@@ -1,0 +1,60 @@
+diff --git a/kernel/exec.c b/kernel/exec.c
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -1397,7 +1397,7 @@
+
+     STRACE("execve(\"%.1000s\", {", filename);
+     const char *args = argv;
+-    while (*args != '\0') {
++    for (ssize_t i = 0; i < argc; i++) {
+         STRACE("\"%.1000s\", ", args);
+         args += strlen(args) + 1;
+     }
+@@ -1416,7 +1416,7 @@
+         size_t p = 0;
+         const char *a = argv;
+         int n = 0;
+-        while (*a != '\0' && p < sizeof(argbuf) - 4 && n < 8) {
++        while (n < argc && p < sizeof(argbuf) - 4 && n < 8) {
+             int wrote = snprintf(argbuf + p, sizeof(argbuf) - p,
+                                  "%s%.200s", n == 0 ? "" : " ", a);
+             if (wrote < 0 || (size_t)wrote >= sizeof(argbuf) - p) break;
+@@ -1497,7 +1497,7 @@
+     {
+         const char *base = strrchr(filename, '/');
+         base = base ? base + 1 : filename;
+-        if (strcmp(base, "node") == 0) {
++        if (argc > 0 && argv[0] != '\0' && strcmp(base, "node") == 0) {
+             // Fallback (jitless) mode, see the mode choice below.
+             static const char *inject_args_jitless[] = {
+                 "--jitless",
+@@ -1551,7 +1551,8 @@
+                     jitless = true;
+             }
+             // node's own options come before the script; what follows it belongs to the script
+-            for (const char *a = argv + strlen(argv) + 1; *a != '\0'; a += strlen(a) + 1) {
++            const char *a = argv + strlen(argv) + 1;
++            for (ssize_t i = 1; i < argc; i++, a += strlen(a) + 1) {
+                 if (a[0] != '-' || strcmp(a, "--") == 0)
+                     break;
+                 if (strcmp(a, "--jitless") == 0 || strcmp(a, "--no-expose-wasm") == 0)
+@@ -1585,16 +1586,13 @@
+                 const char *arg = inject_args[ai];
+                 size_t arg_len = strlen(arg) + 1; // includes NUL
+
+-                // Find end of argv buffer
+-                char *p = argv;
+-                while (*p != '\0')
+-                    p += strlen(p) + 1;
+-                size_t total_used = (p - argv) + 1;
++                // Empty strings are argv entries; only argc marks the end of this vector.
++                size_t total_used = args_size((struct exec_args) {.count = argc, .args = argv});
+
+                 // Check if already present
+                 bool found = false;
+                 char *q = argv;
+-                while (*q != '\0') {
++                for (ssize_t i = 0; i < argc; i++) {
+                     if (strcmp(q, arg) == 0) { found = true; break; }
+                     q += strlen(q) + 1;
+                 }

@@ -1,0 +1,25 @@
+--- a/src/vs/workbench/services/extensions/common/extensions.ts
++++ b/src/vs/workbench/services/extensions/common/extensions.ts
+@@ -414,6 +414,9 @@
+ 
+ export interface IExtensionService {
+ 	readonly _serviceBrand: undefined;
++
++	/** Resolve extension resources for the embedder, or use the standard FileAccess mapping. */
++	resolveExtensionResourceUri?(uri: URI): Promise<URI | undefined>;
+ 
+ 	/**
+ 	 * An event emitted when extensions are registered after their extension points got handled.
+--- a/src/vs/workbench/api/browser/mainThreadExtensionService.ts
++++ b/src/vs/workbench/api/browser/mainThreadExtensionService.ts
+@@ -190,7 +190,9 @@
+ 	}
+ 
+ 	async $asBrowserUri(uri: UriComponents): Promise<UriComponents> {
+-		return FileAccess.uriToBrowserUri(URI.revive(uri));
++		const resource = URI.revive(uri);
++		const resolved = await this._extensionService.resolveExtensionResourceUri?.(resource);
++		return resolved ?? FileAccess.uriToBrowserUri(resource);
+ 	}
+ }
+ 

@@ -1,0 +1,32 @@
+# CodiPadNode attribution and notices
+
+Original CodiPad code in `native/CodiPadNode` is licensed under GPL-3.0-only in
+the root `LICENSE` file. Third-party runtime components retain their original
+licenses and notices, described below.
+
+## 1. Upstream Node.js runtime
+
+The linked runtime is Node.js 24.21.0 built from the nodejs.org distribution
+tarball (pinned in `build/runtime-manifest.json`). Its license is Node.js's
+`LICENSE` (MIT plus bundled third-party notices), preserved in
+`patches/node/NODE-LICENSE` and staged alongside the runtime bundle.
+
+## 2. a-shell node-port patches
+
+The iOS Node build uses five patches derived from the a-shell node port:
+
+- `patches/node/gyp-ios.patch`, `platform.patch`, `public-vm.patch`,
+  `runtime.patch`, and `v8-alias-writes.patch`.
+- Provenance: `https://github.com/holzschu/a-shell`, commit
+  `79aac66fe8a21a626d7fdd6ee42d24039a21802b`, path `node`.
+- License: BSD 3-Clause, Copyright (c) 2019, Nicolas Holzschuch
+  (`patches/node/A-SHELL-LICENSE.txt`).
+
+`patches/node/process-authority.patch`, `session-environment.patch`, and
+`stdio-ipc.patch` are original CodiPad patches under GPL-3.0-only.
+
+## Runtime ABI contract
+
+`PageAllocator.cpp` exports `codipad_v8_rx_begin`, `codipad_v8_rx_end`, and
+`codipad_v8_rw_begin`. `v8-alias-writes.patch` routes V8 code writes through
+`codipad_v8_rw_begin + (address - codipad_v8_rx_begin)`.

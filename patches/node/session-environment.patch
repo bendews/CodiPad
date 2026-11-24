@@ -1,0 +1,118 @@
+--- a/src/node.h
++++ b/src/node.h
+@@ -688,7 +688,10 @@
+   // Controls whether the InspectorAgent created for this Environment waits for
+   // Inspector frontend events during the Environment creation. It's used to
+   // call node::Stop(env) on a Worker thread that is waiting for the events.
+-  kNoWaitForInspectorFrontend = 1 << 11
++  kNoWaitForInspectorFrontend = 1 << 11,
++  // Use the Environment's HOME value for POSIX os.homedir(). Embedders opt in
++  // when they install an Environment-local variable store.
++  kUseEnvironmentHome = 1 << 12
+ };
+ }  // namespace EnvironmentFlags
+ 
+@@ -747,6 +750,14 @@
+     std::unique_ptr<InspectorParentHandle> inspector_parent_handle,
+     std::string_view thread_name);
+ 
++// Replaces this Environment's variable store with a private map initialized
++// from |values|. Call before LoadEnvironment() so process.env and native
++// environment lookups use the same Environment-local values.
++NODE_EXTERN v8::Maybe<void> SetEnvironmentVariables(
++    Environment* env,
++    v8::Local<v8::Context> context,
++    v8::Local<v8::Object> values);
++
+ // Returns a handle that can be passed to `LoadEnvironment()`, making the
+ // child Environment accessible to the inspector as if it were a Node.js Worker.
+ // `child_thread_id` can be created using `AllocateEnvironmentThreadId()`
+--- a/src/env.h
++++ b/src/env.h
+@@ -728,6 +728,7 @@
+   inline permission::Permission* permission();
+   inline std::shared_ptr<KVStore> env_vars();
+   inline void set_env_vars(std::shared_ptr<KVStore> env_vars);
++  inline bool uses_environment_home() const;
+ 
+   inline IsolateData* isolate_data() const;
+ 
+--- a/src/env-inl.h
++++ b/src/env-inl.h
+@@ -312,6 +312,10 @@
+ 
+ inline void Environment::set_env_vars(std::shared_ptr<KVStore> env_vars) {
+   env_vars_ = env_vars;
++}
++
++inline bool Environment::uses_environment_home() const {
++  return flags_ & EnvironmentFlags::kUseEnvironmentHome;
+ }
+ 
+ inline bool Environment::printed_error() const {
+--- a/src/node_os.cc
++++ b/src/node_os.cc
+@@ -276,6 +276,20 @@
+ 
+ static void GetHomeDirectory(const FunctionCallbackInfo<Value>& args) {
+   Environment* env = Environment::GetCurrent(args);
++#ifndef _WIN32
++  if (env->uses_environment_home()) {
++    std::optional<std::string> home = env->env_vars()->Get("HOME");
++    if (home.has_value() && !home->empty()) {
++      Local<String> value;
++      if (String::NewFromUtf8(env->isolate(), home->data(), NewStringType::kNormal,
++                              static_cast<int>(home->size()))
++              .ToLocal(&value)) {
++        args.GetReturnValue().Set(value);
++      }
++      return;
++    }
++  }
++#endif
+   char buf[PATH_MAX];
+ 
+   size_t len = sizeof(buf);
+--- a/src/node_worker.cc
++++ b/src/node_worker.cc
+@@ -724,6 +724,8 @@
+     worker->environment_flags_ |= EnvironmentFlags::kNoGlobalSearchPaths;
+   if (env->no_browser_globals())
+     worker->environment_flags_ |= EnvironmentFlags::kNoBrowserGlobals;
++  if (env->uses_environment_home())
++    worker->environment_flags_ |= EnvironmentFlags::kUseEnvironmentHome;
+ }
+ 
+ void Worker::StartThread(const FunctionCallbackInfo<Value>& args) {
+--- a/src/api/environment.cc
++++ b/src/api/environment.cc
+@@ -6,6 +6,7 @@
+ #include "crypto/crypto_util.h"
+ #endif  // HAVE_OPENSSL
+ #include "env.h"
++#include "env-inl.h"
+ #include "env_properties.h"
+ #include "node.h"
+ #include "node_builtins.h"
+@@ -577,6 +578,21 @@
+ #else
+   return {};
+ #endif
++}
++
++Maybe<void> SetEnvironmentVariables(Environment* env,
++                                    Local<Context> context,
++                                    Local<Object> values) {
++  CHECK_NOT_NULL(env);
++  CHECK_EQ(context->GetIsolate(), env->isolate());
++
++  std::shared_ptr<KVStore> env_vars = KVStore::CreateMapKVStore();
++  if (env_vars->AssignFromObject(context, values).IsNothing()) {
++    return Nothing<void>();
++  }
++
++  env->set_env_vars(std::move(env_vars));
++  return JustVoid();
+ }
+ 
+ MaybeLocal<Value> LoadEnvironment(Environment* env,

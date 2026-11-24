@@ -1,0 +1,77 @@
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -3985,10 +3985,34 @@
+ // sets ISH_JIT=0 for the gadget engine. Called on one thread, before the guest boots.
+ static pthread_mutex_t jit_region_lock = PTHREAD_MUTEX_INITIALIZER;
+ static bool jit_startup_started;
++static bool jit_mode_frozen;
++static bool jit_gadget_only;
+ 
++// All region installation and startup decisions share this lock.
++bool ish_jit_configure_mode(bool gadget_only) {
++    pthread_mutex_lock(&jit_region_lock);
++    bool ok = gadget_only == jit_gadget_only ||
++              (!jit_mode_frozen && !jit_startup_started && region == NULL);
++    if (ok) {
++        jit_gadget_only = gadget_only;
++    }
++    pthread_mutex_unlock(&jit_region_lock);
++    return ok;
++}
++
++void ish_jit_freeze_mode(void) {
++    pthread_mutex_lock(&jit_region_lock);
++    jit_mode_frozen = true;
++    pthread_mutex_unlock(&jit_region_lock);
++}
++
+ bool ish_jit_try_enable(void) {
+ #ifndef ISH_JIT_NO_EMIT
+     pthread_mutex_lock(&jit_region_lock);
++    if (jit_gadget_only) {
++        pthread_mutex_unlock(&jit_region_lock);
++        return false;
++    }
+     if (jit_startup_started) {
+         bool enabled = region != NULL;
+         pthread_mutex_unlock(&jit_region_lock);
+@@ -4033,7 +4057,7 @@
+ size_t ish_jit_region_capacity(void) {
+ #ifndef ISH_JIT_NO_EMIT
+     pthread_mutex_lock(&jit_region_lock);
+-    if (jit_startup_started) {
++    if (jit_gadget_only || jit_startup_started) {
+         pthread_mutex_unlock(&jit_region_lock);
+         return 0;
+     }
+@@ -4051,7 +4075,7 @@
+ bool ish_jit_limit_region_capacity(size_t maximum) {
+ #ifndef ISH_JIT_NO_EMIT
+     pthread_mutex_lock(&jit_region_lock);
+-    bool ok = !jit_startup_started && region == NULL && maximum >= (16u << 20) &&
++    bool ok = !jit_gadget_only && !jit_startup_started && region == NULL && maximum >= (16u << 20) &&
+               maximum <= ((size_t) 1024 << 20) && !(maximum & (maximum - 1));
+     if (ok) region_maximum = maximum;
+     pthread_mutex_unlock(&jit_region_lock);
+@@ -4066,7 +4090,7 @@
+ bool ish_jit_install_region(void *rx, void *rw, size_t capacity) {
+ #ifndef ISH_JIT_NO_EMIT
+     pthread_mutex_lock(&jit_region_lock);
+-    if (jit_startup_started || region != NULL || rx == NULL || rw == NULL || rx == rw || capacity == 0 ||
++    if (jit_gadget_only || jit_startup_started || region != NULL || rx == NULL || rw == NULL || rx == rw || capacity == 0 ||
+         ((uintptr_t) rx & 0x3fff) != 0 || ((uintptr_t) rw & 0x3fff) != 0 ||
+         capacity > UINTPTR_MAX - (uintptr_t) rx || capacity > UINTPTR_MAX - (uintptr_t) rw) {
+         pthread_mutex_unlock(&jit_region_lock);
+@@ -4102,9 +4126,10 @@
+     // permitted after pthread_once begins initialization.
+     pthread_mutex_lock(&jit_region_lock);
+     jit_startup_started = true;
++    bool gadget_only = jit_gadget_only;
+     pthread_mutex_unlock(&jit_region_lock);
+-    if (env_off("ISH_JIT")) {
+-        jit_note("jit: fallback (ISH_JIT=0)");
++    if (gadget_only || env_off("ISH_JIT")) {
++        jit_note(gadget_only ? "jit: fallback (gadget-only mode)" : "jit: fallback (ISH_JIT=0)");
+         return;
+     }
+     const char *flat = getenv("ISH_FLAT_MEMORY");

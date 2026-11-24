@@ -1,0 +1,30 @@
+name: Bug report
+description: Report a build failure or a problem using CodiPad.
+body:
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it?
+      description: Include the smallest project, command, or sequence of actions that shows the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened, and what did you expect?
+      description: For a build failure, include the build command and the first relevant error.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Where did it happen?
+      description: Include the CodiPad commit or version. For app issues, include the iPad model, iPadOS version, and execution mode. For build issues, include macOS and Xcode versions.
+    validations:
+      required: true
+  - type: input
+    id: extension
+    attributes:
+      label: Extension ID and version
+      description: For an extension issue, include the extension ID, version, and how you installed it (bundled with CodiPad, local VSIX, or a configured gallery).
+      placeholder: esbenp.prettier-vscode, version …, local VSIX

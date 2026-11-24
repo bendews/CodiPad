@@ -1,0 +1,209 @@
+--- a/util/sync.c
++++ b/util/sync.c
+@@ -20,84 +20,114 @@
+     pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+ #endif
+     pthread_cond_init(&cond->cond, &attr);
++    pthread_condattr_destroy(&attr);
++    pthread_mutex_init(&cond->notify_lock, NULL);
+ }
+ void cond_destroy(cond_t *cond) {
+     pthread_cond_destroy(&cond->cond);
++    pthread_mutex_destroy(&cond->notify_lock);
+ }
+ 
+ static bool is_signal_pending(lock_t *lock) {
+-    if (!current)
+-        return false;
+-    if (lock != &current->sighand->lock)
+-        lock(&current->sighand->lock);
++    if (!current) return false;
++    struct sighand *sighand = current->sighand;
++    if (!sighand) return true;
++    if (lock != &sighand->lock) lock(&sighand->lock);
+     bool pending = !!(current->pending & ~current->blocked);
+-    if (lock != &current->sighand->lock)
+-        unlock(&current->sighand->lock);
++    if (lock != &sighand->lock) unlock(&sighand->lock);
+     return pending;
+ }
+ 
+-int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+-    if (is_signal_pending(lock))
+-        return _EINTR;
+-    int err = wait_for_ignore_signals(cond, lock, timeout);
+-    if (err < 0)
+-        return _ETIMEDOUT;
+-    if (is_signal_pending(lock))
+-        return _EINTR;
+-    return 0;
++struct condition_wait {
++    cond_t *cond;
++    lock_t *guest_lock;
++    struct task *task;
++};
++
++// pthread_cond_wait also reacquires notify_lock on cancellation. Restore the
++// caller's mutex before any outer cleanup handler runs, as the old wait did.
++static void finish_condition_wait(void *opaque) {
++    struct condition_wait *wait = opaque;
++    pthread_mutex_unlock(&wait->cond->notify_lock);
++    if (wait->task) {
++        lock(&wait->task->waiting_cond_lock);
++        wait->task->waiting_cond = NULL;
++        wait->task->waiting_lock = NULL;
++        unlock(&wait->task->waiting_cond_lock);
++    }
++    lock(wait->guest_lock);
+ }
+ 
+-int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+-    if (current) {
+-        lock(&current->waiting_cond_lock);
+-        current->waiting_cond = cond;
+-        current->waiting_lock = lock;
+-        unlock(&current->waiting_cond_lock);
++static int condition_wait(cond_t *cond, lock_t *guest_lock,
++                          struct timespec *timeout, bool interruptible) {
++    struct task *task = current;
++    struct sighand *sighand = interruptible && task ? task->sighand : NULL;
++    // Interruptible waits preserve guest -> sighand -> waiting_cond -> notify
++    // order. Ignore-signals waits must not acquire sighand (stopped groups hold
++    // group->lock, while signal delivery takes sighand -> group). Never acquire
++    // a guest/sighand lock while holding notify_lock.
++    if (sighand && guest_lock != &sighand->lock) lock(&sighand->lock);
++    bool interrupted = interruptible && task && (!sighand || (task->pending & ~task->blocked));
++    if (interruptible && interrupted) {
++        if (sighand && guest_lock != &sighand->lock) unlock(&sighand->lock);
++        return _EINTR;
+     }
++    if (task) lock(&task->waiting_cond_lock);
++    pthread_mutex_lock(&cond->notify_lock);
++    if (task) {
++        task->waiting_cond = cond;
++        task->waiting_lock = guest_lock;
++        unlock(&task->waiting_cond_lock);
++    }
++    if (sighand && guest_lock != &sighand->lock) unlock(&sighand->lock);
++
+     int rc = 0;
+-#if LOCK_DEBUG
+-    struct lock_debug lock_tmp = lock->debug;
+-    lock->debug = (struct lock_debug) { .initialized = lock->debug.initialized };
+-#endif
++    struct condition_wait wait = {cond, guest_lock, task};
++    pthread_cleanup_push(finish_condition_wait, &wait);
++    unlock(guest_lock);
+     if (!timeout) {
+-        pthread_cond_wait(&cond->cond, &lock->m);
++        rc = pthread_cond_wait(&cond->cond, &cond->notify_lock);
+     } else {
+ #if __linux__
+         struct timespec abs_timeout;
+         clock_gettime(CLOCK_MONOTONIC, &abs_timeout);
+         abs_timeout.tv_sec += timeout->tv_sec;
+         abs_timeout.tv_nsec += timeout->tv_nsec;
+-        if (abs_timeout.tv_nsec > 1000000000) {
++        if (abs_timeout.tv_nsec >= 1000000000) {
+             abs_timeout.tv_sec++;
+             abs_timeout.tv_nsec -= 1000000000;
+         }
+-        rc = pthread_cond_timedwait(&cond->cond, &lock->m, &abs_timeout);
++        rc = pthread_cond_timedwait(&cond->cond, &cond->notify_lock, &abs_timeout);
+ #elif __APPLE__
+-        rc = pthread_cond_timedwait_relative_np(&cond->cond, &lock->m, timeout);
++        rc = pthread_cond_timedwait_relative_np(&cond->cond, &cond->notify_lock, timeout);
+ #else
+ #error Unimplemented pthread_cond_wait relative timeout.
+ #endif
+     }
+-#if LOCK_DEBUG
+-    lock->debug = lock_tmp;
+-#endif
+-
+-    if (current) {
+-        lock(&current->waiting_cond_lock);
+-        current->waiting_cond = NULL;
+-        current->waiting_lock = NULL;
+-        unlock(&current->waiting_cond_lock);
+-    }
+-    if (rc == ETIMEDOUT)
+-        return _ETIMEDOUT;
++    pthread_cleanup_pop(0);
++    finish_condition_wait(&wait);
++    if (rc == ETIMEDOUT) return _ETIMEDOUT;
++    if (interruptible && is_signal_pending(guest_lock)) return _EINTR;
+     return 0;
+ }
+ 
++int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
++    return condition_wait(cond, lock, timeout, true);
++}
++
++int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout) {
++    return condition_wait(cond, lock, timeout, false);
++}
++
+ void notify(cond_t *cond) {
++    pthread_mutex_lock(&cond->notify_lock);
+     pthread_cond_broadcast(&cond->cond);
++    pthread_mutex_unlock(&cond->notify_lock);
+ }
+ void notify_once(cond_t *cond) {
++    pthread_mutex_lock(&cond->notify_lock);
+     pthread_cond_signal(&cond->cond);
++    pthread_mutex_unlock(&cond->notify_lock);
+ }
+ 
+ __thread sigjmp_buf unwind_buf;
+--- a/util/sync.h
++++ b/util/sync.h
+@@ -126,12 +126,14 @@
+ 
+ typedef struct {
+     pthread_cond_t cond;
++    pthread_mutex_t notify_lock; // serializes notify with registration-to-sleep
+ } cond_t;
+-#define COND_INITIALIZER ((cond_t) {PTHREAD_COND_INITIALIZER})
++#define COND_INITIALIZER ((cond_t) {.cond = PTHREAD_COND_INITIALIZER, .notify_lock = PTHREAD_MUTEX_INITIALIZER})
+ 
+ // Must call before using the condition
+ void cond_init(cond_t *cond);
+-// Must call when finished with the condition (currently doesn't do much but might do something important eventually I guess)
++// All waiters/notifiers must have settled before destruction. A final FD reference
++// alone does not prove this while read/write/connect/fcntl still borrow descriptors.
+ void cond_destroy(cond_t *cond);
+ // Releases the lock, waits for the condition, and reacquires the lock.
+ // Returns _EINTR if waiting stopped because the thread received a signal,
+--- a/kernel/time.c
++++ b/kernel/time.c
+@@ -224,7 +224,7 @@
+ 
+     // Private cond/lock. Nothing ever notifies it deliberately, so the wait is
+     // meant to end by timeout or by signal.
+-    cond_t sleep_cond = COND_INITIALIZER;
++    cond_t sleep_cond;
+     lock_t sleep_lock;
+     lock_init(&sleep_lock);
+     cond_init(&sleep_cond);
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -164,6 +164,8 @@
+ 
+ void task_destroy(struct task *task) {
+     task_close_host_io(task);
++    cond_destroy(&task->pause);
++    cond_destroy(&task->ptrace.cond);
+     list_remove(&task->siblings);
+     pid_get(task->pid)->task = NULL;
+ 
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -556,6 +556,7 @@
+ 
+     // tear down group
+     cond_destroy(&task->group->child_exit);
++    cond_destroy(&task->group->stopped_cond);
+     task_leave_session(task);
+     list_remove(&task->group->pgroup);
+     free(task->group);

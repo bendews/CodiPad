@@ -1,0 +1,10 @@
+/* Match VS Code's Safari selection rule when WebKit identifies itself as a web view. */
+.monaco-workbench.ipad .monaco-editor .view-lines {
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+/* xterm draws its own cursor; its hidden input is still needed for composition. */
+.monaco-workbench.ipad .xterm .xterm-helper-textarea {
+	caret-color: transparent;
+}

@@ -1,0 +1,611 @@
+--- a/kernel/calls.c
++++ b/kernel/calls.c
+@@ -89,8 +89,24 @@
+         if (current->group->doing_group_exit)
+             do_exit(current->group->group_exit_code);
+ #elif defined(GUEST_ARM64)
++        // ARM64 Linux tasks use x8. The restricted Mach-O personality uses
++        // Darwin's class-2 syscall numbers in x16; translate only the core
++        // process/stdio calls implemented by this ABI slice.
+         // ARM64: syscall number in x8, args in x0-x5, return in x0
+         unsigned syscall_num = cpu->regs[8];
++        if (current->darwin_abi) {
++            uint64_t darwin_num = cpu->regs[16];
++            syscall_num = ~0U;
++            if ((darwin_num & 0xff000000U) == 0x02000000U) {
++                switch ((unsigned)(darwin_num & 0x00ffffffU)) {
++                    case 1: syscall_num = 93; break; // exit
++                    case 3: syscall_num = 63; break; // read
++                    case 4: syscall_num = 64; break; // write
++                    case 6: syscall_num = 57; break; // close
++                    default: break;
++                }
++            }
++        }
+         // Snapshot for SA_RESTART: x0 (first arg) is about to be clobbered by
+         // the return value; save it and the number so an interrupted syscall
+         // can be re-executed if a SA_RESTART signal is delivered.
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -228,6 +228,7 @@
+     write_wrlock(&current->mem->lock);
+ 
+     current->mm->exefile = fd_retain(fd);
++    current->darwin_abi = false;
+ 
+     addr_t load_addr = 0; // used for AX_PHDR
+     bool load_addr_set = false;
+@@ -538,6 +539,551 @@
+     return args_end - args.args;
+ }
+ 
++#ifdef GUEST_ARM64
++// Deliberately small, fail-closed Mach-O subset. This ARM64 instruction image
++// runs in the existing iSH task/MM, with the declared Darwin calls translated
++// by calls.c. This is format/ABI compatibility, not host-native execution.
++struct macho64_header {
++    uint32_t magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved;
++};
++struct macho64_command { uint32_t cmd, cmdsize; };
++struct macho64_segment {
++    uint32_t cmd, cmdsize;
++    char segname[16];
++    uint64_t vmaddr, vmsize, fileoff, filesize;
++    int32_t maxprot, initprot;
++    uint32_t nsects, flags;
++};
++struct macho64_main { uint32_t cmd, cmdsize; uint64_t entryoff, stacksize; };
++struct macho64_build { uint32_t cmd, cmdsize, platform, minos, sdk, ntools; };
++struct macho64_plan {
++    struct macho64_header header;
++    struct macho64_segment segments[24];
++    size_t segment_count;
++    struct macho64_main main_cmd;
++    uint64_t min_vmaddr, max_vmaddr, entry_vmaddr;
++    uint32_t fixups_offset, fixups_size;
++    bool has_fixups;
++};
++struct macho64_linkedit_data { uint32_t cmd, cmdsize, dataoff, datasize; };
++
++#define MACHO64_MAGIC 0xfeedfacfU
++#define MACHO64_ARM64 0x0100000cU
++#define MACHO64_EXECUTE 2U
++#define MACHO64_PIE 0x00200000U
++#define MACHO64_LC_SEGMENT_64 0x19U
++#define MACHO64_LC_MAIN 0x80000028U
++#define MACHO64_LC_BUILD_VERSION 0x32U
++#define MACHO64_LC_LOAD_DYLIB 0x0cU
++#define MACHO64_LC_LOAD_DYLINKER 0x0eU
++#define MACHO64_LC_DYLD_CHAINED_FIXUPS 0x80000034U
++#define MACHO64_LC_DYLD_EXPORTS_TRIE 0x80000033U
++#define MACHO64_LC_SYMTAB 0x02U
++#define MACHO64_LC_DYSYMTAB 0x0bU
++#define MACHO64_LC_UUID 0x1bU
++#define MACHO64_LC_CODE_SIGNATURE 0x1dU
++#define MACHO64_LC_SOURCE_VERSION 0x2aU
++#define MACHO64_LC_FUNCTION_STARTS 0x26U
++#define MACHO64_LC_DATA_IN_CODE 0x29U
++#define MACHO64_PLATFORM_MACOS 1U
++
++static int macho_read_at(struct fd *fd, uint64_t offset, void *buffer, size_t size) {
++    if (offset > INT64_MAX || fd->ops->lseek(fd, (off_t)offset, SEEK_SET) < 0)
++        return _EIO;
++    ssize_t got = fd->ops->read(fd, buffer, size);
++    return got == (ssize_t)size ? 0 : (got < 0 ? _EIO : _ENOEXEC);
++}
++
++static int macho_parse(struct fd *fd, struct macho64_plan *plan) {
++    memset(plan, 0, sizeof(*plan));
++    if (fd == NULL || macho_read_at(fd, 0, &plan->header, sizeof(plan->header)) < 0)
++        return _ENOEXEC;
++    struct macho64_header *h = &plan->header;
++    if (h->magic != MACHO64_MAGIC || h->cputype != MACHO64_ARM64 || h->cpusubtype != 0 ||
++        h->filetype != MACHO64_EXECUTE || !(h->flags & MACHO64_PIE) || h->ncmds > 64 ||
++        h->sizeofcmds > 32768)
++        return _ENOEXEC;
++
++    uint64_t command_end = sizeof(*h) + (uint64_t)h->sizeofcmds;
++    uint64_t offset = sizeof(*h), file_size = (uint64_t)fd->open_stat.size;
++    bool have_main = false, have_macos = false, have_fixups = false;
++    plan->min_vmaddr = UINT64_MAX;
++    for (uint32_t i = 0; i < h->ncmds; i++) {
++        struct macho64_command c;
++        if (offset > command_end || command_end - offset < sizeof(c) ||
++            macho_read_at(fd, offset, &c, sizeof(c)) < 0 || c.cmdsize < sizeof(c) ||
++            c.cmdsize > command_end - offset)
++            return _ENOEXEC;
++        if (c.cmd == MACHO64_LC_SEGMENT_64) {
++            struct macho64_segment segment;
++            if (plan->segment_count == sizeof(plan->segments) / sizeof(plan->segments[0]) ||
++                c.cmdsize < sizeof(segment) ||
++                macho_read_at(fd, offset, &segment, sizeof(segment)) < 0 ||
++                c.cmdsize != sizeof(segment) + (uint64_t)segment.nsects * 80U ||
++                segment.filesize > segment.vmsize || segment.fileoff > file_size ||
++                segment.filesize > file_size - segment.fileoff ||
++                (strncmp(segment.segname, "__PAGEZERO", 16) != 0 &&
++                 segment.vmsize > (64U * 1024U * 1024U)) ||
++                (segment.vmsize != 0 && (segment.vmaddr & (PAGE_SIZE - 1)) != 0) ||
++                (segment.fileoff & (PAGE_SIZE - 1)) != 0 ||
++                (segment.initprot & ~7) != 0 || (segment.maxprot & ~7) != 0 ||
++                ((segment.initprot & 6) == 6) || ((segment.maxprot & 6) == 6))
++                return _ENOEXEC;
++            if (strncmp(segment.segname, "__PAGEZERO", 16) == 0) {
++                if (segment.filesize != 0 || segment.initprot != 0)
++                    return _ENOEXEC;
++            } else if (segment.vmsize != 0) {
++                uint64_t end = segment.vmaddr + segment.vmsize;
++                if (end < segment.vmaddr)
++                    return _ENOEXEC;
++                if (segment.vmaddr < plan->min_vmaddr) plan->min_vmaddr = segment.vmaddr;
++                if (end > plan->max_vmaddr) plan->max_vmaddr = end;
++            }
++            plan->segments[plan->segment_count++] = segment;
++        } else if (c.cmd == MACHO64_LC_MAIN) {
++            if (have_main || c.cmdsize != sizeof(plan->main_cmd) ||
++                macho_read_at(fd, offset, &plan->main_cmd, sizeof(plan->main_cmd)) < 0)
++                return _ENOEXEC;
++            have_main = true;
++        } else if (c.cmd == MACHO64_LC_BUILD_VERSION) {
++            struct macho64_build b;
++            if (have_macos || c.cmdsize < sizeof(b) || macho_read_at(fd, offset, &b, sizeof(b)) < 0 ||
++                b.platform != MACHO64_PLATFORM_MACOS ||
++                (uint64_t)c.cmdsize != sizeof(b) + (uint64_t)b.ntools * 8U)
++                return _ENOEXEC;
++            have_macos = true;
++        } else if (c.cmd == MACHO64_LC_DYLD_CHAINED_FIXUPS) {
++            struct macho64_linkedit_data data;
++            if (have_fixups || c.cmdsize != sizeof(data) ||
++                macho_read_at(fd, offset, &data, sizeof(data)) < 0 ||
++                data.dataoff > file_size || data.datasize > file_size - data.dataoff ||
++                data.datasize < 28)
++                return _ENOEXEC;
++            have_fixups = true;
++            plan->has_fixups = true;
++            plan->fixups_offset = data.dataoff;
++            plan->fixups_size = data.datasize;
++        } else if (c.cmd == MACHO64_LC_LOAD_DYLIB || c.cmd == MACHO64_LC_LOAD_DYLINKER) {
++            // These are declarations only. This loader supplies its own bounded guest ABI and
++            // never resolves symbols against host dyld/libSystem.
++            uint32_t minimum_name_offset = c.cmd == MACHO64_LC_LOAD_DYLINKER ? 12U : 24U;
++            if (c.cmdsize < minimum_name_offset)
++                return _ENOEXEC;
++            char name[64] = {0};
++            uint32_t nameoff;
++            if (macho_read_at(fd, offset + 8, &nameoff, sizeof(nameoff)) < 0 ||
++                nameoff < minimum_name_offset || nameoff >= c.cmdsize ||
++                c.cmdsize - nameoff > sizeof(name) ||
++                macho_read_at(fd, offset + nameoff, name, c.cmdsize - nameoff) < 0)
++                return _ENOEXEC;
++            if ((c.cmd == MACHO64_LC_LOAD_DYLIB && strcmp(name, "/usr/lib/libSystem.B.dylib") != 0) ||
++                (c.cmd == MACHO64_LC_LOAD_DYLINKER && strcmp(name, "/usr/lib/dyld") != 0))
++                return _ENOEXEC;
++        } else if (c.cmd == MACHO64_LC_UUID || c.cmd == MACHO64_LC_SOURCE_VERSION ||
++                   c.cmd == MACHO64_LC_FUNCTION_STARTS || c.cmd == MACHO64_LC_DATA_IN_CODE ||
++                   c.cmd == MACHO64_LC_DYLD_EXPORTS_TRIE || c.cmd == MACHO64_LC_SYMTAB ||
++                   c.cmd == MACHO64_LC_DYSYMTAB || c.cmd == MACHO64_LC_CODE_SIGNATURE) {
++            // Metadata not needed by the direct LC_MAIN guest entry.
++        } else {
++            return _ENOEXEC;
++        }
++        offset += c.cmdsize;
++    }
++    if (offset != command_end || !have_main || !have_macos || plan->segment_count < 2 ||
++        plan->min_vmaddr == UINT64_MAX || plan->max_vmaddr <= plan->min_vmaddr ||
++        plan->max_vmaddr - plan->min_vmaddr > 64U * 1024U * 1024U)
++        return _ENOEXEC;
++    uint64_t text_min = UINT64_MAX;
++    for (size_t i = 0; i < plan->segment_count; i++) {
++        const struct macho64_segment *s = &plan->segments[i];
++        if (strncmp(s->segname, "__PAGEZERO", 16) == 0 || s->vmsize == 0)
++            continue;
++        for (size_t j = 0; j < i; j++) {
++            const struct macho64_segment *p = &plan->segments[j];
++            if (strncmp(p->segname, "__PAGEZERO", 16) == 0 || p->vmsize == 0)
++                continue;
++            if (s->vmaddr < p->vmaddr + p->vmsize && p->vmaddr < s->vmaddr + s->vmsize)
++                return _ENOEXEC;
++        }
++        if (strncmp(s->segname, "__TEXT", 16) == 0) {
++            if (s->filesize == 0 || (s->initprot & 5) != 5 || (s->initprot & 2) != 0 ||
++                s->fileoff != 0 || text_min != UINT64_MAX)
++                return _ENOEXEC;
++            text_min = s->vmaddr;
++            if (plan->main_cmd.entryoff >= s->filesize ||
++                plan->main_cmd.entryoff < sizeof(*h) + h->sizeofcmds)
++                return _ENOEXEC;
++            plan->entry_vmaddr = s->vmaddr + plan->main_cmd.entryoff;
++        }
++    }
++    return text_min == UINT64_MAX ? _ENOEXEC : 0;
++}
++
++struct macho_fixups_header {
++    uint32_t version, starts_offset, imports_offset, symbols_offset;
++    uint32_t imports_count, imports_format, symbols_format;
++};
++
++#define MACHO_CHAINED_PTR_64 2U
++#define MACHO_CHAINED_PTR_64_OFFSET 6U
++#define MACHO_CHAINED_IMPORT 1U
++#define MACHO_CHAINED_IMPORT_ADDEND 2U
++#define MACHO_CHAINED_START_NONE 0xffffU
++#define MACHO_CHAINED_START_MULTI 0x8000U
++
++static uint16_t macho_u16(const uint8_t *p) {
++    uint16_t value;
++    memcpy(&value, p, sizeof(value));
++    return value;
++}
++
++static uint32_t macho_u32(const uint8_t *p) {
++    uint32_t value;
++    memcpy(&value, p, sizeof(value));
++    return value;
++}
++
++static uint64_t macho_u64(const uint8_t *p) {
++    uint64_t value;
++    memcpy(&value, p, sizeof(value));
++    return value;
++}
++
++static int macho_import_name(const uint8_t *blob, size_t blob_size,
++                             const struct macho_fixups_header *h, uint32_t ordinal,
++                             const char **out_name, int64_t *out_addend) {
++    if (ordinal >= h->imports_count || h->imports_format < MACHO_CHAINED_IMPORT ||
++        h->imports_format > MACHO_CHAINED_IMPORT_ADDEND)
++        return _ENOEXEC;
++    size_t stride = h->imports_format == MACHO_CHAINED_IMPORT ? 4 : 8;
++    size_t at = (size_t)h->imports_offset + (size_t)ordinal * stride;
++    if (at > blob_size || stride > blob_size - at)
++        return _ENOEXEC;
++    uint32_t raw = macho_u32(blob + at);
++    uint32_t dylib_ordinal = raw & 0xffU;
++    bool weak = (raw & 0x100U) != 0;
++    uint32_t name_offset = raw >> 9;
++    if (dylib_ordinal != 1 || weak || name_offset >= blob_size - h->symbols_offset)
++        return _ENOEXEC;
++    const char *name = (const char *)(blob + h->symbols_offset + name_offset);
++    size_t remain = blob_size - (h->symbols_offset + name_offset);
++    if (memchr(name, '\0', remain) == NULL || strcmp(name, "_write") != 0)
++        return _ENOEXEC;
++    int64_t addend = 0;
++    if (h->imports_format == MACHO_CHAINED_IMPORT_ADDEND)
++        addend = (int32_t)macho_u32(blob + at + 4);
++    *out_name = name;
++    *out_addend = addend;
++    return 0;
++}
++
++// Validate or apply the narrowly supported chained-fixup ABI. Only ordinary 64-bit/offset
++// pointers and the declared libSystem write import are accepted. No host symbol lookup occurs.
++static int macho_chained_fixups(struct fd *fd, const struct macho64_plan *plan,
++                                addr_t image_base, addr_t write_stub, bool apply) {
++    if (!plan->has_fixups)
++        return 0;
++    if (plan->fixups_size > 4U * 1024U * 1024U || plan->fixups_size < sizeof(struct macho_fixups_header))
++        return _ENOEXEC;
++    size_t size = plan->fixups_size;
++    uint8_t *blob = malloc(size);
++    if (blob == NULL)
++        return _ENOMEM;
++    int err = macho_read_at(fd, plan->fixups_offset, blob, size);
++    if (err < 0) goto done;
++    struct macho_fixups_header h;
++    memcpy(&h, blob, sizeof(h));
++    if (h.version != 0 || h.symbols_format != 0 || h.imports_count > 256 ||
++        h.starts_offset > size || size - h.starts_offset < 4 ||
++        h.imports_offset > size || h.symbols_offset > size ||
++        (uint64_t)h.imports_count * (h.imports_format == MACHO_CHAINED_IMPORT ? 4U : 8U) >
++            size - h.imports_offset ||
++        (h.imports_format != MACHO_CHAINED_IMPORT && h.imports_format != MACHO_CHAINED_IMPORT_ADDEND)) {
++        err = _ENOEXEC;
++        goto done;
++    }
++    for (uint32_t i = 0; i < h.imports_count; i++) {
++        const char *name;
++        int64_t addend;
++        if ((err = macho_import_name(blob, size, &h, i, &name, &addend)) < 0 || addend != 0) {
++            err = _ENOEXEC;
++            goto done;
++        }
++    }
++    uint32_t seg_count = macho_u32(blob + h.starts_offset);
++    uint64_t offsets_end = (uint64_t)h.starts_offset + 4 + (uint64_t)seg_count * 4;
++    if (seg_count > plan->segment_count || offsets_end > size) {
++        err = _ENOEXEC;
++        goto done;
++    }
++    for (uint32_t si = 0; si < seg_count; si++) {
++        uint32_t rel = macho_u32(blob + h.starts_offset + 4 + si * 4U);
++        if (rel == 0)
++            continue;
++        uint64_t info_at64 = (uint64_t)h.starts_offset + rel;
++        if (info_at64 > size || size - (size_t)info_at64 < 22) { err = _ENOEXEC; goto done; }
++        size_t info_at = (size_t)info_at64;
++        uint32_t info_size = macho_u32(blob + info_at);
++        uint16_t page_size = macho_u16(blob + info_at + 4);
++        uint16_t pointer_format = macho_u16(blob + info_at + 6);
++        uint64_t segment_offset = macho_u64(blob + info_at + 8);
++        uint16_t page_count = macho_u16(blob + info_at + 20);
++        if ((pointer_format != MACHO_CHAINED_PTR_64 && pointer_format != MACHO_CHAINED_PTR_64_OFFSET) ||
++            (page_size != 4096 && page_size != 16384) || info_size < 22U + (uint32_t)page_count * 2U ||
++            info_size > size - info_at || info_at + 22U + (size_t)page_count * 2U > size) {
++            err = _ENOEXEC;
++            goto done;
++        }
++        const struct macho64_segment *seg = &plan->segments[si];
++        if (strncmp(seg->segname, "__PAGEZERO", 16) == 0 ||
++            segment_offset != seg->vmaddr - plan->min_vmaddr ||
++            (uint64_t)page_count > (seg->vmsize + page_size - 1) / page_size) {
++            err = _ENOEXEC;
++            goto done;
++        }
++        for (uint16_t pi = 0; pi < page_count; pi++) {
++            uint16_t chain = macho_u16(blob + info_at + 22 + (size_t)pi * 2);
++            if (chain == MACHO_CHAINED_START_NONE)
++                continue;
++            if ((chain & MACHO_CHAINED_START_MULTI) != 0 || chain >= page_size) {
++                err = _ENOEXEC;
++                goto done;
++            }
++            uint32_t chain_offset = chain;
++            bool chain_ended = false;
++            for (unsigned step = 0; step < page_size / 4; step++) {
++                uint64_t file_at = seg->fileoff + (uint64_t)pi * page_size + chain_offset;
++                if (chain_offset + sizeof(uint64_t) > page_size ||
++                    file_at > seg->fileoff + seg->filesize ||
++                    sizeof(uint64_t) > seg->fileoff + seg->filesize - file_at) {
++                    err = _ENOEXEC;
++                    goto done;
++                }
++                uint64_t raw;
++                if ((err = macho_read_at(fd, file_at, &raw, sizeof(raw))) < 0) goto done;
++                bool bind = (raw >> 63) != 0;
++                uint16_t next = (uint16_t)((raw >> 51) & 0xfffU);
++                uint64_t value = 0;
++                if (bind) {
++                    uint32_t ordinal = (uint32_t)(raw & 0xffffffU);
++                    const char *name;
++                    int64_t import_addend;
++                    int8_t pointer_addend = (int8_t)((raw >> 24) & 0xffU);
++                    if (macho_import_name(blob, size, &h, ordinal, &name, &import_addend) < 0 ||
++                        strcmp(name, "_write") != 0 || import_addend + pointer_addend != 0) {
++                        err = _ENOEXEC;
++                        goto done;
++                    }
++                    value = write_stub;
++                } else {
++                    uint64_t target = raw & ((1ULL << 36) - 1);
++                    uint8_t high8 = (uint8_t)(raw >> 56);
++                    if (high8 != 0) { err = _ENOEXEC; goto done; }
++                    if (target != 0) {
++                        uint64_t target_offset = pointer_format == MACHO_CHAINED_PTR_64_OFFSET
++                            ? target : target - plan->min_vmaddr;
++                        uint64_t image_span = plan->max_vmaddr - plan->min_vmaddr;
++                        if (target_offset >= image_span) { err = _ENOEXEC; goto done; }
++                        value = image_base + target_offset;
++                    }
++                }
++                if (apply) {
++                    addr_t target = image_base + (seg->vmaddr - plan->min_vmaddr) +
++                        (addr_t)pi * page_size + chain_offset;
++                    if (user_put(target, value)) { err = _EFAULT; goto done; }
++                }
++                if (next == 0) {
++                    chain_ended = true;
++                    break;
++                }
++                chain_offset += (uint32_t)next * 4U;
++            }
++            if (!chain_ended) {
++                err = _ENOEXEC;
++                goto done;
++            }
++        }
++    }
++    err = 0;
++done:
++    free(blob);
++    return err;
++}
++
++// Pure format gate shared with IshKernel's top-level authority classifier.
++int ish_macho_preflight_fd(struct fd *fd) {
++    struct macho64_plan plan;
++    int err = macho_parse(fd, &plan);
++    if (err < 0)
++        return err;
++    return macho_chained_fixups(fd, &plan, 0, 0, false);
++}
++
++static int macho_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
++    struct macho64_plan plan;
++    int err = macho_parse(fd, &plan);
++    if (err < 0)
++        return err;
++    err = macho_chained_fixups(fd, &plan, 0, 0, false);
++    if (err < 0)
++        return err;
++
++    uint64_t span = plan.max_vmaddr - plan.min_vmaddr;
++    pages_t image_pages = PAGE_ROUND_UP(span);
++    pages_t total_pages = image_pages + 1; // one task-local syscall veneer page
++    write_wrlock(&current->mem->lock);
++    page_t image_page = pt_find_hole(current->mem, total_pages);
++    write_wrunlock(&current->mem->lock);
++    if (image_page == BAD_PAGE)
++        return _ENOMEM;
++    addr_t image_base = image_page << PAGE_BITS;
++    addr_t veneer_page = image_base + ((addr_t)image_pages << PAGE_BITS);
++
++    // All commands, ranges, imports, and fixup chains are validated before this point. Replace
++    // the old address space only after the complete image has passed the same pure preflight used
++    // by top-level process-authority classification.
++    struct mm *new_mm = mm_new();
++    if (new_mm == NULL)
++        return _ENOMEM;
++    lock(&current->general_lock);
++    struct mm *old_mm = current->mm;
++    task_set_mm(current, new_mm);
++    mm_release_from(old_mm, "macho exec");
++    unlock(&current->general_lock);
++
++    write_wrlock(&current->mem->lock);
++    current->mm->exefile = fd_retain(fd);
++    current->mm->exe_bias = image_base;
++    current->mm->exe_entry = image_base + (plan.entry_vmaddr - plan.min_vmaddr);
++    current->darwin_abi = true;
++    for (size_t i = 0; i < plan.segment_count; i++) {
++        const struct macho64_segment *s = &plan.segments[i];
++        if (s->vmsize == 0 || strncmp(s->segname, "__PAGEZERO", 16) == 0)
++            continue;
++        page_t page = PAGE(image_base + (s->vmaddr - plan.min_vmaddr));
++        pages_t pages = PAGE_ROUND_UP(s->vmsize);
++        // Materialize writable pages for file loading and chained rebases, then apply each
++        // segment's declared non-W+X final protection below.
++        err = pt_map_nothing(current->mem, page, pages, P_READ | P_WRITE);
++        if (err < 0)
++            goto macho_load_fail_locked;
++    }
++    err = pt_map_nothing(current->mem, PAGE(veneer_page), 1, P_READ | P_WRITE);
++    if (err < 0)
++        goto macho_load_fail_locked;
++    write_wrunlock(&current->mem->lock);
++
++    uint8_t buffer[4096];
++    for (size_t i = 0; i < plan.segment_count; i++) {
++        const struct macho64_segment *s = &plan.segments[i];
++        if (s->filesize == 0 || strncmp(s->segname, "__PAGEZERO", 16) == 0)
++            continue;
++        uint64_t copied = 0;
++        addr_t dest = image_base + (s->vmaddr - plan.min_vmaddr);
++        while (copied < s->filesize) {
++            size_t amount = (size_t)(s->filesize - copied);
++            if (amount > sizeof(buffer)) amount = sizeof(buffer);
++            if (macho_read_at(fd, s->fileoff + copied, buffer, amount) < 0 ||
++                user_write(dest + copied, buffer, amount))
++                return _EIO;
++            copied += amount;
++        }
++    }
++
++    // Darwin class-2 syscall veneers are guest ARM64 code. They enter calls.c with x16 set to the
++    // declared Darwin syscall number, preserving the task's guest file table, signal path and cwd.
++    static const uint32_t veneer_template[] = {
++        0xd2800090U, 0xf2a04010U, 0xd4001001U, 0xd65f03c0U, // write (class 2, number 4)
++        0xd2800070U, 0xf2a04010U, 0xd4001001U, 0xd65f03c0U, // read (class 2, number 3)
++        0xd28000d0U, 0xf2a04010U, 0xd4001001U, 0xd65f03c0U, // close (class 2, number 6)
++        0xd2800030U, 0xf2a04010U, 0xd4001001U, 0xd65f03c0U, // exit (class 2, number 1)
++    };
++    if (user_write(veneer_page, veneer_template, sizeof(veneer_template)))
++        return _EFAULT;
++    addr_t write_stub = veneer_page;
++    addr_t read_stub = veneer_page + 16;
++    addr_t close_stub = veneer_page + 32;
++    addr_t exit_stub = veneer_page + 48;
++    (void)read_stub;
++    (void)close_stub;
++
++    err = macho_chained_fixups(fd, &plan, image_base, write_stub, true);
++    if (err < 0)
++        return err;
++
++    write_wrlock(&current->mem->lock);
++    for (size_t i = 0; i < plan.segment_count; i++) {
++        const struct macho64_segment *s = &plan.segments[i];
++        if (s->vmsize == 0 || strncmp(s->segname, "__PAGEZERO", 16) == 0)
++            continue;
++        unsigned prot = 0;
++        if (s->initprot & 1) prot |= P_READ;
++        if (s->initprot & 2) prot |= P_WRITE;
++        if (s->initprot & 4) prot |= P_EXEC;
++        page_t page = PAGE(image_base + (s->vmaddr - plan.min_vmaddr));
++        pages_t pages = PAGE_ROUND_UP(s->vmsize);
++        err = pt_set_flags(current->mem, page, pages, prot);
++        if (err < 0)
++            goto macho_load_fail_locked;
++    }
++    err = pt_set_flags(current->mem, PAGE(veneer_page), 1, P_READ | P_EXEC);
++    if (err < 0)
++        goto macho_load_fail_locked;
++    if ((err = pt_map_nothing(current->mem, STACK_INIT_PAGE, 1, P_WRITE | P_GROWSDOWN)) < 0 ||
++        (err = pt_map_nothing(current->mem, STACK_TOP_PAGE, 1, P_READ)) < 0)
++        goto macho_load_fail_locked;
++    write_wrunlock(&current->mem->lock);
++
++    addr_t sp = STACK_TOP_ADDR - sizeof(void *);
++    (void)(sp = copy_string(sp, file));
++    if (sp == 0) return _EFAULT;
++    addr_t envp_addr = sp = args_copy(sp, envp);
++    if (sp == 0) return _EFAULT;
++    current->mm->argv_end = sp;
++    addr_t argv_addr = sp = args_copy(sp, argv);
++    if (sp == 0) return _EFAULT;
++    current->mm->argv_start = sp;
++    sp = align_stack(sp);
++    sp -= 3 * sizeof(uint64_t) + (argv.count + envp.count) * sizeof(uint64_t);
++    sp &= ~0xfULL;
++    addr_t p = sp;
++    uint64_t argc = argv.count;
++    if (user_put(p, argc)) return _EFAULT;
++    p += sizeof(uint64_t);
++    for (size_t n = 0; n < argv.count; n++) {
++        uint64_t string_addr = argv_addr;
++        if (user_put(p, string_addr)) return _EFAULT;
++        argv_addr += user_strlen(argv_addr) + 1;
++        p += sizeof(uint64_t);
++    }
++    p += sizeof(uint64_t); // argv NULL
++    for (size_t n = 0; n < envp.count; n++) {
++        uint64_t string_addr = envp_addr;
++        if (user_put(p, string_addr)) return _EFAULT;
++        envp_addr += user_strlen(envp_addr) + 1;
++        p += sizeof(uint64_t);
++    }
++    p += sizeof(uint64_t); // envp NULL
++    uint64_t apple_null = 0;
++    if (user_put(p, apple_null)) return _EFAULT;
++    current->mm->stack_start = sp;
++    current->cpu.sp = sp;
++    current->cpu.pc = image_base + (plan.entry_vmaddr - plan.min_vmaddr);
++    memset(current->cpu.regs, 0, sizeof(current->cpu.regs));
++    current->cpu.nzcv = current->cpu.nf = current->cpu.zf = 0;
++    current->cpu.cf = current->cpu.vf = current->cpu.fpcr = current->cpu.fpsr = 0;
++    current->cpu.regs[0] = argc;
++    current->cpu.regs[1] = sp + sizeof(uint64_t);
++    current->cpu.regs[2] = sp + sizeof(uint64_t) * (argv.count + 2);
++    current->cpu.regs[30] = exit_stub; // LC_MAIN enters C main directly; return becomes Darwin exit.
++    return 0;
++
++macho_load_fail_locked:
++    write_wrunlock(&current->mem->lock);
++    return err;
++}
++#endif
++
+ static inline addr_t align_stack(addr_t sp) {
+     return sp &~ (addr_t)0xf;
+ }
+@@ -577,6 +1123,9 @@
+ 
+ static int format_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
+     int err = elf_exec(fd, file, argv, envp);
++    if (err != _ENOEXEC)
++        return err;
++    err = macho_exec(fd, file, argv, envp);
+     if (err != _ENOEXEC)
+         return err;
+     // other formats would go here
+--- a/kernel/task.h
++++ b/kernel/task.h
+@@ -32,6 +32,9 @@
+     uid_t_ groups[MAX_GROUPS];
+     char comm[16] __strncpy_safe; // locked by general_lock
+     bool did_exec; // for that one annoying setsid edge case
++    // The ARM64 task is executing the restricted Mach-O/Darwin syscall ABI.
++    // This is per-task state and is reset by every successful exec.
++    bool darwin_abi;
+     bool undumpable; // prctl(PR_SET_DUMPABLE, 0); inherited by fork, cleared by exec
+ 
+     struct fdtable *files;

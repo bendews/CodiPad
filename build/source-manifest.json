@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/microsoft/vscode.git",
+    "tag": "1.143.1",
+    "revision": "e646868227c3e3a9e3f24277c8c7220be42c0be7",
+    "license": {
+      "spdx": "MIT",
+      "file": "LICENSE.txt",
+      "url": "https://github.com/microsoft/vscode/blob/e646868227c3e3a9e3f24277c8c7220be42c0be7/LICENSE.txt"
+    },
+    "vendorPath": "vendor/vscode",
+    "patchSeries": "patches/vscode/series"
+  },
+  "agentHost": {
+    "sqlite": {
+      "package": "@vscode/sqlite3",
+      "version": "5.1.12-vscode",
+      "url": "https://registry.npmjs.org/@vscode/sqlite3/-/sqlite3-5.1.12-vscode.tgz",
+      "sha256": "521675e4de9714e91862d1aff6d10cf88351e3c03ad9b699062b7b754ccb9144",
+      "integrity": "sha512-WLTftbMtK3Ni0s+q46qtKJ2CFtA3YrS5N4GcrETDCxqNTQAvk1LlYlG3RwGE6vZLcUqPt3TCHobijYeNUhEQ9Q==",
+      "nodeAddonApi": {
+        "package": "node-addon-api",
+        "version": "8.2.0",
+        "url": "https://registry.npmjs.org/node-addon-api/-/node-addon-api-8.2.0.tgz",
+        "sha256": "c1f2bf15f3396ad9ea9e6361a44022e4571904226f3d7367f0e2a6c6be0a5d6e",
+        "integrity": "sha512-qnyuI2ROiCkye42n9Tj5aX1ns7rzj6n7zW1XReSnLSL9v/vbLeR6fJq6PU27YU/ICfYw6W7Ouk/N7cysWu/hlw=="
+      }
+    },
+    "parcel": {
+      "package": "@parcel/watcher-linux-arm64-glibc",
+      "version": "2.5.6",
+      "url": "https://registry.npmjs.org/@parcel/watcher-linux-arm64-glibc/-/watcher-linux-arm64-glibc-2.5.6.tgz",
+      "sha256": "084d8a2dbea9c6a4c1b49d680abed344294f413a86a2184b7e013c1b395b30a0",
+      "integrity": "sha512-f2g/DT3NhGPdBmMWYoxixqYr3v/UXcmLOYy16Bx0TM20Tchduwr4EaCbmxh1321TABqPGDpS8D/ggOTaljijOA=="
+    },
+    "noticeInputs": {
+      "schemaVersion": 1,
+      "notices": {
+        "node_modules/@xterm/headless": {
+          "version": "6.1.0-beta.303",
+          "integrity": "sha512-FjPRg5OF0UdloypPRZcUdtpxaxYKk7FdNArgpOaedoj7UWzinB+THZyEY7t6QHRR5bjcbz7B7s4vX0Zo5LT6aw==",
+          "path": "workbench/notices/agent-host/XTERM-LICENSE",
+          "sha256": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+          "source": {
+            "repository": "https://github.com/xtermjs/xterm.js",
+            "revision": "c58ea3637f3968e0e6e79cd92cf9aace7ef89ee2",
+            "url": "https://raw.githubusercontent.com/xtermjs/xterm.js/c58ea3637f3968e0e6e79cd92cf9aace7ef89ee2/LICENSE"
+          }
+        },
+        "node_modules/@github/copilot-sdk": {
+          "version": "1.0.23-preview.5",
+          "integrity": "sha512-anfJXS4akvrvjlss9ge3azjwiETiTv2gAouWyKYW/4F6vTH2xRz23Mfd5vqIPHOipC8YaQlOXCnaI2rdDY+BIw==",
+          "path": "workbench/notices/agent-host/COPILOT-SDK-LICENSE",
+          "sha256": "2510b446bc1f0cf9702453075d20cd88631e20e5642658edb7325d9c1eb534f7",
+          "source": {
+            "repository": "https://github.com/github/copilot-sdk",
+            "revision": "b96cd2b54f7eb87458fd50f485a751c712e88f62",
+            "url": "https://raw.githubusercontent.com/github/copilot-sdk/b96cd2b54f7eb87458fd50f485a751c712e88f62/LICENSE",
+            "releaseTag": "v1.0.23-preview.5"
+          }
+        }
+      }
+    }
+  }
+}

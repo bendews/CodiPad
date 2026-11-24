@@ -1,0 +1,28 @@
+.DS_Store
+/build/*
+!/build/source-manifest.json
+!/build/runtime-manifest.json
+/.build/
+/native/CodiPadWorkspace/.build/
+/.evidence/
+/vendor/
+/app/generated/
+__pycache__/
+*.pyc
+DerivedData/
+node_modules/
+*.xcuserstate
+xcuserdata/
+
+# Local signing credentials and exported builds
+*.p8
+*.p12
+*.mobileprovision
+*.ipa
+*.xcarchive/
+*.xcresult/
+
+# Local environment overrides
+.env
+.env.*
+!.env.example

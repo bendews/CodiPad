@@ -1,0 +1,602 @@
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -43,6 +43,7 @@
+ static bool pic_on;       // ISH_JIT_PIC=0: disable translation sharing (see "PIC" below)
+ static bool aot_only;     // ISH_JIT_AOT_ONLY=1: install AOT translations, translate nothing
+                           // (what a build without the JIT would run)
++static bool flat_memory_emission; // ISH_FLAT_MEMORY=1 enables scalar-load metadata lookup
+ 
+ static bool env_off(const char *name) {
+     const char *v = getenv(name);
+@@ -728,8 +729,86 @@
+ 
+ // Inline TLB lookup for guest address in T_A (bytes = access size); leaves
+ // the host address in T_A. Branches to the unit's stub on a miss or crossing.
+-static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos) {
++static unsigned emit_local_cond(struct em *e, unsigned cond) {
++    unsigned at = e->n;
++    put(e, 0x54000000u | cond); // b.cond, patched to an in-block label
++    return at;
++}
++
++static void patch_local_cond(struct em *e, unsigned at, unsigned target) {
++    int32_t delta = (int32_t) target - (int32_t) at;
++    e->buf[at] = 0x54000000u | (((uint32_t) delta & 0x7ffffu) << 5) |
++                 (e->buf[at] & 0xfu);
++}
++
++static void patch_local_b(struct em *e, unsigned at, unsigned target) {
++    int32_t delta = (int32_t) target - (int32_t) at;
++    e->buf[at] = 0x14000000u | ((uint32_t) delta & 0x3ffffffu);
++}
++
++static unsigned emit_local_cbz(struct em *e, unsigned reg, bool nonzero) {
++    unsigned at = e->n;
++    put(e, (nonzero ? 0xB5000000u : 0xB4000000u) | reg);
++    return at;
++}
++
++static void patch_local_cbz(struct em *e, unsigned at, unsigned target) {
++    int32_t delta = (int32_t) target - (int32_t) at;
++    e->buf[at] |= ((uint32_t) delta & 0x7ffffu) << 5;
++}
++
++static unsigned emit_local_tbnz(struct em *e, unsigned reg, unsigned bit) {
++    unsigned at = e->n;
++    put(e, 0x37000000u | (bit << 19) | reg);
++    return at;
++}
++
++static void patch_local_tb(struct em *e, unsigned at, unsigned target) {
++    int32_t delta = (int32_t) target - (int32_t) at;
++    e->buf[at] |= ((uint32_t) delta & 0x3fffu) << 5;
++}
++
++static void tlb_lookup(struct em *e, unsigned bytes, bool write, unsigned spos,
++                       bool flat_read) {
+     e->hflags = false;   // the checks below use cmp
++    unsigned flat_fail[2], nflat_fail = 0, flat_success = 0, flat_old = 0;
++    unsigned pages_null = 0, high_nonzero = 0;
++    if (flat_read && flat_memory_emission) {
++        // tlb_refresh validates the exact 4 GiB view. Helpers may drop and
++        // reacquire the memory lock inside a block, so keep the per-access
++        // stale check. Its high marker also makes the full-address check fail.
++        int stale_off = (int) offsetof(struct tlb, stale) -
++                        (int) offsetof(struct tlb, entries);
++        put(e, 0xF8400000u | ((uint32_t) (stale_off & 0x1ff) << 12) |
++                   (2u << 5) | T_Q); // ldur x12, [x2, #stale]
++        put(e, 0xAA000000u | (T_Q << 16) | (T_A << 5) | T_Q); // orr x12, x9, x12
++        put(e, 0xD3400000u | (32u << 16) | (63u << 10) |
++                   (T_Q << 5) | T_Q); // ubfx x12, x12, #32, #32
++        high_nonzero = emit_local_cbz(e, T_Q, true);
++
++        // The view fields are adjacent. Load the base and metadata together;
++        // retain the base in x8 until the permission check succeeds.
++        int view_off = (int) offsetof(struct tlb, flat_base) -
++                       (int) offsetof(struct tlb, entries);
++        put(e, 0xA9400000u | (((uint32_t) (view_off / 8) & 0x7f) << 15) |
++                   (T_E << 10) | (2u << 5) | T_P); // ldp x8, x11, [x2, #-16]
++        pages_null = emit_local_cbz(e, T_E, false);
++
++        // Keep the complete scalar range inside one 4 KiB metadata page.
++        put(e, 0x92402C00u | (T_A << 5) | T_Q); // and x12, x9, #0xfff
++        put(e, 0xF100001Fu | ((0x1000 - bytes) << 10) | (T_Q << 5));
++        flat_fail[nflat_fail++] = emit_local_cond(e, 8); // b.hi old TLB
++
++        // The metadata byte is canonical and byte aligned; test DirectRead
++        // directly without extracting or normalizing unrelated permission bits.
++        put(e, 0xD3400000u | (12u << 16) | (31u << 10) |
++                   (T_A << 5) | T_I); // ubfx x10, x9, #12, #20
++        put(e, 0x38606800u | (T_I << 16) | (3u << 13) |
++                   (T_E << 5) | T_Q); // ldrb w12, [x11, x10]
++        const unsigned direct_read_bit = __builtin_ctz((unsigned) CodiPadGuestPageDirectRead);
++        flat_success = emit_local_tbnz(e, T_Q, direct_read_bit);
++    }
++    flat_old = e->n;
+     put(e, 0x9240BC00u | (T_A << 5) | T_A);                    // and x9, x9, #0xffffffffffff
+     put(e, 0xD34C6000u | (T_A << 5) | T_I);                    // ubfx x10, x9, #12, #13
+     put(e, 0xCA400000u | (T_A << 16) | (25u << 10) | (T_I << 5) | T_I);  // eor x10, x10, x9, lsr #25
+@@ -750,6 +829,19 @@
+     branch_stub(e, spos, 2);                                   // b.hi stub
+     put(e, 0xF9400000u | ((offsetof(struct tlb_entry, data_minus_addr) / 8) << 10) | (T_I << 5) | T_E);  // ldr x11, [x10, #dma]
+     put(e, 0x8B000000u | (T_A << 16) | (T_E << 5) | T_A);      // add x9, x11, x9
++    if (flat_success != 0) {
++        unsigned flat_skip = e->n;
++        put(e, 0); // b over direct block after ordinary TLB hit
++        unsigned direct_block = e->n;
++        put(e, 0x8B000000u | (T_A << 16) | (T_P << 5) | T_A); // add x9, x8, x9
++        unsigned end = e->n;
++        patch_local_b(e, flat_skip, end);
++        patch_local_tb(e, flat_success, direct_block);
++        patch_local_cbz(e, pages_null, flat_old);
++        patch_local_cbz(e, high_nonzero, flat_old);
++        for (unsigned i = 0; i < nflat_fail; i++)
++            patch_local_cond(e, flat_fail[i], flat_old);
++    }
+ }
+ 
+ // Load/store translation. Returns false if the form is unsupported.
+@@ -925,7 +1017,7 @@
+         if (imm < -4095 || imm > 4095) return false;
+         int gn = rn == 31 ? G_SP : rn;
+         int hn = ldst_addr(e, gn, imm, idx == 1);
+-        tlb_lookup(e, 2u << scale, !L, spos);
++        tlb_lookup(e, 2u << scale, !L, spos, false);
+         if (!L) { vload(e, V_N, rt); vload(e, V_M, rt2); }
+         put(e, (x & 0xC0400000u) | 0x2D000000u | ((uint32_t) V_M << 10) | (T_A << 5) | V_N);   // ldp/stp vN, vM, [x9]
+         if (L) { vstore(e, V_N, rt); vstore(e, V_M, rt2); }
+@@ -952,7 +1044,7 @@
+     bool load = opc & 1;
+     int gn = rn == 31 ? G_SP : rn;
+     int hn = ldst_addr(e, gn, imm, wbmode == 1);
+-    tlb_lookup(e, 1u << scale, !load, spos);
++    tlb_lookup(e, 1u << scale, !load, spos, false);
+     if (!load) vload(e, V_N, rt);
+     put(e, (x & 0xC0C00000u) | 0x3D000000u | (T_A << 5) | V_N);              // ldr/str vN, [x9]
+     if (load) vstore(e, V_N, rt);   // the host load zeroed the rest of the register
+@@ -978,7 +1070,7 @@
+         if (idx == 1) put(e, 0xAA0003E0u | ((uint32_t) hn << 16) | T_A);       // mov x9, xn (post-index)
+         else if (imm >= 0) put(e, 0x91000000u | ((uint32_t) imm << 10) | ((uint32_t) hn << 5) | T_A);
+         else put(e, 0xD1000000u | ((uint32_t) -imm << 10) | ((uint32_t) hn << 5) | T_A);
+-        tlb_lookup(e, 2u << scale, !L, spos);
++        tlb_lookup(e, 2u << scale, !L, spos, false);
+         int ht = rt == 31 ? 31 : L ? hdest(e, rt) : hreg(e, rt);
+         int ht2 = rt2 == 31 ? 31 : L ? hdest(e, rt2) : hreg(e, rt2);
+         // host pair access, signed-offset form, offset 0
+@@ -1035,7 +1127,7 @@
+     }
+     if (prfm)
+         goto writeback_base;
+-    tlb_lookup(e, 1u << size, !load, spos);
++    tlb_lookup(e, 1u << size, !load, spos, load);
+     {
+         int ht = rt == 31 ? 31 : load ? hdest(e, rt) : hreg(e, rt);
+         put(e, (x & 0xC0C00000u) | 0x39000000u | (T_A << 5) | (uint32_t) ht);   // host access: same size/opc, [x9]
+@@ -2394,7 +2486,7 @@
+ 
+ // Bump whenever the code emitted for some guest instruction, stub or exit
+ // changes: images made before would still pass every other check.
+-#define JIT_CODE_VERSION 14
++#define JIT_CODE_VERSION 15
+ 
+ // Everything the emitted code bakes in besides the gadgets it names: the
+ // conventions, the struct layouts it loads from and the TLB / block cache
+@@ -3830,6 +3922,8 @@
+         jit_note("jit: fallback (ISH_JIT=0)");
+         return;
+     }
++    const char *flat = getenv("ISH_FLAT_MEMORY");
++    flat_memory_emission = flat != NULL && flat[0] != '\0' && flat[0] != '0';
+ #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+     // TXM devices may execute only from the debugger-prepared region. If none
+     // was installed before boot, leave JIT disabled and use guest gadgets.
+--- a/emu/mmu.h
++++ b/emu/mmu.h
+@@ -3,6 +3,7 @@
+ 
+ #include "misc.h"
+ #ifdef GUEST_ARM64
++#include "GuestMemoryWindow.h"
+ #include "util/list.h"
+ #include "util/sync.h"
+ #endif
+@@ -54,6 +55,9 @@
+     // Like translate(MEM_WRITE) but returns NULL instead of triggering CoW/GROWSDOWN.
+     // Used by TLB to speculatively populate write permission on read miss.
+     void *(*translate_write_nofault)(struct mmu *mmu, addr_t addr);
++#ifdef GUEST_ARM64
++    int (*get_flat_view)(struct mmu *mmu, CodiPadGuestMemoryView *view);
++#endif
+ };
+ 
+ static inline void *mmu_translate(struct mmu *mmu, addr_t addr, int type) {
+--- a/emu/tlb.c
++++ b/emu/tlb.c
+@@ -17,7 +17,29 @@
+ }
+ #endif
+ 
++#ifdef GUEST_ARM64
++static void tlb_refresh_flat_view(struct tlb *tlb, struct mmu *mmu) {
++    // Called only while the address-space read lock is held. A helper can
++    // drop/reacquire that lock inside a block, so refresh after such helpers
++    // before generated code is allowed to reuse these borrowed pointers.
++    CodiPadGuestMemoryView flat = {0};
++    if (mmu->ops->get_flat_view != NULL && mmu->ops->get_flat_view(mmu, &flat) &&
++        flat.base != NULL && flat.pages != NULL && flat.length == (1ULL << 32)) {
++        tlb->flat_base = flat.base;
++        tlb->flat_pages = flat.pages;
++    } else {
++        tlb->flat_base = NULL;
++        tlb->flat_pages = NULL;
++    }
++}
++#endif
++
+ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
++#ifdef GUEST_ARM64
++    // Refresh on every guest entry, even when the software TLB generation did
++    // not change.
++    tlb_refresh_flat_view(tlb, mmu);
++#endif
+     if (tlb->mmu == mmu && tlb->mem_changes == mmu->changes)
+         return;
+     if (tlb->mmu != mmu) {
+@@ -50,12 +72,15 @@
+ 
+ void tlb_detach(struct tlb *tlb) {
+     struct mmu *mmu = tlb->attached;
+-    if (mmu == NULL)
+-        return;
+-    lock(&mmu->tlbs_lock);
+-    list_remove(&tlb->tlbs_link);
+-    unlock(&mmu->tlbs_lock);
+-    tlb->attached = NULL;
++    if (mmu != NULL) {
++        lock(&mmu->tlbs_lock);
++        list_remove(&tlb->tlbs_link);
++        unlock(&mmu->tlbs_lock);
++        tlb->attached = NULL;
++    }
++    // Generated code cannot retain a borrowed view across the lock boundary.
++    tlb->flat_base = NULL;
++    tlb->flat_pages = NULL;
+ }
+ 
+ // After mmu->changes moved: the threads running in this address space may
+@@ -177,6 +202,13 @@
+         }
+         // Raced with a concurrent remap — retry with the fresh generation.
+     }
++#ifdef GUEST_ARM64
++    // mmu_translate may have dropped the memory lock to resolve CoW or grow a
++    // stack page. The old borrowed view can have been released in that gap.
++    // The helper returns with the lock reacquired, so publish the current view
++    // before clearing control returns to generated code.
++    tlb_refresh_flat_view(tlb, tlb->mmu);
++#endif
+     if (ptr == NULL) {
+         tlb->segfault_addr = addr;
+         return NULL;
+--- a/emu/tlb.h
++++ b/emu/tlb.h
+@@ -34,6 +34,10 @@
+     // mem_changes (a fill flushes first when it moved), so this one bit stands
+     // for all their generations.
+     uint64_t stale;
++    // Borrowed flat view, valid only while attached under the address-space
++    // read lock. Cleared at detach; generated code also rejects stale TLBs.
++    void *flat_base;
++    const uint8_t *flat_pages;
+ #endif
+     // this is basically one of the return values of tlb_handle_miss, tlb_{read,write}, and __tlb_{read,write}_cross_page
+     // yes, this sucks
+--- a/kernel/memory.c
++++ b/kernel/memory.c
+@@ -19,10 +19,16 @@
+ #include "kernel/task.h"
+ #include "kernel/resource.h"
+ #include "fs/fd.h"
++#ifdef GUEST_ARM64
++#include "GuestMemoryWindow.h"
++#endif
+ 
+ // increment the change count
+ static void mem_changed(struct mem *mem);
+ static struct mmu_ops mem_mmu_ops;
++#ifdef GUEST_ARM64
++static struct mmu_ops mem_flat_mmu_ops;
++#endif
+ 
+ #include "kernel/mm.h"
+ #include "emu/tlb.h"
+@@ -32,6 +38,170 @@
+ // ============================================================
+ // ARM64: 4-level page table for 48-bit address space
+ // ============================================================
++
++struct flat_memory_binding {
++    page_t group;
++    struct data *data;
++    struct flat_memory_binding *next;
++};
++
++// Experimental and default-off. The ordinary page table remains the source
++// of truth; this aliases only eligible anonymous backing into a per-mm window.
++static bool flat_memory_requested(void) {
++    const char *value = getenv("ISH_FLAT_MEMORY");
++    return value != NULL && value[0] != '\0' && value[0] != '0';
++}
++
++static void flat_binding_drop(struct flat_memory_binding **link) {
++    struct flat_memory_binding *binding = *link;
++    *link = binding->next;
++    struct data *data = binding->data;
++    if (--data->refcount == 0) {
++        if (data->data != vdso_data) munmap(data->data, data->size);
++        if (data->fd != NULL) fd_close(data->fd);
++        free(data);
++    }
++    free(binding);
++}
++
++static void flat_bindings_drop_range(struct mem *mem, page_t first, page_t last) {
++    struct flat_memory_binding **link = &mem->flat_bindings;
++    while (*link != NULL) {
++        if ((*link)->group >= first && (*link)->group < last)
++            flat_binding_drop(link);
++        else
++            link = &(*link)->next;
++    }
++}
++
++static struct flat_memory_binding **flat_binding_link(struct mem *mem, page_t group) {
++    struct flat_memory_binding **link = &mem->flat_bindings;
++    while (*link != NULL && (*link)->group != group)
++        link = &(*link)->next;
++    return link;
++}
++
++static void flat_bindings_drop_all(struct mem *mem) {
++    while (mem->flat_bindings != NULL)
++        flat_binding_drop(&mem->flat_bindings);
++}
++
++static void flat_window_disable(struct mem *mem) {
++    if (mem->flat_window == NULL) return;
++    mem->flat_failed = true;
++    mem->mmu.ops = &mem_mmu_ops;
++    int host_error = 0;
++    CodiPadGuestMemoryResult result = CodiPadGuestMemoryWindowRelease(mem->flat_window, &host_error);
++    if (result == CodiPadGuestMemoryOK) {
++        mem->flat_window = NULL;
++        flat_bindings_drop_all(mem);
++    } else {
++        // The aliases may still address these data objects. Keep every pin
++        // until a later successful Release; never free the backing here.
++        printk("[iSH][FLAT-MEMORY] window release failed: %d\n", host_error);
++    }
++}
++
++static void flat_sync_range(struct mem *mem, page_t start, pages_t pages) {
++    if (mem->flat_window == NULL || mem->flat_failed || pages == 0 || start >= (1ULL << 20))
++        return;
++    const size_t host_bytes = CodiPadGuestMemoryWindowHostPageSize(mem->flat_window);
++    if (host_bytes < PAGE_SIZE || host_bytes % PAGE_SIZE != 0)
++        return;
++    const page_t group_pages = host_bytes / PAGE_SIZE;
++    const page_t limit = 1ULL << 20; // the flat window is exactly 4 GiB
++    page_t end = start + pages;
++    if (end < start || end > limit) end = limit;
++    page_t group = start / group_pages * group_pages;
++    while (group < end) {
++        if (mem->flat_window == NULL || mem->flat_failed) return;
++        if (group + group_pages > limit) break;
++        struct pt_entry *first = mem_pt(mem, group);
++        bool eligible = first != NULL && first->data != NULL &&
++            first->data->fd == NULL &&
++            (first->flags & (P_ANONYMOUS | P_READ | P_WRITE)) ==
++                (P_ANONYMOUS | P_READ | P_WRITE) &&
++            !(first->flags & (P_SHARED | P_COW)) &&
++            ((uintptr_t) first->data->data + first->offset) % host_bytes == 0;
++        struct data *data = eligible ? first->data : NULL;
++        size_t first_offset = eligible ? first->offset : 0;
++        if (eligible && (first_offset > data->size || host_bytes > data->size - first_offset))
++            eligible = false;
++        for (page_t i = 0; eligible && i < group_pages; i++) {
++            struct pt_entry *entry = mem_pt(mem, group + i);
++            eligible = entry != NULL && entry->data == data &&
++                entry->offset == first_offset + i * PAGE_SIZE &&
++                entry->data->fd == NULL &&
++                (entry->flags & (P_ANONYMOUS | P_READ | P_WRITE)) ==
++                    (P_ANONYMOUS | P_READ | P_WRITE) &&
++                !(entry->flags & (P_SHARED | P_COW));
++        }
++        if (eligible) {
++            int host_error = 0;
++            void *backing = (char *) data->data + first_offset;
++            // A repeated sync can encounter an existing alias. Revoke that
++            // exact group before attempting to replace it, retaining its pin
++            // if revocation fails.
++            struct flat_memory_binding **existing = flat_binding_link(mem, group);
++            if (*existing != NULL) {
++                CodiPadGuestMemoryResult unbind = CodiPadGuestMemoryWindowUnbind(
++                    mem->flat_window, group << PAGE_BITS, host_bytes, &host_error);
++                if (unbind != CodiPadGuestMemoryOK) {
++                    flat_window_disable(mem);
++                    return;
++                }
++                flat_binding_drop(existing);
++            }
++            struct flat_memory_binding *binding = malloc(sizeof(*binding));
++            if (binding == NULL) {
++                group += group_pages;
++                continue;
++            }
++            binding->group = group;
++            binding->data = data;
++            binding->next = mem->flat_bindings;
++            mem->flat_bindings = binding;
++            ++data->refcount; // pin backing until its alias is successfully revoked
++            CodiPadGuestMemoryResult result = CodiPadGuestMemoryWindowBind(
++                mem->flat_window, group << PAGE_BITS, host_bytes, backing,
++                CodiPadGuestMemoryRead, &host_error);
++            if (result == CodiPadGuestMemoryHostFailure) {
++                flat_window_disable(mem);
++                return;
++            } else if (result != CodiPadGuestMemoryOK) {
++                // Only this attempted binding is ours to release. Never drop
++                // another live alias's source pin on a conflict response.
++                struct flat_memory_binding **link = flat_binding_link(mem, group);
++                if (*link == binding) flat_binding_drop(link);
++            }
++            // Alignment, conflict, and unsupported mappings remain indirect.
++        }
++        group += group_pages;
++    }
++}
++
++static void flat_unbind_range(struct mem *mem, page_t start, pages_t pages) {
++    if (mem->flat_window == NULL || mem->flat_failed || pages == 0 || start >= (1ULL << 20))
++        return;
++    const size_t host_bytes = CodiPadGuestMemoryWindowHostPageSize(mem->flat_window);
++    if (host_bytes < PAGE_SIZE || host_bytes % PAGE_SIZE != 0)
++        return;
++    page_t group_pages = host_bytes / PAGE_SIZE;
++    page_t end = start + pages;
++    if (end < start || end > (1ULL << 20)) end = 1ULL << 20;
++    page_t first = start / group_pages * group_pages;
++    page_t last = (end + group_pages - 1) / group_pages * group_pages;
++    if (last > (1ULL << 20)) last = 1ULL << 20;
++    if (last <= first) return;
++    int host_error = 0;
++    CodiPadGuestMemoryResult result = CodiPadGuestMemoryWindowUnbind(
++        mem->flat_window, first << PAGE_BITS,
++        (size_t) (last - first) << PAGE_BITS, &host_error);
++    if (result == CodiPadGuestMemoryOK)
++        flat_bindings_drop_range(mem, first, last);
++    else
++        flat_window_disable(mem);
++}
+ 
+ void mem_init(struct mem *mem) {
+     mem->pgdir = calloc(1, sizeof(struct pt_node));
+@@ -41,6 +211,15 @@
+     mem->mmu.ops = &mem_mmu_ops;
+     mem->mmu.asbestos = asbestos_new(&mem->mmu);
+     mem->mmu.changes = 0;
++    mem->flat_window = NULL;
++    mem->flat_bindings = NULL;
++    mem->flat_failed = false;
++    if (flat_memory_requested()) {
++        int host_error = 0;
++        mem->flat_window = CodiPadGuestMemoryWindowCreate(&host_error);
++    }
++    if (mem->flat_window != NULL)
++        mem->mmu.ops = &mem_flat_mmu_ops;
+     lock_init(&mem->mmu.tlbs_lock);
+     list_init(&mem->mmu.tlbs);
+     wrlock_init(&mem->lock);
+@@ -84,6 +263,7 @@
+            current ? current->pid : -1, (void *) mem,
+            (unsigned long long) MM_OF_MEM(mem)->seq, mem->lock.val, mem->lock.pid);
+     write_wrlock(&mem->lock);
++    flat_window_disable(mem);
+     pt_unmap_always(mem, 0, MEM_PAGES);
+     while (mem->reservations) {
+         struct mem_reservation *r = mem->reservations;
+@@ -607,6 +787,9 @@
+         pt->flags = flags;
+ 
+     }
++#ifdef GUEST_ARM64
++    flat_sync_range(mem, start, pages);
++#endif
+     return 0;
+ }
+ 
+@@ -618,6 +801,10 @@
+ }
+ 
+ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
++#ifdef GUEST_ARM64
++    // Revoke aliases before any page can drop the final struct data reference.
++    flat_unbind_range(mem, start, pages);
++#endif
+     // Reset mmap_hint if freed region is above it, so pt_find_hole can
+     // reuse the freed space on the next mmap(addr=0).
+     if (start + pages - 1 > mem->mmap_hint)
+@@ -874,6 +1061,9 @@
+             return _ENOMEM;
+         }
+     }
++#ifdef GUEST_ARM64
++    flat_unbind_range(mem, start, pages);
++#endif
+     for (page_t page = start; page < start + pages; page++) {
+         struct pt_entry *entry = mem_pt(mem, page);
+         if (entry == NULL) {
+@@ -970,11 +1160,20 @@
+                 return errno_map();
+         }
+     }
++    #ifdef GUEST_ARM64
++    flat_sync_range(mem, start, pages);
++    #endif
+     mem_changed(mem);
+     return 0;
+ }
+ 
+ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t pages) {
++#ifdef GUEST_ARM64
++    // Fork turns source pages into CoW and initially shares the same backing.
++    // Revoke both windows before either page table changes.
++    flat_unbind_range(src, start, pages);
++    flat_unbind_range(dst, start, pages);
++#endif
+ #if ANON_MMAP_LIMIT_PAGES > 0
+     long anon_copied = 0;
+ #endif
+@@ -1449,10 +1648,29 @@
+     return mem_ptr_nofault(mem, addr, MEM_WRITE);
+ }
+ 
++#ifdef GUEST_ARM64
++static int mem_mmu_get_flat_view(struct mmu *mmu, CodiPadGuestMemoryView *view) {
++    struct mem *mem = container_of(mmu, struct mem, mmu);
++    return mem->flat_window != NULL && !mem->flat_failed &&
++           CodiPadGuestMemoryWindowGetView(mem->flat_window, view);
++}
++#endif
++
+ static struct mmu_ops mem_mmu_ops = {
+     .translate = mem_mmu_translate,
+     .translate_write_nofault = mem_mmu_translate_write_nofault,
++#ifdef GUEST_ARM64
++    .get_flat_view = mem_mmu_get_flat_view,
++#endif
+ };
++
++#ifdef GUEST_ARM64
++static struct mmu_ops mem_flat_mmu_ops = {
++    .translate = mem_mmu_translate,
++    .translate_write_nofault = mem_mmu_translate_write_nofault,
++    .get_flat_view = mem_mmu_get_flat_view,
++};
++#endif
+ 
+ int mem_segv_reason(struct mem *mem, addr_t addr) {
+     struct pt_entry *pt = mem_pt(mem, PAGE(addr));
+--- a/kernel/memory.h
++++ b/kernel/memory.h
+@@ -36,11 +36,18 @@
+     void *children[PT_ENTRIES]; // pt_node* for L0-L2, pt_entry* array for L3
+ };
+ 
++struct flat_memory_binding;
++
+ struct mem {
+     struct pt_node *pgdir;  // L0 node (512 entries)
+     int pgdir_used;
+ 
+     struct mmu mmu;
++#ifdef GUEST_ARM64
++    struct CodiPadGuestMemoryWindow *flat_window;
++    struct flat_memory_binding *flat_bindings;
++    bool flat_failed;
++#endif
+ 
+     // Hint for pt_find_hole: start searching just below the last successful
+     // allocation instead of always from MMAP_HOLE_START. Reset on munmap
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -238,7 +238,8 @@
+ #ifdef GUEST_ARM64
+         tlb_attach(tlb, &self->mem->mmu);
+ #endif
+-        tlb_refresh(tlb, &self->mem->mmu);
++        // cpu_run_to_interrupt refreshes after entering the active execution
++        // window, while this address-space read lock is still held.
+         int interrupt = cpu_run_to_interrupt(cpu, tlb);
+ #ifdef GUEST_ARM64
+         tlb_detach(tlb);

@@ -1,0 +1,221 @@
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -11,10 +11,16 @@
+ #include "fs/dev.h"
+ #include "fs/real.h"
+ 
++// Own explicit directory descriptors for the complete syscall, including errors.
+ static struct fd *at_fd(fd_t f) {
+     if (f == AT_FDCWD_)
+         return AT_PWD;
+-    return f_get(f);
++    return f_get_retained(f);
++}
++
++static void at_fd_cleanup(struct fd **fd) {
++    if (*fd != NULL && *fd != AT_PWD)
++        fd_close(*fd);
+ }
+ 
+ static void apply_umask(mode_t_ *mode) {
+@@ -48,7 +54,7 @@
+     char path[MAX_PATH];
+     if (user_read_string(path_addr, path, sizeof(path)))
+         return _EFAULT;
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+     STRACE("faccessat(%d, \"%s\", 0x%x, %d)", at_f, path, mode, flags);
+@@ -75,7 +81,7 @@
+     if (flags & O_CREAT_)
+         apply_umask(&mode);
+ 
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL) {
+         return _EBADF;
+     }
+@@ -95,7 +101,7 @@
+     if (user_read_string(path_addr, path, sizeof(path)))
+         return _EFAULT;
+     STRACE("readlinkat(%d, \"%s\", %#x, %#x)", at_f, path, buf_addr, bufsize);
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+     char buf[bufsize];
+@@ -120,10 +126,10 @@
+     if (user_read_string(dst_addr, dst, sizeof(dst)))
+         return _EFAULT;
+     STRACE("linkat(%d, \"%s\", %d, \"%s\")", src_at_f, src, dst_at_f, dst);
+-    struct fd *src_at = at_fd(src_at_f);
++    struct fd *src_at __attribute__((cleanup(at_fd_cleanup))) = at_fd(src_at_f);
+     if (src_at == NULL)
+         return _EBADF;
+-    struct fd *dst_at = at_fd(dst_at_f);
++    struct fd *dst_at __attribute__((cleanup(at_fd_cleanup))) = at_fd(dst_at_f);
+     if (dst_at == NULL)
+         return _EBADF;
+     return generic_linkat(src_at, src, dst_at, dst);
+@@ -139,7 +145,7 @@
+     if (user_read_string(path_addr, path, sizeof(path)))
+         return _EFAULT;
+     STRACE("unlinkat(%d, \"%s\", %d)", at_f, path, flags);
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+     if (flags & AT_REMOVEDIR_)
+@@ -162,10 +168,10 @@
+     if (user_read_string(dst_addr, dst, sizeof(dst)))
+         return _EFAULT;
+     STRACE("renameat(%d, \"%s\", %d, \"%s\")", src_at_f, src, dst_at_f, dst);
+-    struct fd *src_at = at_fd(src_at_f);
++    struct fd *src_at __attribute__((cleanup(at_fd_cleanup))) = at_fd(src_at_f);
+     if (src_at == NULL)
+         return _EBADF;
+-    struct fd *dst_at = at_fd(dst_at_f);
++    struct fd *dst_at __attribute__((cleanup(at_fd_cleanup))) = at_fd(dst_at_f);
+     if (dst_at == NULL)
+         return _EBADF;
+     return generic_renameat(src_at, src, dst_at, dst);
+@@ -187,7 +193,7 @@
+     if (user_read_string(link_addr, link, sizeof(link)))
+         return _EFAULT;
+     STRACE("symlinkat(\"%s\", %d, \"%s\")", target, at_f, link);
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+     return generic_symlinkat(target, at, link);
+@@ -203,7 +209,7 @@
+         return _EFAULT;
+     STRACE("mknodat(%d, \"%s\", %#x, %#x)", at_f, path, mode, dev);
+     apply_umask(&mode);
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+     return generic_mknodat(at, path, mode, dev);
+@@ -837,10 +843,10 @@
+ dword_t sys_getcwd(addr_t buf_addr, dword_t size) {
+     STRACE("getcwd(%#x, %#x)", buf_addr, size);
+     lock(&current->fs->lock);
+-    struct fd *wd = current->fs->pwd;
++    struct fd *wd __attribute__((cleanup(fd_cleanup))) = fd_retain(current->fs->pwd);
++    unlock(&current->fs->lock);
+     char pwd[MAX_PATH + 1];
+     int err = generic_getpath(wd, pwd);
+-    unlock(&current->fs->lock);
+     if (err < 0)
+         return err;
+ 
+@@ -872,9 +878,10 @@
+ 
+ void fs_chdir(struct fs_info *fs, struct fd *fd) {
+     lock(&fs->lock);
+-    fd_close(fs->pwd);
++    struct fd *old = fs->pwd;
+     fs->pwd = fd;
+     unlock(&fs->lock);
++    fd_close(old);
+ }
+ 
+ dword_t sys_chdir(addr_t path_addr) {
+@@ -909,9 +916,10 @@
+     if (IS_ERR(dir))
+         return PTR_ERR(dir);
+     lock(&current->fs->lock);
+-    fd_close(current->fs->root);
++    struct fd *old = current->fs->root;
+     current->fs->root = dir;
+     unlock(&current->fs->lock);
++    fd_close(old);
+     return 0;
+ }
+ 
+@@ -1089,7 +1097,7 @@
+     STRACE("utimensat(%d, %s, {{%lld, %lld}, {%lld, %lld}}, %d)", at_f, path,
+             (long long)atime.tv_sec, (long long)atime.tv_nsec,
+             (long long)mtime.tv_sec, (long long)mtime.tv_nsec, flags);
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+ 
+@@ -1167,7 +1175,7 @@
+     if (user_read_string(path_addr, path, sizeof(path)))
+         return _EFAULT;
+     STRACE("fchmodat(%d, \"%s\", %o)", at_f, path, mode);
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+     mode &= ~S_IFMT;
+@@ -1205,7 +1213,7 @@
+     if (user_read_string(path_addr, path, sizeof(path)))
+         return _EFAULT;
+     STRACE("fchownat(%d, \"%s\", %d, %d, %d)", at_f, path, owner, group, flags);
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+     // realfs can't change ownership on host, silently succeed
+@@ -1303,7 +1311,7 @@
+     if (user_read_string(path_addr, path, sizeof(path)))
+         return _EFAULT;
+     STRACE("mkdirat(%d, %s, 0%o)", at_f, path, mode);
+-    struct fd *at = at_fd(at_f);
++    struct fd *at __attribute__((cleanup(at_fd_cleanup))) = at_fd(at_f);
+     if (at == NULL)
+         return _EBADF;
+     apply_umask(&mode);
+--- a/fs/path.c
++++ b/fs/path.c
+@@ -7,6 +7,7 @@
+ #include "kernel/calls.h"
+ #include "util/sync.h"
+ #include "fs/path.h"
++#include "fs/fd.h"
+ 
+ // === Path Normalize Cache ===
+ //
+@@ -274,11 +275,19 @@
+         return _ENOENT;
+ 
+     // start with root or cwd, depending on whether it starts with a slash
++    // Snapshot ownership while protected from concurrent chdir/chroot.
++    // Explicit directory descriptors are held by the caller.
++    struct fd *base_owner __attribute__((cleanup(fd_cleanup))) = NULL;
+     lock(&current->fs->lock);
+-    if (path[0] == '/')
++    if (path[0] == '/') {
+         at = current->fs->root;
+-    else if (at == AT_PWD)
++        if (at != NULL)
++            base_owner = fd_retain(at);
++    } else if (at == AT_PWD) {
+         at = current->fs->pwd;
++        if (at != NULL)
++            base_owner = fd_retain(at);
++    }
+     unlock(&current->fs->lock);
+ 
+     char at_path[MAX_PATH];
+--- a/kernel/fs_info.c
++++ b/kernel/fs_info.c
+@@ -14,9 +14,13 @@
+ 
+ struct fs_info *fs_info_copy(struct fs_info *fs) {
+     struct fs_info *new_fs = fs_info_new();
++    if (new_fs == NULL)
++        return NULL;
++    lock(&fs->lock);
+     new_fs->umask = fs->umask;
+     new_fs->pwd = fd_retain(fs->pwd);
+     new_fs->root = fd_retain(fs->root);
++    unlock(&fs->lock);
+     return new_fs;
+ }
+ 

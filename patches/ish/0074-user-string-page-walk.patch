@@ -1,0 +1,48 @@
+--- a/kernel/user.c
++++ b/kernel/user.c
+@@ -94,14 +94,38 @@
+     struct mem *mem = USER_MEM_OR_FAULT(current);
+     read_wrlock(&mem->lock);
+     size_t i = 0;
+-    while (i < max) {
+-        if (__user_read_mem(mem, addr + i, &buf[i], sizeof(buf[i]))) {
+-            read_wrunlock(&mem->lock);
+-            return 1;
++    // Resolve each guest page once while the memory map is read-locked.
++    // Preserve the existing byte-at-a-time overflow behavior for pathological
++    // ranges that wrap the guest address type.
++    if (max > (addr_t) -1 - addr) {
++        while (i < max) {
++            if (__user_read_mem(mem, addr + i, &buf[i], sizeof(buf[i]))) {
++                read_wrunlock(&mem->lock);
++                return 1;
++            }
++            if (buf[i] == '\0')
++                break;
++            i++;
+         }
+-        if (buf[i] == '\0')
+-            break;
+-        i++;
++    } else {
++        while (i < max) {
++            addr_t pos = addr + i;
++            const char *ptr = mem_ptr(mem, pos, MEM_READ);
++            if (ptr == NULL) {
++                read_wrunlock(&mem->lock);
++                return 1;
++            }
++            size_t chunk = PAGE_SIZE - PGOFFSET(pos);
++            if (chunk > max - i)
++                chunk = max - i;
++            for (size_t j = 0; j < chunk; j++) {
++                buf[i++] = ptr[j];
++                if (buf[i - 1] == '\0') {
++                    read_wrunlock(&mem->lock);
++                    return 0;
++                }
++            }
++        }
+     }
+     read_wrunlock(&mem->lock);
+     return 0;

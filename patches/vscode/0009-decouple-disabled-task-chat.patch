@@ -1,0 +1,75 @@
+--- a/src/vs/workbench/contrib/tasks/browser/abstractTaskService.ts
++++ b/src/vs/workbench/contrib/tasks/browser/abstractTaskService.ts
+@@ -48,8 +48,9 @@
+ import { ITerminalProfileResolverService } from '../../terminal/common/terminal.js';
+ 
+ import { CommandString, ConfiguringTask, ContributedTask, CustomTask, ExecutionEngine, InMemoryTask, InstancePolicy, ITaskConfig, ITaskEvent, ITaskIdentifier, ITaskInactiveEvent, ITaskProcessEndedEvent, ITaskSet, JsonSchemaVersion, KeyedTaskIdentifier, RerunAllRunningTasksCommandId, RuntimeType, Task, TASK_RUNNING_STATE, TaskDefinition, TaskEventKind, TaskGroup, TaskRunSource, TaskSettingId, TaskSorter, TaskSourceKind, TasksSchemaProperties, USER_TASKS_GROUP_KEY } from '../common/tasks.js';
+ import { ChatAgentLocation, ChatModeKind } from '../../chat/common/constants.js';
++import { ChatAIDisabledSettingId } from '../../../../platform/chat/common/chatSettings.js';
+ import { CustomExecutionSupportedContext, ICustomizationProperties, IProblemMatcherRunOptions, ITaskFilter, ITaskProvider, ITaskService, IWorkspaceFolderTaskResult, ProcessExecutionSupportedContext, ServerlessWebContext, ShellExecutionSupportedContext, TaskCommandsRegistered, TaskExecutionSupportedContext, TasksAvailableContext } from '../common/taskService.js';
+ import { ITaskExecuteResult, ITaskResolver, ITaskSummary, ITaskSystem, ITaskSystemInfo, ITaskTerminateResponse, TaskError, TaskErrors, TaskExecuteKind, Triggers, VerifiedTask } from '../common/taskSystem.js';
+ import { getTemplates as getTaskTemplates } from '../common/taskTemplates.js';
+ 
+@@ -295,10 +296,8 @@
+ 		@IThemeService private readonly _themeService: IThemeService,
+ 		@ILifecycleService private readonly _lifecycleService: ILifecycleService,
+ 		@IRemoteAgentService remoteAgentService: IRemoteAgentService,
+ 		@IInstantiationService private readonly _instantiationService: IInstantiationService,
+-		@IChatService private readonly _chatService: IChatService,
+-		@IChatAgentService private readonly _chatAgentService: IChatAgentService,
+ 		@IHostService private readonly _hostService: IHostService
+ 	) {
+ 		super();
+ 		this._whenTaskSystemReady = Event.toPromise(this.onDidChangeTaskSystemInfo);
+@@ -800,9 +799,10 @@
+ 		if (!VirtualWorkspaceContext.getValue(this._contextKeyService) && ((runSource === TaskRunSource.User) || (runSource === TaskRunSource.ConfigurationChange))) {
+ 			if (userRequested) {
+ 				this._outputService.showChannel(this._outputChannel.id, true);
+ 			} else {
+-				const chatEnabled = this._chatService.isEnabled(ChatAgentLocation.Chat);
++				const chatEnabled = this._configurationService.getValue<boolean>(ChatAIDisabledSettingId) !== true
++					&& this._instantiationService.invokeFunction(accessor => accessor.get(IChatService).isEnabled(ChatAgentLocation.Chat));
+ 				const actions = [];
+ 				if (chatEnabled && errorMessage) {
+ 					const beforeJSONregex = /^(.*?)\s*\{[\s\S]*$/;
+ 					const matches = errorMessage.match(beforeJSONregex);
+@@ -812,9 +812,9 @@
+ 							? `\`${message}\``
+ 							: `\`${message}\`\n\`\`\`json${errorMessage}\`\`\``;
+ 
+ 
+-						const defaultAgent = this._chatAgentService.getDefaultAgent(ChatAgentLocation.Chat);
++						const defaultAgent = this._instantiationService.invokeFunction(accessor => accessor.get(IChatAgentService).getDefaultAgent(ChatAgentLocation.Chat));
+ 						if (defaultAgent) {
+ 							actions.push({
+ 								label: nls.localize('troubleshootWithChat', "Fix with AI"),
+ 								run: async () => {
+--- a/src/vs/workbench/contrib/tasks/electron-browser/taskService.ts
++++ b/src/vs/workbench/contrib/tasks/electron-browser/taskService.ts
+@@ -48,8 +48,6 @@
+ import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
+ import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
+ import { IAccessibilitySignalService } from '../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
+-import { IChatService } from '../../chat/common/chatService/chatService.js';
+-import { IChatAgentService } from '../../chat/common/participants/chatAgents.js';
+ import { IHostService } from '../../../services/host/browser/host.js';
+ 
+ interface IWorkspaceFolderConfigurationResult {
+@@ -96,8 +94,6 @@
+ 		@IInstantiationService instantiationService: IInstantiationService,
+ 		@IRemoteAgentService remoteAgentService: IRemoteAgentService,
+ 		@IAccessibilitySignalService accessibilitySignalService: IAccessibilitySignalService,
+-		@IChatService _chatService: IChatService,
+-		@IChatAgentService _chatAgentService: IChatAgentService,
+ 		@IHostService _hostService: IHostService
+ 	) {
+ 		super(configurationService,
+@@ -136,8 +132,6 @@
+ 			lifecycleService,
+ 			remoteAgentService,
+ 			instantiationService,
+-			_chatService,
+-			_chatAgentService,
+ 			_hostService
+ 		);
+ 		this._register(lifecycleService.onBeforeShutdown(event => event.veto(this.beforeShutdown(), 'veto.tasks')));

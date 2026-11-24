@@ -1,0 +1,17 @@
+--- a/src/vs/base/browser/touch.ts
++++ b/src/vs/base/browser/touch.ts
+@@ -302,6 +302,14 @@
+ 			for (const [_, target] of targets) {
+ 				target.dispatchEvent(event);
+ 				this.dispatched = true;
++
++				// Gesture targets are dispatched separately from deepest to shallowest. If a
++				// child consumes a tap (for example, by running a menu command), do not deliver
++				// that same tap to ancestor widgets. A parent menubar could otherwise reopen
++				// after the command's action runner has closed it.
++				if (event.type === EventType.Tap && event.defaultPrevented) {
++					break;
++				}
+ 			}
+ 		}
+ 	}

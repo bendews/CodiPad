@@ -1,0 +1,325 @@
+--- a/src/vs/platform/files/common/fileService.ts
++++ b/src/vs/platform/files/common/fileService.ts
+@@ -14,7 +14,7 @@
+ import { TernarySearchTree } from '../../../base/common/ternarySearchTree.js';
+ import { Schemas } from '../../../base/common/network.js';
+ import { mark } from '../../../base/common/performance.js';
+-import { extUri, extUriIgnorePathCase, IExtUri, isAbsolutePath } from '../../../base/common/resources.js';
++import { ExtUri, extUri, extUriIgnorePathCase, IExtUri, isAbsolutePath } from '../../../base/common/resources.js';
+ import { consumeStream, isReadableBufferedStream, isReadableStream, listenStream, newWriteableStream, peekReadable, peekStream, transform } from '../../../base/common/stream.js';
+ import { URI } from '../../../base/common/uri.js';
+ import { localize } from '../../../nls.js';
+@@ -64,7 +64,9 @@
+ 
+ 		// Forward events from provider
+ 		providerDisposables.add(provider.onDidChangeFile(changes => {
+-			const event = new FileChangesEvent(changes, !this.isPathCaseSensitive(provider));
++			const event = new FileChangesEvent(changes, provider.capabilitiesForResource
++				? resource => !this.isPathCaseSensitive(provider, resource)
++				: !this.isPathCaseSensitive(provider));
+ 
+ 			// Always emit any event internally
+ 			this.internalOnDidFilesChange.fire(event);
+@@ -127,7 +129,7 @@
+ 	hasCapability(resource: URI, capability: FileSystemProviderCapabilities): boolean {
+ 		const provider = this.provider.get(resource.scheme);
+ 
+-		return !!(provider && (provider.capabilities & capability));
++		return !!(provider && (((provider.capabilitiesForResource?.(resource) ?? provider.capabilities) & capability)));
+ 	}
+ 
+ 	listCapabilities(): Iterable<{ scheme: string; capabilities: FileSystemProviderCapabilities }> {
+@@ -208,8 +210,6 @@
+ 	private async doResolveFile(resource: URI, options?: IResolveFileOptions): Promise<IFileStat>;
+ 	private async doResolveFile(resource: URI, options?: IResolveFileOptions): Promise<IFileStat> {
+ 		const provider = await this.withProvider(resource);
+-		const isPathCaseSensitive = this.isPathCaseSensitive(provider);
+-
+ 		const resolveTo = options?.resolveTo;
+ 		const resolveSingleChildDescendants = options?.resolveSingleChildDescendants;
+ 		const resolveMetadata = options?.resolveMetadata;
+@@ -222,7 +222,7 @@
+ 
+ 			// lazy trie to check for recursive resolving
+ 			if (!trie) {
+-				trie = TernarySearchTree.forUris<true>(() => !isPathCaseSensitive);
++				trie = TernarySearchTree.forUris<true>(uri => !this.isPathCaseSensitive(provider, uri));
+ 				trie.set(resource, true);
+ 				if (resolveTo) {
+ 					trie.fill(true, resolveTo);
+@@ -921,8 +921,8 @@
+ 
+ 		// Check if source is equal or parent to target (requires providers to be the same)
+ 		if (sourceProvider === targetProvider) {
+-			const { providerExtUri, isPathCaseSensitive } = this.getExtUri(sourceProvider);
+-			if (!isPathCaseSensitive) {
++			const { providerExtUri } = this.getExtUri(sourceProvider);
++			if (!this.isPathCaseSensitive(sourceProvider, source) || !this.isPathCaseSensitive(targetProvider, target)) {
+ 				isSameResourceWithDifferentPathCase = providerExtUri.isEqual(source, target);
+ 			}
+ 
+@@ -961,13 +961,18 @@
+ 		const isPathCaseSensitive = this.isPathCaseSensitive(provider);
+ 
+ 		return {
+-			providerExtUri: isPathCaseSensitive ? extUri : extUriIgnorePathCase,
++			providerExtUri: provider.capabilitiesForResource
++				? new ExtUri(resource => !this.isPathCaseSensitive(provider, resource))
++				: isPathCaseSensitive ? extUri : extUriIgnorePathCase,
+ 			isPathCaseSensitive
+ 		};
+ 	}
+ 
+-	private isPathCaseSensitive(provider: IFileSystemProvider): boolean {
+-		return !!(provider.capabilities & FileSystemProviderCapabilities.PathCaseSensitive);
++	private isPathCaseSensitive(provider: IFileSystemProvider, resource?: URI): boolean {
++		const capabilities = resource && provider.capabilitiesForResource
++			? provider.capabilitiesForResource(resource)
++			: provider.capabilities;
++		return !!(capabilities & FileSystemProviderCapabilities.PathCaseSensitive);
+ 	}
+ 
+ 	async createFolder(resource: URI): Promise<IFileStatWithMetadata> {
+--- a/src/vs/platform/files/common/files.ts
++++ b/src/vs/platform/files/common/files.ts
+@@ -678,6 +678,8 @@
+ export interface IFileSystemProvider {
+ 
+ 	readonly capabilities: FileSystemProviderCapabilities;
++	/** Complete capability mask for a resource; when absent, use `capabilities`. */
++	capabilitiesForResource?(resource: URI): FileSystemProviderCapabilities;
+ 	readonly onDidChangeCapabilities: Event<void>;
+ 
+ 	readonly onDidChangeFile: Event<readonly IFileChange[]>;
+@@ -1010,7 +1012,10 @@
+ 
+ 	private readonly correlationId: number | undefined | typeof FileChangesEvent.MIXED_CORRELATION = undefined;
+ 
+-	constructor(changes: readonly IFileChange[], private readonly ignorePathCasing: boolean) {
++	private readonly ignorePathCasing: (resource: URI) => boolean;
++
++	constructor(changes: readonly IFileChange[], ignorePathCasing: boolean | ((resource: URI) => boolean)) {
++		this.ignorePathCasing = typeof ignorePathCasing === 'function' ? ignorePathCasing : () => ignorePathCasing;
+ 		for (const change of changes) {
+ 
+ 			// Split by type
+@@ -1043,26 +1048,23 @@
+ 		}
+ 	}
+ 
+-	private readonly added = new Lazy(() => {
+-		const added = TernarySearchTree.forUris<boolean>(() => this.ignorePathCasing);
+-		added.fill(this.rawAdded.map(resource => [resource, true]));
+-
+-		return added;
+-	});
+-
+-	private readonly updated = new Lazy(() => {
+-		const updated = TernarySearchTree.forUris<boolean>(() => this.ignorePathCasing);
+-		updated.fill(this.rawUpdated.map(resource => [resource, true]));
+-
+-		return updated;
+-	});
+-
+-	private readonly deleted = new Lazy(() => {
+-		const deleted = TernarySearchTree.forUris<boolean>(() => this.ignorePathCasing);
+-		deleted.fill(this.rawDeleted.map(resource => [resource, true]));
+-
+-		return deleted;
+-	});
++	private readonly added = new Lazy(() => this.createChangeTrees(this.rawAdded));
++
++	private readonly updated = new Lazy(() => this.createChangeTrees(this.rawUpdated));
++
++	private readonly deleted = new Lazy(() => this.createChangeTrees(this.rawDeleted));
++
++	private createChangeTrees(resources: readonly URI[]): { sensitive: TernarySearchTree<URI, true>; insensitive: TernarySearchTree<URI, true> } {
++		const sensitive = TernarySearchTree.forUris<true>();
++		const insensitive = TernarySearchTree.forUris<true>(() => true);
++		sensitive.fill(true, resources.filter(resource => !this.ignorePathCasing(resource)));
++		insensitive.fill(true, resources.filter(resource => this.ignorePathCasing(resource)));
++		return { sensitive, insensitive };
++	}
++
++	private treeForResource(trees: { sensitive: TernarySearchTree<URI, true>; insensitive: TernarySearchTree<URI, true> }, resource: URI): TernarySearchTree<URI, true> {
++		return this.ignorePathCasing(resource) ? trees.insensitive : trees.sensitive;
++	}
+ 
+ 	/**
+ 	 * Find out if the file change events match the provided resource.
+@@ -1091,33 +1093,36 @@
+ 
+ 		// Added
+ 		if (!hasTypesFilter || types.includes(FileChangeType.ADDED)) {
+-			if (this.added.value.get(resource)) {
++			const added = this.treeForResource(this.added.value, resource);
++			if (added.get(resource)) {
+ 				return true;
+ 			}
+ 
+-			if (options.includeChildren && this.added.value.findSuperstr(resource)) {
++			if (options.includeChildren && added.findSuperstr(resource)) {
+ 				return true;
+ 			}
+ 		}
+ 
+ 		// Updated
+ 		if (!hasTypesFilter || types.includes(FileChangeType.UPDATED)) {
+-			if (this.updated.value.get(resource)) {
++			const updated = this.treeForResource(this.updated.value, resource);
++			if (updated.get(resource)) {
+ 				return true;
+ 			}
+ 
+-			if (options.includeChildren && this.updated.value.findSuperstr(resource)) {
++			if (options.includeChildren && updated.findSuperstr(resource)) {
+ 				return true;
+ 			}
+ 		}
+ 
+ 		// Deleted
+ 		if (!hasTypesFilter || types.includes(FileChangeType.DELETED)) {
+-			if (this.deleted.value.findSubstr(resource) /* deleted also considers parent folders */) {
++			const deleted = this.treeForResource(this.deleted.value, resource);
++			if (deleted.findSubstr(resource) /* deleted also considers parent folders */) {
+ 				return true;
+ 			}
+ 
+-			if (options.includeChildren && this.deleted.value.findSuperstr(resource)) {
++			if (options.includeChildren && deleted.findSuperstr(resource)) {
+ 				return true;
+ 			}
+ 		}
+--- a/src/vs/platform/files/test/common/files.test.ts
++++ b/src/vs/platform/files/test/common/files.test.ts
+@@ -109,6 +109,20 @@
+ 		}
+ 	});
+ 
++	test('FileChangesEvent - resource-specific path casing', function () {
++		const sensitive = URI.file('/Sensitive/foo.py');
++		const sensitiveUpper = URI.file('/Sensitive/Foo.py');
++		const insensitive = URI.file('/Insensitive/foo.py');
++		const insensitiveUpper = URI.file('/Insensitive/Foo.py');
++		const event = new FileChangesEvent([
++			{ resource: sensitive, type: FileChangeType.ADDED },
++			{ resource: insensitive, type: FileChangeType.ADDED }
++		], resource => resource.path.startsWith('/Insensitive'));
++
++		assert.strictEqual(event.contains(sensitiveUpper, FileChangeType.ADDED), false);
++		assert.strictEqual(event.contains(insensitiveUpper, FileChangeType.ADDED), true);
++	});
++
+ 	test('FileChangesEvent - correlation', function () {
+ 		let changes: IFileChange[] = [
+ 			{ resource: toResource.call(this, '/foo/updated.txt'), type: FileChangeType.UPDATED },
+--- a/src/vs/platform/uriIdentity/common/uriIdentityService.ts
++++ b/src/vs/platform/uriIdentity/common/uriIdentityService.ts
+@@ -42,9 +42,14 @@
+ 		// * in-memory uris
+ 		// * all kind of "private" schemes
+ 		const ignorePathCasing = (uri: URI): boolean => {
++			const provider = _fileService.getProvider(uri.scheme);
++			if (provider?.capabilitiesForResource) {
++				return !this._fileService.hasCapability(uri, FileSystemProviderCapabilities.PathCaseSensitive);
++			}
++
+ 			let ignorePathCasing = schemeIgnoresPathCasingCache.get(uri.scheme);
+ 			if (ignorePathCasing === undefined) {
+-				// retrieve once and then case per scheme until a change happens
++				// Preserve the upstream scheme cache for providers with uniform capabilities.
+ 				ignorePathCasing = _fileService.hasProvider(uri) && !this._fileService.hasCapability(uri, FileSystemProviderCapabilities.PathCaseSensitive);
+ 				schemeIgnoresPathCasingCache.set(uri.scheme, ignorePathCasing);
+ 			}
+@@ -54,14 +59,17 @@
+ 			_fileService.onDidChangeFileSystemProviderRegistrations,
+ 			_fileService.onDidChangeFileSystemProviderCapabilities
+ 		)(e => {
++			const resourceAwareProvider = !!(e.provider ?? _fileService.getProvider(e.scheme))?.capabilitiesForResource;
+ 			const oldIgnorePathCasingValue = schemeIgnoresPathCasingCache.get(e.scheme);
+-			if (oldIgnorePathCasingValue === undefined) {
++			if (oldIgnorePathCasingValue === undefined && !resourceAwareProvider) {
+ 				return;
+ 			}
+-			schemeIgnoresPathCasingCache.delete(e.scheme);
+-			const newIgnorePathCasingValue = ignorePathCasing(URI.from({ scheme: e.scheme }));
+-			if (newIgnorePathCasingValue === newIgnorePathCasingValue) {
+-				return;
++			if (!resourceAwareProvider) {
++				schemeIgnoresPathCasingCache.delete(e.scheme);
++				const newIgnorePathCasingValue = ignorePathCasing(URI.from({ scheme: e.scheme }));
++				if (oldIgnorePathCasingValue === newIgnorePathCasingValue) {
++					return;
++				}
+ 			}
+ 			for (const [key, entry] of this._canonicalUris.entries()) {
+ 				if (entry.uri.scheme !== e.scheme) {
+--- a/src/vs/platform/uriIdentity/test/common/uriIdentityService.test.ts
++++ b/src/vs/platform/uriIdentity/test/common/uriIdentityService.test.ts
+@@ -6,9 +6,9 @@
+ import assert from 'assert';
+ import { UriIdentityService } from '../../common/uriIdentityService.js';
+ import { mock } from '../../../../base/test/common/mock.js';
+-import { IFileService, FileSystemProviderCapabilities } from '../../../files/common/files.js';
++import { IFileService, IFileSystemProvider, IFileSystemProviderCapabilitiesChangeEvent, FileSystemProviderCapabilities } from '../../../files/common/files.js';
+ import { URI } from '../../../../base/common/uri.js';
+-import { Event } from '../../../../base/common/event.js';
++import { Emitter, Event } from '../../../../base/common/event.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+ 
+ suite('URI Identity', function () {
+@@ -50,6 +50,54 @@
+ 		assert.strictEqual(actual.toString(), expected.toString());
+ 		assert.ok(service.extUri.isEqual(actual, expected));
+ 	}
++
++	test('resource-specific case identity and capability invalidation', function () {
++		class ResourceAwareFileService extends FakeFileService {
++			private readonly capabilitiesChanged = new Emitter<IFileSystemProviderCapabilitiesChangeEvent>();
++			override onDidChangeFileSystemProviderCapabilities = this.capabilitiesChanged.event;
++			private caseSensitive = false;
++			override getProvider(scheme: string): IFileSystemProvider | undefined {
++				return scheme === 'mixed' ? {
++					capabilities: FileSystemProviderCapabilities.PathCaseSensitive,
++					capabilitiesForResource: () => this.caseSensitive ? FileSystemProviderCapabilities.PathCaseSensitive : FileSystemProviderCapabilities.None,
++					onDidChangeCapabilities: Event.None
++				} as IFileSystemProvider : undefined;
++			}
++			override hasProvider(uri: URI): boolean {
++				return uri.scheme === 'mixed' || super.hasProvider(uri);
++			}
++			override hasCapability(uri: URI, flag: FileSystemProviderCapabilities): boolean {
++				if (uri.scheme === 'mixed') {
++					return Boolean((this.caseSensitive ? FileSystemProviderCapabilities.PathCaseSensitive : FileSystemProviderCapabilities.None) & flag);
++				}
++				return super.hasCapability(uri, flag);
++			}
++			setCaseSensitive(value: boolean): void {
++				this.caseSensitive = value;
++				this.capabilitiesChanged.fire({ scheme: 'mixed', provider: this.getProvider('mixed')! });
++			}
++			disposeEmitter(): void {
++				this.capabilitiesChanged.dispose();
++			}
++		}
++
++		const fileService = new ResourceAwareFileService(new Map([['mixed', FileSystemProviderCapabilities.None]]));
++		const service = new UriIdentityService(fileService);
++		try {
++			const upper = URI.parse('mixed://volume/Foo.py');
++			const lower = URI.parse('mixed://volume/foo.py');
++			assert.strictEqual(service.extUri.isEqual(upper, lower), true);
++			assert.strictEqual(service.asCanonicalUri(upper).toString(), upper.toString());
++			assert.strictEqual(service.asCanonicalUri(lower).toString(), upper.toString());
++
++			fileService.setCaseSensitive(true);
++			assert.strictEqual(service.extUri.isEqual(upper, lower), false);
++			assert.strictEqual(service.asCanonicalUri(lower).toString(), lower.toString());
++		} finally {
++			service.dispose();
++			fileService.disposeEmitter();
++		}
++	});
+ 
+ 	test('extUri (isEqual)', function () {
+ 		const a = URI.parse('foo://bar/bang');

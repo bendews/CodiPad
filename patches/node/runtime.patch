@@ -1,0 +1,77 @@
+--- a/src/api/environment.cc
++++ b/src/api/environment.cc
+@@ -1,4 +1,7 @@
+ #include <cstdlib>
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ #if HAVE_OPENSSL
+ #include "crypto/crypto_util.h"
+ #endif  // HAVE_OPENSSL
+@@ -219,6 +222,12 @@
+     // heap based on the actual physical memory.
+     params->constraints.ConfigureDefaults(total_memory, 0);
+   }
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++  // A bounded debugger-backed pool replaces Darwin's ordinary JIT mappings.
++  // Preserve explicit Worker limits; each isolate owns its code reservation.
++  if (params->constraints.code_range_size_in_bytes() == 0)
++    params->constraints.set_code_range_size_in_bytes(16 * 1024 * 1024);
++#endif
+   params->embedder_wrapper_object_index = BaseObject::InternalFields::kSlot;
+   params->embedder_wrapper_type_index = std::numeric_limits<int>::max();
+ 
+--- a/node.gypi
++++ b/node.gypi
+@@ -258,6 +258,7 @@
+       'libraries': [ '-framework CoreFoundation -framework Security' ],
+       'defines!': [
+         'NODE_PLATFORM="mac"',
++        'NODE_PLATFORM="ios"',
+       ],
+       'defines': [
+         # we need to use node's preferred "darwin" rather than gyp's preferred "mac"
+--- a/deps/v8/src/codegen/arm64/cpu-arm64.cc
++++ b/deps/v8/src/codegen/arm64/cpu-arm64.cc
+@@ -6,6 +6,7 @@
+ 
+ #if V8_TARGET_ARCH_ARM64
+ 
++#include "src/base/memory.h"
+ #include "src/codegen/arm64/utils-arm64.h"
+ #include "src/codegen/cpu-features.h"
+ #include "src/codegen/flush-instruction-cache.h"
+@@ -51,6 +52,11 @@
+ #if defined(V8_OS_WIN)
+   ::FlushInstructionCache(GetCurrentProcess(), address, length);
+ #elif defined(V8_OS_DARWIN)
++#if defined(V8_OS_IOS)
++  auto write_address = base::JitWriteAddress(reinterpret_cast<uintptr_t>(address));
++  if (write_address != reinterpret_cast<uintptr_t>(address))
++    sys_dcache_flush(reinterpret_cast<void*>(write_address), length);
++#endif
+   sys_icache_invalidate(address, length);
+ #elif defined(V8_OS_LINUX)
+   char* begin = reinterpret_cast<char*>(address);
+--- a/deps/uv/src/unix/process.c
++++ b/deps/uv/src/unix/process.c
+@@ -36,6 +36,7 @@
+ #include <poll.h>
+ 
+ #if defined(__APPLE__)
++# include <TargetConditionals.h>
+ # include <spawn.h>
+ # include <paths.h>
+ # include <sys/kauth.h>
+@@ -64,7 +65,10 @@
+ # include "zos-base.h"
+ #endif
+ 
+-#ifdef UV_HAVE_KQUEUE
++/* iOS cannot fork, so a spawned command is a logical process. kqueue cannot
++ * watch one and the blocking waitpid fallback would stall the event loop, so the
++ * SIGCHLD path is used there instead. */
++#if defined(UV_HAVE_KQUEUE) && !TARGET_OS_IPHONE
+ #include <sys/event.h>
+ #else
+ #define UV_USE_SIGCHLD

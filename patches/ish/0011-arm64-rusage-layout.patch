@@ -1,0 +1,29 @@
+--- a/kernel/resource.h
++++ b/kernel/resource.h
+@@ -48,0 +49,17 @@
++#ifdef GUEST_ARM64
++    // Linux ARM64 struct rusage uses signed 64-bit long for every ru_* counter.
++    sqword_t maxrss;
++    sqword_t ixrss;
++    sqword_t idrss;
++    sqword_t isrss;
++    sqword_t minflt;
++    sqword_t majflt;
++    sqword_t nswap;
++    sqword_t inblock;
++    sqword_t oublock;
++    sqword_t msgsnd;
++    sqword_t msgrcv;
++    sqword_t nsignals;
++    sqword_t nvcsw;
++    sqword_t nivcsw;
++#else
+@@ -62,0 +80 @@
++#endif
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@ -178,2 +178,2 @@
+-    // only the time fields are currently implemented
+-    struct rusage_ rusage;
++    // CPU times are implemented; unsupported accounting counters remain zero.
++    struct rusage_ rusage = {};

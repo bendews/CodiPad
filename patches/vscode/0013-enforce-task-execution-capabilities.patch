@@ -1,0 +1,35 @@
+--- a/src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts
++++ b/src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts
+@@ -39,6 +39,7 @@
+ import { TaskTerminalStatus } from './taskTerminalStatus.js';
+ import { ProblemCollectorEventKind, ProblemHandlingStrategy, StartStopProblemCollector, WatchingProblemCollector } from '../common/problemCollectors.js';
+ import { GroupKind } from '../common/taskConfiguration.js';
++import { CustomExecutionSupportedContext, ProcessExecutionSupportedContext, ShellExecutionSupportedContext } from '../common/taskService.js';
+ import { IResolveSet, IResolvedVariables, ITaskExecuteResult, ITaskResolver, ITaskSummary, ITaskSystem, ITaskSystemInfo, ITaskSystemInfoResolver, ITaskTerminateResponse, TaskError, TaskErrors, TaskExecuteKind, Triggers, VerifiedTask } from '../common/taskSystem.js';
+ import { CommandOptions, CommandString, ContributedTask, CustomTask, DependsOrder, ICommandConfiguration, IConfigurationProperties, IExtensionTaskSource, IPresentationOptions, IShellConfiguration, IShellQuotingOptions, ITaskEvent, InMemoryTask, PanelKind, RerunForActiveTerminalCommandId, RevealKind, RevealProblemKind, RuntimeType, ShellQuoting, TASK_TERMINAL_ACTIVE, Task, TaskEvent, TaskEventKind, TaskScope, TaskSourceKind, rerunTaskIcon } from '../common/tasks.js';
+ import { ITerminalGroupService, ITerminalInstance, ITerminalService } from '../../terminal/browser/terminal.js';
+@@ -223,7 +224,7 @@
+ 		private _viewDescriptorService: IViewDescriptorService,
+ 		private _logService: ILogService,
+ 		private _notificationService: INotificationService,
+-		contextKeyService: IContextKeyService,
++		private readonly contextKeyService: IContextKeyService,
+ 		instantiationService: IInstantiationService,
+ 		taskSystemInfoResolver: ITaskSystemInfoResolver,
+ 		private _taskLookup: (taskKey: string) => Promise<Task | undefined>,
+@@ -526,6 +527,15 @@
+ 	}
+ 
+ 	private _executeTask(task: Task, resolver: ITaskResolver, trigger: string, liveDependencies: Set<string>, encounteredTasks: Map<string, Promise<ITaskSummary>>, alreadyResolved?: Map<string, string>): Promise<ITaskSummary> {
++		if (CustomTask.is(task) || ContributedTask.is(task)) {
++			const runtime = task.command.runtime;
++			const capability = runtime === RuntimeType.Shell ? ShellExecutionSupportedContext
++				: runtime === RuntimeType.Process ? ProcessExecutionSupportedContext
++					: runtime === RuntimeType.CustomExecution ? CustomExecutionSupportedContext : undefined;
++			if (runtime !== undefined && capability?.getValue(this.contextKeyService) === false) {
++				throw new TaskError(Severity.Error, nls.localize('unsupportedTaskExecution', "The execution backend does not support this task execution type: {0}", RuntimeType.toString(runtime)), TaskErrors.NoValidTaskRunner);
++			}
++		}
+ 		this._showTaskLoadErrors(task);
+ 
+ 		const mapKey = task.getMapKey();

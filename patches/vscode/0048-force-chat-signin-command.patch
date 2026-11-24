@@ -1,0 +1,26 @@
+diff -ruN a/src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts b/src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts
+--- a/src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts	2026-11-10 20:12:40
++++ b/src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts	2026-11-10 20:12:40
+@@ -339,11 +339,21 @@
+ 			constructor() {
+ 				super({
+ 					id: 'workbench.action.chat.triggerSetupForceSignIn',
+-					title: localize2('forceSignIn', "Sign in to use GitHub Copilot")
++					title: localize2('forceSignIn', "Sign in to use GitHub Copilot"),
++					f1: true,
++					precondition: ContextKeyExpr.and(
++						ChatContextKeys.Setup.hidden.negate(),
++						ChatContextKeys.Setup.disabledInWorkspace.negate(),
++						ContextKeyExpr.not(`config.${ChatAIDisabledSettingId}`)
++					)
+ 				});
+ 			}
+ 
+ 			override async run(accessor: ServicesAccessor): Promise<unknown> {
++				if (accessor.get(IConfigurationService).getValue<boolean>(ChatAIDisabledSettingId) ||
++					!accessor.get(IContextKeyService).contextMatchesRules(ContextKeyExpr.and(ChatContextKeys.Setup.hidden.negate(), ChatContextKeys.Setup.disabledInWorkspace.negate()))) {
++					return;
++				}
+ 				const commandService = accessor.get(ICommandService);
+ 				const telemetryService = accessor.get(ITelemetryService);
+ 

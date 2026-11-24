@@ -1,0 +1,101 @@
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -7,6 +7,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
++#include <unistd.h>
+ #include "kernel/calls.h"
+ #include "kernel/task.h"
+ #include "kernel/memory.h"
+@@ -73,6 +74,7 @@
+     *task = (struct task) {};
+     if (parent != NULL)
+         *task = *parent;
++    task->host_io_pipe[0] = task->host_io_pipe[1] = -1;
+     task->pid = pid->id;
+     task->proc_resources_ready = false;
+     pid->task = task;
+@@ -111,7 +113,6 @@
+     list_init(&task->queue);
+     task->clear_tid = 0;
+     task->robust_list = 0;
+-    task->host_io_pipe[0] = task->host_io_pipe[1] = -1;
+     task->futex_pipe[0] = -1;
+     task->futex_pipe[1] = -1;
+     task->did_exec = false;
+@@ -148,7 +149,20 @@
+     deferred_free_count = 0;
+ }
+ 
++// pids_lock pins sighand against the group-exit safety valve.
++void task_close_host_io(struct task *task) {
++    if (task->host_io_pipe[0] < 0 && task->host_io_pipe[1] < 0) return;
++    struct sighand *sighand = task->sighand;
++    if (sighand != NULL) lock(&sighand->lock);
++    for (unsigned i = 0; i < 2; i++) {
++        if (task->host_io_pipe[i] >= 0) close(task->host_io_pipe[i]);
++        task->host_io_pipe[i] = -1;
++    }
++    if (sighand != NULL) unlock(&sighand->lock);
++}
++
+ void task_destroy(struct task *task) {
++    task_close_host_io(task);
+     list_remove(&task->siblings);
+     pid_get(task->pid)->task = NULL;
+ 
+--- a/kernel/task.h
++++ b/kernel/task.h
+@@ -56,7 +56,7 @@
+     bool blocking;
+     // Per-thread pipe for futex_wait wakeup (reused across calls to avoid
+     // pipe creation overhead in Go runtime spin loops)
+-    int host_io_pipe[2]; // owned host-IO wakeup pipe; sighand lock protects publication/close
++    int host_io_pipe[2]; // owned host-IO wakeup pipe; pids_lock pins sighand while publishing/closing
+     int futex_pipe[2]; // [0]=read, [1]=write; -1 if not yet created
+     // Timestamp (CLOCK_MONOTONIC ns) of last time blocking became false.
+     // Used by deadlock detector to check how long ALL threads have been stuck.
+@@ -180,6 +180,8 @@
+ struct task *task_create_(struct task *parent);
+ // Removes the process from the process table and frees it. Must be called with pids_lock.
+ void task_destroy(struct task *task);
++// Close owned wake descriptors; caller holds pids_lock. Safe after sighand detach.
++void task_close_host_io(struct task *task);
+ 
+ // misc
+ void vfork_notify(struct task *task);
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -76,6 +76,9 @@
+     // the group leader has finished exiting and the group struct may be
+     // freed. Don't touch any shared state — just kill the host thread.
+     if (current->exiting) {
++        lock(&pids_lock);
++        task_close_host_io(current);
++        unlock(&pids_lock);
+         current = NULL;
+         pthread_exit(NULL);
+     }
+@@ -147,13 +150,6 @@
+         fdtable_release(files);
+     if (fs != NULL)
+         fs_info_release(fs);
+-    // Signal delivery holds this lock while writing the wake pipe.
+-    lock(&current->sighand->lock);
+-    for (unsigned i = 0; i < 2; i++) {
+-        if (current->host_io_pipe[i] >= 0) close(current->host_io_pipe[i]);
+-        current->host_io_pipe[i] = -1;
+-    }
+-    unlock(&current->sighand->lock);
+     // Close per-thread futex wakeup pipe
+     if (current->futex_pipe[0] != -1) {
+         close(current->futex_pipe[0]);
+@@ -178,6 +174,7 @@
+     // the actual freeing needs pids_lock
+     lock(&pids_lock);
+     current->exiting = true;
++    task_close_host_io(current);
+     // release the sighand (may already be NULL if another thread in the group
+     // exited concurrently and released it, e.g. after safety-valve SIGUSR1)
+     if (current->sighand != NULL) {

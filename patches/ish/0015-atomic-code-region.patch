@@ -1,0 +1,11 @@
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -109,7 +109,7 @@
+ 
+ // Power-of-two executable region, split into banks within ARM64 B's reach.
+ // Debugger-prepared device mappings charge the entire reservation to memory.
+-static size_t region_size = 256u << 20;
++static _Atomic size_t region_size = 256u << 20;
+ static unsigned region_shift = 28;
+ #define CODE_BANK (128u << 20)
+ static size_t stub_bytes;   // permanent prefix copied at the start of each bank

@@ -1,0 +1,14 @@
+diff -ruN a/src/vs/workbench/services/host/browser/toasts.ts b/src/vs/workbench/services/host/browser/toasts.ts
+--- a/src/vs/workbench/services/host/browser/toasts.ts	2026-11-10 19:33:38
++++ b/src/vs/workbench/services/host/browser/toasts.ts	2026-11-10 19:33:38
+@@ -15,6 +15,10 @@
+ }
+ 
+ export async function showBrowserToast(controller: IShowToastController, options: IToastOptions, token: CancellationToken): Promise<IToastResult> {
++	if (typeof Notification === 'undefined') {
++		return { supported: false, clicked: false };
++	}
++
+ 	const toast = await triggerBrowserToast(options.title, {
+ 		detail: options.body,
+ 		sticky: !options.silent

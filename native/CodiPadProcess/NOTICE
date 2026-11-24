@@ -1,0 +1,18 @@
+# Third-party notices — native/CodiPadProcess
+
+## iSH (ARM64 fork) — kernel only
+
+- Source: https://github.com/ish-app/ish, via the OpenMinis ARM64 fork
+  (`https://github.com/OpenMinis/ish-arm64`), pinned in `build/runtime-manifest.json`.
+- License: GPLv3 (`patches/ish/LICENSE`), with the additional iOS terms in
+  `patches/ish/LICENSE.IOS`.
+- Used here: virtual kernel (task/signal/pty/devpts), fakefs, and the realfs
+  mount API. CodiPad kernel patches live in `patches/ish/`.
+- Original CodiPad code in this directory is licensed under GPL-3.0-only in
+  the root `LICENSE`.
+
+## Node / libuv integration
+
+`NodeProcess.c` is original CodiPad code compiled against the pinned Node build's
+public libuv headers to route child process spawning, waiting, and signalling
+through `IshKernel`.

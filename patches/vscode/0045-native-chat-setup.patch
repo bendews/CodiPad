@@ -1,0 +1,36 @@
+diff -ruN a/src/vs/workbench/services/accounts/browser/defaultAccount.ts b/src/vs/workbench/services/accounts/browser/defaultAccount.ts
+--- a/src/vs/workbench/services/accounts/browser/defaultAccount.ts	2026-11-10 18:00:29
++++ b/src/vs/workbench/services/accounts/browser/defaultAccount.ts	2026-11-10 18:00:29
+@@ -432,7 +432,7 @@
+ 		// Skip initialization for classic web-no-remote (vscode.dev editor), but
+ 		// still initialize for the agents web workbench (vscode.dev/agents) where
+ 		// account state drives the title bar and the welcome walkthrough.
+-		if (isWeb && !this.environmentService.remoteAuthority && !this.environmentService.isSessionsWindow) {
++		if (isWeb && !this.environmentService.remoteAuthority && !this.environmentService.isSessionsWindow && !this.environmentService.supportsLocalNodeExtensionHost) {
+ 			this.logService.debug('[DefaultAccount] Running in web without remote, skipping initialization');
+ 			return;
+ 		}
+diff -ruN a/src/vs/workbench/services/chat/common/chatEntitlementService.ts b/src/vs/workbench/services/chat/common/chatEntitlementService.ts
+--- a/src/vs/workbench/services/chat/common/chatEntitlementService.ts	2026-11-10 17:58:34
++++ b/src/vs/workbench/services/chat/common/chatEntitlementService.ts	2026-11-10 17:58:53
+@@ -450,7 +450,7 @@
+ 		);
+ 		this.sentimentObs = observableFromEvent(this.onDidChangeSentiment, () => this.sentiment);
+ 
+-		if ((isWeb && !environmentService.remoteAuthority && !environmentService.isSessionsWindow)) {
++		if ((isWeb && !environmentService.remoteAuthority && !environmentService.isSessionsWindow && !environmentService.supportsLocalNodeExtensionHost)) {
+ 			ChatEntitlementContextKeys.Setup.hidden.bindTo(this.contextKeyService).set(true); // hide copilot UI on web if unsupported
+ 			return;
+ 		}
+diff -ruN a/src/vs/workbench/services/environment/common/environmentService.ts b/src/vs/workbench/services/environment/common/environmentService.ts
+--- a/src/vs/workbench/services/environment/common/environmentService.ts	2026-11-10 17:58:34
++++ b/src/vs/workbench/services/environment/common/environmentService.ts	2026-11-10 17:58:53
+@@ -31,6 +31,8 @@
+ 	readonly extensionEnabledProposedApi?: string[];
+ 
+ 	// --- Config
++	/** The embedder provides a local Node extension host. */
++	readonly supportsLocalNodeExtensionHost?: boolean;
+ 	readonly remoteAuthority?: string;
+ 	readonly skipReleaseNotes: boolean;
+ 	readonly skipWelcome: boolean;

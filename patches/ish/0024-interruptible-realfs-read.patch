@@ -1,0 +1,189 @@
+diff --git a/fs/real.c b/fs/real.c
+--- a/fs/real.c
++++ b/fs/real.c
+@@ -7,6 +7,7 @@
+ #include <sys/stat.h>
+ #include <limits.h>
+ #include <pthread.h>
++#include <signal.h>
+ #include <stdatomic.h>
+ #include <sys/ioctl.h>
+ #include <termios.h>
+@@ -21,6 +22,7 @@
+ #include "kernel/errno.h"
+ #include "kernel/calls.h"
+ #include "kernel/fs.h"
++#include "kernel/task.h"
+ #include "fs/dev.h"
+ #include "fs/devices.h"
+ #include "fs/real.h"
+@@ -177,14 +179,131 @@
+     return 0;
+ }
+ 
++// A host signal can be handled before read enters the kernel. Keep re-kicking
++// only a pending guest signal until the registered FIFO read has returned.
++// No file-description flags change, and positive/partial read results stay intact.
++struct realfs_read_wait {
++    struct task *task;
++    pthread_t thread;
++    struct realfs_read_wait *next;
++};
++static pthread_mutex_t realfs_read_wait_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t realfs_read_wait_changed = PTHREAD_COND_INITIALIZER;
++static struct realfs_read_wait *realfs_read_waits;
++static bool realfs_read_wait_started;
++
++static bool realfs_read_signal_pending(struct task *task) {
++    if (task == NULL || task->sighand == NULL)
++        return false;
++    lock(&task->sighand->lock);
++    bool pending = !!(task->pending & ~task->blocked);
++    unlock(&task->sighand->lock);
++    return pending;
++}
++
++static void *realfs_read_wait_watch(void *unused) {
++    (void) unused;
++    pthread_mutex_lock(&realfs_read_wait_lock);
++    for (;;) {
++        while (realfs_read_waits == NULL)
++            pthread_cond_wait(&realfs_read_wait_changed, &realfs_read_wait_lock);
++        for (struct realfs_read_wait *wait = realfs_read_waits; wait; wait = wait->next) {
++            if (realfs_read_signal_pending(wait->task))
++                pthread_kill(wait->thread, SIGUSR1);
++        }
++        // The lock spans each kick and unregister, so a returned read has no
++        // remaining task reference or later kick call. Empty service waits are idle.
++        struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000};
++#if __APPLE__
++        pthread_cond_timedwait_relative_np(&realfs_read_wait_changed, &realfs_read_wait_lock, &delay);
++#else
++        struct timespec deadline;
++        clock_gettime(CLOCK_REALTIME, &deadline);
++        deadline.tv_nsec += delay.tv_nsec;
++        if (deadline.tv_nsec >= 1000000000) {
++            deadline.tv_nsec -= 1000000000;
++            deadline.tv_sec++;
++        }
++        pthread_cond_timedwait(&realfs_read_wait_changed, &realfs_read_wait_lock, &deadline);
++#endif
++    }
++}
++
++static int realfs_read_wait_begin(struct realfs_read_wait *wait) {
++    pthread_mutex_lock(&realfs_read_wait_lock);
++    if (!realfs_read_wait_started) {
++        pthread_attr_t attributes;
++        int err = pthread_attr_init(&attributes);
++        if (err == 0) {
++            err = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
++            if (err == 0) {
++                pthread_t thread;
++                err = pthread_create(&thread, &attributes, realfs_read_wait_watch, NULL);
++            }
++            pthread_attr_destroy(&attributes);
++        }
++        if (err != 0) {
++            pthread_mutex_unlock(&realfs_read_wait_lock);
++            errno = err;
++            return errno_map();
++        }
++        realfs_read_wait_started = true;
++    }
++    wait->next = realfs_read_waits;
++    realfs_read_waits = wait;
++    pthread_cond_signal(&realfs_read_wait_changed);
++    pthread_mutex_unlock(&realfs_read_wait_lock);
++    return 0;
++}
++
++static void realfs_read_wait_end(void *data) {
++    struct realfs_read_wait *wait = data;
++    pthread_mutex_lock(&realfs_read_wait_lock);
++    struct realfs_read_wait **link = &realfs_read_waits;
++    while (*link != wait)
++        link = &(*link)->next;
++    *link = wait->next;
++    pthread_cond_signal(&realfs_read_wait_changed);
++    pthread_mutex_unlock(&realfs_read_wait_lock);
++}
++
++#ifdef REALFS_READ_WAIT_TESTING
++// Read-only private probe observation; not present in app archives.
++void realfs_read_wait_test_snapshot(unsigned *registrations, unsigned *helpers) {
++    pthread_mutex_lock(&realfs_read_wait_lock);
++    unsigned count = 0;
++    for (struct realfs_read_wait *wait = realfs_read_waits; wait; wait = wait->next)
++        count++;
++    *registrations = count;
++    *helpers = realfs_read_wait_started ? 1 : 0;
++    pthread_mutex_unlock(&realfs_read_wait_lock);
++}
++#endif
++
++static ssize_t realfs_read_interruptible(struct fd *fd, void *buf, size_t bufsize) {
++    for (;;) {
++        if (bufsize != 0 && realfs_read_signal_pending(current))
++            return _EINTR;
++        ssize_t res = read(fd->real_fd, buf, bufsize);
++        if (res >= 0)
++            return res;
++        if (errno != EINTR)
++            return errno_map();
++    }
++}
++
+ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
+-    ssize_t res;
+-    do {
+-        res = read(fd->real_fd, buf, bufsize);
+-    } while (res < 0 && errno == EINTR);
+-    if (res < 0)
+-        return errno_map();
+-    return res;
++    if (current == NULL || current->sighand == NULL || !S_ISFIFO(fd->type) || bufsize == 0)
++        return realfs_read_interruptible(fd, buf, bufsize);
++    struct realfs_read_wait wait = {.task = current, .thread = pthread_self()};
++    int err = realfs_read_wait_begin(&wait);
++    if (err < 0)
++        return err;
++    ssize_t result;
++    pthread_cleanup_push(realfs_read_wait_end, &wait);
++    result = realfs_read_interruptible(fd, buf, bufsize);
++    pthread_cleanup_pop(1);
++    return result;
+ }
+ 
+ ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
+diff --git a/kernel/calls.c b/kernel/calls.c
+--- a/kernel/calls.c
++++ b/kernel/calls.c
+@@ -147,6 +147,8 @@
+             // Fast paths return int (small values), safe to use directly
+             STRACE("%d call %-3d (fast) = 0x%x\n", current->pid, syscall_num, fast_result);
+             int32_t signed_result = (int32_t)fast_result;
++            if (syscall_num == 63 && signed_result == _EINTR)
++                current->syscall_restartable = true;
+             if (signed_result >= -4095 && signed_result < 0) {
+                 cpu->regs[0] = (uint64_t)(int64_t)signed_result;
+             } else {
+@@ -1402,15 +1404,11 @@
+     if (fd == NULL || fd->ops != &realfs_fdops)
+         return -1;
+ 
+-    // Direct host read (with EINTR retry)
++    // Keep the shared guest-signal/EINTR contract on the small-buffer path.
+     char buf[4096];
+-    ssize_t res;
+-    do {
+-        res = read(fd->real_fd, buf, size);
+-    } while (res < 0 && errno == EINTR);
+-
++    ssize_t res = realfs_read(fd, buf, size);
+     if (res < 0)
+-        return errno_map();
++        return res;
+ 
+     // Copy to guest memory
+     if (res > 0 && user_write(buf_addr, buf, res))

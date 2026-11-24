@@ -1,0 +1,8 @@
+diff --git a/src/vs/platform/extensionManagement/common/extensionsScannerService.ts b/src/vs/platform/extensionManagement/common/extensionsScannerService.ts
+--- a/src/vs/platform/extensionManagement/common/extensionsScannerService.ts
++++ b/src/vs/platform/extensionManagement/common/extensionsScannerService.ts
+@@ -200,3 +200,3 @@ export abstract class AbstractExtensionsScannerService extends Disposable impleme
+ 	private _targetPlatformPromise: Promise<TargetPlatform> | undefined;
+-	private getTargetPlatform(): Promise<TargetPlatform> {
++	protected getTargetPlatform(): Promise<TargetPlatform> {
+ 		if (!this._targetPlatformPromise) {

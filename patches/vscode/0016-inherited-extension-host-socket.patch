@@ -1,0 +1,18 @@
+--- a/src/vs/workbench/api/node/extensionHostProcess.ts
++++ b/src/vs/workbench/api/node/extensionHostProcess.ts
+@@ -180,2 +180,15 @@
+ function _createExtHostProtocol(): Promise<IMessagePassingProtocol> {
++	if (process.env['VSCODE_IPAD_EXTHOST_FD'] !== undefined) {
++		// fd 3 is a connected socket supplied by the process authority. Keep it
++		// separate from NODE_CHANNEL_FD, which Node reserves for child-process IPC.
++		const fd = Number(process.env['VSCODE_IPAD_EXTHOST_FD']);
++		if (!Number.isInteger(fd) || fd < 3) {
++			throw new Error('Invalid VSCODE_IPAD_EXTHOST_FD');
++		}
++		const socket = new net.Socket({ fd, readable: true, writable: true });
++		const inheritedProtocol = new PersistentProtocol({ socket: new NodeSocket(socket, 'extHost-inherited-fd') });
++		inheritedProtocol.sendResume();
++		socket.on('close', () => onTerminate('renderer closed the inherited socket'));
++		return Promise.resolve(inheritedProtocol);
++	}
+ 	const extHostConnection = readExtHostConnection(process.env);

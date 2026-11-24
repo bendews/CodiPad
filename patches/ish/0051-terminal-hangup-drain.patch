@@ -1,0 +1,36 @@
+--- a/fs/tty.c
++++ b/fs/tty.c
+@@ -524,7 +524,7 @@
+     struct tty *tty = fd->tty;
+     lock(&pids_lock);
+     lock(&tty->lock);
+-    if (tty->hung_up || pty_is_half_closed_master(tty)) {
++    if ((tty->hung_up || pty_is_half_closed_master(tty)) && tty->bufsize == 0) {
+         unlock(&pids_lock);
+         goto error;
+     }
+@@ -558,9 +558,12 @@
+         size_t canon_size;
+         while ((canon_size = tty_canon_size(tty)) == (size_t) -1) {
+             if (!(tty->termios.lflags & ICANON_)) goto retry_mode;
+-            err = _EIO;
+-            if (pty_is_half_closed_master(tty))
+-                goto error;
++            if (tty->hung_up || pty_is_half_closed_master(tty)) {
++                // Drain a final unterminated line before reporting EOF.
++                canon_size = tty->bufsize;
++                if (canon_size == 0) { err = 0; goto error; }
++                break;
++            }
+             err = _EAGAIN;
+             if (fd->flags & O_NONBLOCK_)
+                 goto error;
+@@ -570,7 +573,7 @@
+             if (!(tty->termios.lflags & ICANON_)) goto retry_mode;
+         }
+         // null byte means eof was typed
+-        if (tty->buf[canon_size-1] == '\0')
++        if (tty->buf[canon_size-1] == '\0' && tty->buf_flag[canon_size-1])
+             canon_size--;
+ 
+         if (bufsize > canon_size)

@@ -1,0 +1,305 @@
+--- a/fs/sock.c
++++ b/fs/sock.c
+@@ -1,4 +1,5 @@
+ #include <fcntl.h>
++#include <limits.h>
+ #include <netinet/tcp.h>
+ #include <poll.h>
+ #include <string.h>
+@@ -342,15 +343,27 @@
+ 
+ static lock_t peer_lock = LOCK_INITIALIZER;
+ 
++// Entries live on the connecting thread's stack, protected by peer_lock.
++// A cancelled token can never resolve to a freed or newly reused descriptor.
++struct unix_pending_connect {
++    uint64_t token;
++    bool acknowledged;
++    int ack_pipe[2];
++    struct fd *sock;
++    struct list links;
++};
++static struct list unix_pending_connections = LIST_INITIALIZER(unix_pending_connections);
++static uint64_t unix_next_connect_token = 1;
++
+ // [T-ish-host-fd-double-close] Owns sock_fd from here on: on any failure it is
+ // already closed (f_install() closes the fd it could not install, and with it
+ // real_fd). Callers used to close() it again, which closes whatever the app
+ // opened under that number in between.
+-static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol, struct fd **held) {
++static struct fd *sock_fd_alloc(int sock_fd, int domain, int type, int protocol) {
+     struct fd *fd = adhoc_fd_create(&socket_fdops);
+     if (fd == NULL) {
+         close(sock_fd);
+-        return _ENOMEM;
++        return NULL;
+     }
+     fd->stat.mode = S_IFSOCK | 0666;
+     fd->real_fd = sock_fd;
+@@ -362,6 +375,13 @@
+         cond_init(&fd->socket.unix_got_peer);
+         list_init(&fd->socket.unix_scm);
+     }
++    return fd;
++}
++
++static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol, struct fd **held) {
++    struct fd *fd = sock_fd_alloc(sock_fd, domain, type, protocol);
++    if (fd == NULL)
++        return _ENOMEM;
+     if (held != NULL)
+         *held = fd_retain(fd);
+     return f_install(fd, type & ~SOCKET_TYPE_MASK);
+@@ -748,6 +768,132 @@
+     cred->gid = current->egid;
+ }
+ 
++// Transfer only protocol bytes; readiness and cancellation share the task wake pipe.
++static int unix_handshake_io(struct fd *sock, void *bytes, size_t length, bool writing) {
++    size_t offset = 0;
++    while (offset < length) {
++        int ready = task_wait_host_fd(sock->real_fd, writing ? POLLOUT : POLLIN, -1);
++        if (ready < 0)
++            return ready;
++        int flags = MSG_DONTWAIT;
++#ifdef MSG_NOSIGNAL
++        if (writing)
++            flags |= MSG_NOSIGNAL;
++#endif
++        ssize_t done = writing
++            ? send(sock->real_fd, (char *) bytes + offset, length - offset, flags)
++            : recv(sock->real_fd, (char *) bytes + offset, length - offset, flags);
++        if (done == 0)
++            return _ECONNRESET;
++        if (done < 0) {
++            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
++                continue;
++            return errno_map();
++        }
++        offset += done;
++    }
++    return 0;
++}
++
++static int unix_connect_peer(struct fd *sock) {
++    struct unix_pending_connect pending = {.sock = sock};
++    int err = 0;
++    if (pipe(pending.ack_pipe) < 0) {
++        err = errno_map();
++        shutdown(sock->real_fd, SHUT_RDWR);
++        return err;
++    }
++    for (unsigned i = 0; i < 2; i++) {
++        if (fcntl(pending.ack_pipe[i], F_SETFL, O_NONBLOCK) < 0 ||
++                fcntl(pending.ack_pipe[i], F_SETFD, FD_CLOEXEC) < 0) {
++            err = errno_map();
++            goto close_ack;
++        }
++    }
++    fill_cred(&sock->socket.unix_cred);
++    lock(&peer_lock);
++    if (unix_next_connect_token == UINT64_MAX) {
++        unlock(&peer_lock);
++        err = _EOVERFLOW;
++        goto close_ack;
++    }
++    pending.token = unix_next_connect_token++;
++    list_add_tail(&unix_pending_connections, &pending.links);
++    unlock(&peer_lock);
++
++    err = unix_handshake_io(sock, &pending.token, sizeof(pending.token), true);
++    while (err == 0) {
++        // ACK is private; a concurrent guest recv must never see protocol bytes.
++        struct pollfd descriptors[2] = {
++            {.fd = sock->real_fd, .events = POLLIN}, // EOF; accepted guest output follows ACK
++            {.fd = pending.ack_pipe[0], .events = POLLIN},
++        };
++        err = task_wait_host_fds(descriptors, 2, -1);
++        if (err < 0)
++            break;
++        lock(&peer_lock);
++        err = 0;
++        if (pending.acknowledged) {
++            unlock(&peer_lock);
++            break;
++        }
++        if (descriptors[0].revents) {
++            // Keep ACK publication ordered with this nonblocking peek; it may enable guest writes.
++            char byte;
++            ssize_t n = recv(sock->real_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
++            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
++                unlock(&peer_lock);
++                continue;
++            }
++            err = n < 0 ? errno_map() : n == 0 ? _ECONNRESET : _ECONNABORTED;
++            unlock(&peer_lock);
++            break;
++        }
++        unlock(&peer_lock);
++    }
++    lock(&peer_lock);
++    list_remove(&pending.links);
++    unlock(&peer_lock);
++close_ack:
++    close(pending.ack_pipe[0]);
++    close(pending.ack_pipe[1]);
++    if (err < 0)
++        shutdown(sock->real_fd, SHUT_RDWR); // a partial token must not strand the acceptor
++    return err;
++}
++
++static int unix_accept_peer(struct fd *sock) {
++    uint64_t token;
++    int err = unix_handshake_io(sock, &token, sizeof(token), false);
++    if (err < 0)
++        return err;
++    fill_cred(&sock->socket.unix_cred);
++    err = _ECONNABORTED;
++    lock(&peer_lock);
++    struct unix_pending_connect *pending;
++    list_for_each_entry(&unix_pending_connections, pending, links) {
++        if (pending->token != token)
++            continue;
++        if (pending->acknowledged)
++            break;
++        // The connector owns both private pipe ends until it unregisters under this lock.
++        uint8_t ack = 0xa5;
++        ssize_t sent = write(pending->ack_pipe[1], &ack, sizeof(ack));
++        if (sent != sizeof(ack)) {
++            err = sent < 0 ? errno_map() : _ECONNRESET;
++            break;
++        }
++        pending->acknowledged = true;
++        struct fd *peer = pending->sock;
++        sock->socket.unix_peer = peer;
++        peer->socket.unix_peer = sock;
++        err = 0;
++        break;
++    }
++    unlock(&peer_lock);
++    return err;
++}
++
+ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
+     STRACE("connect(%d, 0x%x, %d)", sock_fd, sockaddr_addr, sockaddr_len);
+     struct fd *sock __attribute__((cleanup(fd_cleanup))) = sock_getfd_retained(sock_fd);
+@@ -774,19 +920,8 @@
+         return errno_map();
+     }
+ 
+-    if (sock->socket.domain == AF_LOCAL_) {
+-        fill_cred(&sock->socket.unix_cred);
+-        assert(sock->socket.unix_peer == NULL);
+-        // Send a pointer to ourselves to the other end so they can set up the peer pointers.
+-        ssize_t res = write(sock->real_fd, &sock, sizeof(struct fd *));
+-        if (res == sizeof(struct fd *)) {
+-            // Wait for acknowledgement that it happened.
+-            lock(&peer_lock);
+-            while (sock->socket.unix_peer == NULL)
+-                wait_for_ignore_signals(&sock->socket.unix_got_peer, &peer_lock, NULL);
+-            unlock(&peer_lock);
+-        }
+-    }
++    if (sock->socket.domain == AF_LOCAL_)
++        return unix_connect_peer(sock);
+ 
+     return err;
+ }
+@@ -840,30 +975,18 @@
+         }
+     }
+ 
+-    struct fd *client_fd __attribute__((cleanup(fd_cleanup))) = NULL;
+-    fd_t client_f = sock_fd_create(client, sock->socket.domain,
+-            sock->socket.type | (flags & SOCK_CLOEXEC_), sock->socket.protocol, &client_fd);
+-    // [T-ish-host-fd-double-close] client is closed already; going on used to
+-    // f_get() the negative number below and write through the NULL fd.
+-    if (client_f < 0)
+-        return client_f;
+-
++    struct fd *client_fd __attribute__((cleanup(fd_cleanup))) = sock_fd_alloc(client,
++            sock->socket.domain, sock->socket.type, sock->socket.protocol);
++    if (client_fd == NULL)
++        return _ENOMEM;
+     if (sock->socket.domain == AF_LOCAL_) {
+-        lock(&peer_lock);
+-        fill_cred(&client_fd->socket.unix_cred);
+-        struct fd *peer;
+-        ssize_t res = read(client, &peer, sizeof(peer));
+-        if (res == sizeof(peer)) {
+-            client_fd->socket.unix_peer = peer;
+-            peer->socket.unix_peer = client_fd;
+-            notify(&peer->socket.unix_got_peer);
+-        }
+-        unlock(&peer_lock);
+-    }
+-
++        int err = unix_accept_peer(client_fd);
++        if (err < 0)
++            return err;
++    }
+     if (flags & SOCK_NONBLOCK_)
+         fd_setflags(client_fd, O_NONBLOCK_);
+-    return client_f;
++    return f_install(fd_retain(client_fd), flags & SOCK_CLOEXEC_);
+ }
+ 
+ int_t sys_accept(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
+@@ -1121,54 +1244,9 @@
+ // or a negative errno on poll() error.
+ static int sock_wait_for(int real_fd, short events, int timeout_opt) {
+     long timeout_ms = sock_get_timeout_ms(real_fd, timeout_opt);
+-    long start_ms = monotonic_ms();
+-    long deadline_ms = (timeout_ms > 0) ? (start_ms + timeout_ms) : 0;
+-    bool slow_logged = false;
+-    for (;;) {
+-        if (current->sighand != NULL) {
+-            lock(&current->sighand->lock);
+-            bool pending = !!(current->pending & ~current->blocked);
+-            unlock(&current->sighand->lock);
+-            if (pending)
+-                return _EINTR;
+-        }
+-
+-        int poll_ms = 1000;
+-        if (deadline_ms > 0) {
+-            long remaining = deadline_ms - monotonic_ms();
+-            if (remaining <= 0) {
+-                printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) deadline-expired after %ldms\n",
+-                       current->pid, current->comm, real_fd, events, timeout_ms);
+-                return _EAGAIN;
+-            }
+-            if (remaining < poll_ms)
+-                poll_ms = (int)remaining;
+-        }
+-
+-        struct pollfd pfd = { .fd = real_fd, .events = events };
+-        current->blocking = true;
+-        int pr = poll(&pfd, 1, poll_ms);
+-        int saved_errno = errno;
+-        current->blocking = false;
+-
+-        if (pr > 0)
+-            return 0;
+-        if (pr == 0) {
+-            // Log once if we're stuck > 3 seconds without any ready event
+-            if (!slow_logged && (monotonic_ms() - start_ms) >= 3000) {
+-                printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) no-event for 3s (timeout_opt_ms=%ld)\n",
+-                       current->pid, current->comm, real_fd, events, timeout_ms);
+-                slow_logged = true;
+-            }
+-            continue;
+-        }
+-        if (saved_errno == EINTR)
+-            continue;
+-        errno = saved_errno;
+-        printk("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) poll err=%d\n",
+-               current->pid, current->comm, real_fd, events, saved_errno);
+-        return errno_map();
+-    }
++    int ready = task_wait_host_fd(real_fd, events,
++            timeout_ms <= 0 ? -1 : timeout_ms > INT_MAX ? INT_MAX : (int) timeout_ms);
++    return ready > 0 ? 0 : ready == 0 ? _EAGAIN : ready;
+ }
+ 
+ static int sock_wait_readable(int real_fd) {

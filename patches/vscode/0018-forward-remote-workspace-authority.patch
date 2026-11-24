@@ -1,0 +1,51 @@
+--- a/src/vs/workbench/browser/web.api.ts
++++ b/src/vs/workbench/browser/web.api.ts
+@@ -432,13 +432,14 @@
+ 	 * @param workspace the workspace to open.
+ 	 * @param options optional options for the workspace to open.
+ 	 * - `reuse`: whether to open inside the current window or a new window
++	 * - `remoteAuthority`: the requested remote connection, or `null` to open locally.
+ 	 * - `payload`: arbitrary payload that should be made available
+ 	 * to the opening window via the `IWorkspaceProvider.payload` property.
+ 	 * @param payload optional payload to send to the workspace to open.
+ 	 *
+ 	 * @returns true if successfully opened, false otherwise.
+ 	 */
+-	open(workspace: IWorkspace, options?: { reuse?: boolean; payload?: object }): Promise<boolean>;
++	open(workspace: IWorkspace, options?: { reuse?: boolean; payload?: object; remoteAuthority?: string | null }): Promise<boolean>;
+ }
+ 
+ export interface IResourceUriProvider {
+--- a/src/vs/workbench/services/host/browser/browserHostService.ts
++++ b/src/vs/workbench/services/host/browser/browserHostService.ts
+@@ -265,13 +265,13 @@
+ 				} else if (options?.removeMode) {
+ 					foldersToRemove.push(openable.folderUri);
+ 				} else {
+-					this.doOpen({ folderUri: openable.folderUri }, { reuse: this.shouldReuse(options, false /* no file */), payload });
++					await this.doOpen({ folderUri: openable.folderUri }, { reuse: this.shouldReuse(options, false /* no file */), payload, remoteAuthority: options?.remoteAuthority });
+ 				}
+ 			}
+ 
+ 			// Workspace
+ 			else if (isWorkspaceToOpen(openable)) {
+-				this.doOpen({ workspaceUri: openable.workspaceUri }, { reuse: this.shouldReuse(options, false /* no file */), payload });
++				await this.doOpen({ workspaceUri: openable.workspaceUri }, { reuse: this.shouldReuse(options, false /* no file */), payload, remoteAuthority: options?.remoteAuthority });
+ 			}
+ 
+ 			// File (handled later in bulk)
+@@ -479,11 +479,12 @@
+ 	private async doOpenEmptyWindow(options?: IOpenEmptyWindowOptions): Promise<void> {
+ 		return this.doOpen(undefined, {
+ 			reuse: options?.forceReuseWindow,
+-			payload: this.preservePayload(true /* empty window */, options)
++			payload: this.preservePayload(true /* empty window */, options),
++			remoteAuthority: options?.remoteAuthority
+ 		});
+ 	}
+ 
+-	private async doOpen(workspace: IWorkspace, options?: { reuse?: boolean; payload?: object }): Promise<void> {
++	private async doOpen(workspace: IWorkspace, options?: { reuse?: boolean; payload?: object; remoteAuthority?: string | null }): Promise<void> {
+ 
+ 		// When we are in a temporary workspace and are asked to open a local folder
+ 		// we swap that folder into the workspace to avoid a window reload. Access

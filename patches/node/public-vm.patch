@@ -1,0 +1,77 @@
+diff --git a/deps/v8/src/base/build_config.h b/deps/v8/src/base/build_config.h
+index 207f46b..e4022ac 100644
+--- a/deps/v8/src/base/build_config.h
++++ b/deps/v8/src/base/build_config.h
+@@ -34,14 +34,9 @@
+ #define V8_HAS_PTHREAD_JIT_WRITE_PROTECT 0
+ #endif
+ 
+-// BrowserEngineCore JIT write protect is only available on iOS 17.4 and later.
+-#if defined(V8_HOST_ARCH_ARM64) && defined(V8_OS_IOS) && \
+-    defined(__IPHONE_17_4) &&                            \
+-    __IPHONE_OS_VERSION_MIN_REQUIRED >= __IPHONE_17_4
+-#define V8_HAS_BECORE_JIT_WRITE_PROTECT 1
+-#else
++// CodiPad supplies debugger-backed RX/RW mappings. Do not import the
++// BrowserEngineCore SPI used by upstream iOS builds.
+ #define V8_HAS_BECORE_JIT_WRITE_PROTECT 0
+-#endif
+ 
+ #if defined(V8_OS_LINUX) && defined(V8_HOST_ARCH_X64)
+ #define V8_HAS_PKU_JIT_WRITE_PROTECT 1
+diff --git a/deps/v8/src/base/ios-headers.h b/deps/v8/src/base/ios-headers.h
+index 6434435..68e98be 100644
+--- a/deps/v8/src/base/ios-headers.h
++++ b/deps/v8/src/base/ios-headers.h
+@@ -5,27 +5,31 @@
+ #ifndef V8_BASE_IOS_HEADERS_H_
+ #define V8_BASE_IOS_HEADERS_H_
+ 
+-// This file includes the necessary headers that are not part of the
+-// iOS public SDK in order to support memory allocation on iOS.
+-
++// Public iOS VM APIs only. The upstream hand-declared mach_vm_* entrypoints
++// are not present in the public iOS SDK; retain 64-bit address semantics here.
+ #include <mach/mach.h>
+ #include <mach/vm_map.h>
+ 
+-__BEGIN_DECLS
+-
+-kern_return_t mach_vm_remap(
+-    vm_map_t target_task, mach_vm_address_t* target_address,
+-    mach_vm_size_t size, mach_vm_offset_t mask, int flags, vm_map_t src_task,
+-    mach_vm_address_t src_address, boolean_t copy, vm_prot_t* cur_protection,
+-    vm_prot_t* max_protection, vm_inherit_t inheritance);
+-
+-kern_return_t mach_vm_map(vm_map_t target_task, mach_vm_address_t* address,
+-                          mach_vm_size_t size, mach_vm_offset_t mask, int flags,
+-                          mem_entry_name_port_t object,
+-                          memory_object_offset_t offset, boolean_t copy,
+-                          vm_prot_t cur_protection, vm_prot_t max_protection,
+-                          vm_inherit_t inheritance);
+-
+-__END_DECLS
+-
++static inline kern_return_t codipad_v8_vm_remap(vm_map_t task, mach_vm_address_t* address,
++    mach_vm_size_t size, mach_vm_offset_t mask, int flags, vm_map_t source,
++    mach_vm_address_t source_address, boolean_t copy, vm_prot_t* current,
++    vm_prot_t* maximum, vm_inherit_t inheritance) {
++  vm_address_t target = static_cast<vm_address_t>(*address);
++  auto result = vm_remap(task, &target, size, mask, flags, source, source_address,
++                         copy, current, maximum, inheritance);
++  *address = target;
++  return result;
++}
++static inline kern_return_t codipad_v8_vm_map(vm_map_t task, mach_vm_address_t* address,
++    mach_vm_size_t size, mach_vm_offset_t mask, int flags, mem_entry_name_port_t object,
++    memory_object_offset_t offset, boolean_t copy, vm_prot_t current,
++    vm_prot_t maximum, vm_inherit_t inheritance) {
++  vm_address_t target = static_cast<vm_address_t>(*address);
++  auto result = vm_map(task, &target, size, mask, flags, object, offset, copy,
++                       current, maximum, inheritance);
++  *address = target;
++  return result;
++}
++#define mach_vm_remap codipad_v8_vm_remap
++#define mach_vm_map codipad_v8_vm_map
+ #endif  // V8_BASE_IOS_HEADERS_H_

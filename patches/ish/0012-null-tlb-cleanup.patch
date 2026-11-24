@@ -1,0 +1,17 @@
+--- a/emu/tlb.c
++++ b/emu/tlb.c
+@@ -1,5 +1,6 @@
+ #include "emu/cpu.h"
+ #include "emu/tlb.h"
++#include <stdatomic.h>
+ #include "kernel/task.h"
+ #include "kernel/memory.h"
+ #include "kernel/fs.h"
+@@ -130,6 +131,7 @@
+ }
+ 
+ void tlb_free(struct tlb *tlb) {
++    if (tlb == NULL) return;
+     if (tlb->frame != NULL)
+         free(tlb->frame);
+     free(tlb);

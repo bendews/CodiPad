@@ -1,0 +1,32 @@
+--- a/src/vs/workbench/contrib/webview/browser/pre/index.html
++++ b/src/vs/workbench/contrib/webview/browser/pre/index.html
+@@ -5,7 +5,7 @@
+ 	<meta charset="UTF-8">
+ 
+ 	<meta http-equiv="Content-Security-Policy"
+-		content="default-src 'none'; script-src 'sha256-7cKy9iQfWRXcgRS74x6I4q5cRDkv8nQz51jecqMmQ5w=' 'self'; frame-src 'self'; style-src 'unsafe-inline';">
++		content="default-src 'none'; script-src 'sha256-uRiFsj6Jk8Xq+x2pav6mOhkU/yDZEpwC2WDBgR0paLQ=' 'self'; frame-src 'self'; style-src 'unsafe-inline';">
+ 
+ 	<!-- Disable pinch zooming -->
+ 	<meta name="viewport"
+@@ -338,7 +338,7 @@
+ 			async signalReady() {
+ 				const start = (/** @type {string} */ parentOrigin) => {
+ 					perfMark('signalingReady');
+-					invoke(sendToParent, window.parent, { target: ID, channel: 'webview-ready', data: { keyEventToken, mountId: searchParams.get('mountId') } }, parentOrigin, [this.channel.port2]);
++					invoke(sendToParent, window.parent, { target: ID, channel: 'webview-ready', data: { keyEventToken, mountId: searchParams.get('mountId') } }, parentOrigin === 'null' ? '*' : parentOrigin, [this.channel.port2]);
+ 				};
+ 
+ 				const parentOrigin = searchParams.get('parentOrigin');
+@@ -366,7 +366,10 @@
+ 					throw err instanceof Error ? err : new Error(String(err));
+ 				}
+ 
+-				if (hostname === parentOriginHash || hostname.startsWith(parentOriginHash + '.')) {
++				// Native embeds use a distinct loopback port per webview and bind its path to this proof.
++				const localEndpoint = location.protocol === 'http:' && hostname === '127.0.0.1'
++					&& location.pathname === `/${parentOriginHash}/pre/index.html`;
++				if (hostname === parentOriginHash || hostname.startsWith(parentOriginHash + '.') || localEndpoint) {
+ 					// validation succeeded!
+ 					return start(parentOrigin);
+ 				}

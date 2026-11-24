@@ -1,0 +1,15 @@
+--- a/fs/generic.c
++++ b/fs/generic.c
+@@ -202,6 +202,12 @@
+     err = _EPERM;
+     if (mount->fs->unlink)
+         err = mount->fs->unlink(mount, path);
++    // Darwin reports EPERM for unlink(directory); Linux callers need EISDIR.
++    if (err == _EPERM && mount->fs->stat) {
++        struct statbuf stat = {};
++        if (mount->fs->stat(mount, path, &stat) == 0 && S_ISDIR(stat.mode))
++            err = _EISDIR;
++    }
+     path_cache_invalidate();
+     mount_release(mount);
+     return err;

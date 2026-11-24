@@ -1,0 +1,116 @@
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -3721,27 +3721,43 @@
+ 
+ // Start the JIT now: the debugger's region if a debugger is ready, otherwise false and the app
+ // sets ISH_JIT=0 for the gadget engine. Called on one thread, before the guest boots.
++static pthread_mutex_t jit_region_lock = PTHREAD_MUTEX_INITIALIZER;
++static bool jit_startup_started;
++
+ bool ish_jit_try_enable(void) {
+ #ifndef ISH_JIT_NO_EMIT
+-    if (region != NULL)
++    pthread_mutex_lock(&jit_region_lock);
++    if (jit_startup_started) {
++        bool enabled = region != NULL;
++        pthread_mutex_unlock(&jit_region_lock);
++        return enabled;
++    }
++    if (region != NULL) {
++        pthread_mutex_unlock(&jit_region_lock);
+         return true;
++    }
+ #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+-    if (!ish_jit_debugger_ready())
++    if (!ish_jit_debugger_ready()) {
++        pthread_mutex_unlock(&jit_region_lock);
+         return false;
++    }
+     jit_cache_size();
+     if (!jit_txm_present()) {
+         jit_note("jit: fast mode ok (cs_debugged)");   // pre-TXM: jit_init maps, no brk involved
++        pthread_mutex_unlock(&jit_region_lock);
+         return true;
+     }
+     uint8_t *rx = jit_brk_region(NULL, region_size);
+     bool ok = jit_region_from(rx, "jit: fast mode ok");
+     jit_brk_detach();   // the script stays attached until the detach, so always detach
++    pthread_mutex_unlock(&jit_region_lock);
+     return ok;
+ #else
+     // No TXM rule off the device: the platform mapping is what the harness exercises here.
+     bool on = jit_select_region(!TARGET_OS_OSX || getenv("ISH_JIT_DUALMAP") != NULL);
+     if (on)
+         jit_note("jit: fast mode ok (platform map)");
++    pthread_mutex_unlock(&jit_region_lock);
+     return on;
+ #endif
+ #else
+@@ -3749,9 +3765,67 @@
+ #endif
+ }
+ 
++// Return the exact cache size selected by the engine's existing environment
++// and device-memory policy. Zero means startup has begun or this build cannot
++// emit translated code.
++size_t ish_jit_region_capacity(void) {
++#ifndef ISH_JIT_NO_EMIT
++    pthread_mutex_lock(&jit_region_lock);
++    if (jit_startup_started) {
++        pthread_mutex_unlock(&jit_region_lock);
++        return 0;
++    }
++    jit_cache_size();
++    size_t capacity = region_size;
++    pthread_mutex_unlock(&jit_region_lock);
++    return capacity;
++#else
++    return 0;
++#endif
++}
++
++// Install a cache lease from CodiPad's shared Node/JIT executable pool. The
++// owner already established RX and RW aliases; this never maps or chmods pages.
++bool ish_jit_install_region(void *rx, void *rw, size_t capacity) {
++#ifndef ISH_JIT_NO_EMIT
++    pthread_mutex_lock(&jit_region_lock);
++    if (jit_startup_started || region != NULL || rx == NULL || rw == NULL || rx == rw || capacity == 0 ||
++        ((uintptr_t) rx & 0x3fff) != 0 || ((uintptr_t) rw & 0x3fff) != 0 ||
++        capacity > UINTPTR_MAX - (uintptr_t) rx || capacity > UINTPTR_MAX - (uintptr_t) rw) {
++        pthread_mutex_unlock(&jit_region_lock);
++        return false;
++    }
++    jit_cache_size();
++    if (capacity != region_size) {
++        pthread_mutex_unlock(&jit_region_lock);
++        return false;
++    }
++    uintptr_t distance = (uintptr_t) rx > (uintptr_t) rw
++                             ? (uintptr_t) rx - (uintptr_t) rw
++                             : (uintptr_t) rw - (uintptr_t) rx;
++    if (distance + capacity >= (1ull << 32)) {
++        pthread_mutex_unlock(&jit_region_lock);
++        return false;
++    }
++    region = (uint8_t *) rx;
++    rw_delta = (intptr_t) rw - (intptr_t) rx;
++    dual_map = true;
++    jit_note("jit: shared executable cache installed");
++    pthread_mutex_unlock(&jit_region_lock);
++    return true;
++#else
++    return false;
++#endif
++}
++
+ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+ 
+ static void jit_init(void) {
++    // Serialize startup with the external cache installer. No cache changes are
++    // permitted after pthread_once begins initialization.
++    pthread_mutex_lock(&jit_region_lock);
++    jit_startup_started = true;
++    pthread_mutex_unlock(&jit_region_lock);
+     if (env_off("ISH_JIT")) {
+         jit_note("jit: fallback (ISH_JIT=0)");
+         return;

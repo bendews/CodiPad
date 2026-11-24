@@ -1,0 +1,527 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		BEE3ABF2D74E4AC8AC180002 /* LICENSE in Resources */ = {isa = PBXBuildFile; fileRef = FEE3ABF2D74E4AC8AC180003 /* LICENSE */; };
+		BEE3ABF2D74E4AC8AC180001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = FEE3ABF2D74E4AC8AC180001 /* Assets.xcassets */; };
+		B30000000000000000000091 /* TerminalKeyboardBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = F30000000000000000000091 /* TerminalKeyboardBar.swift */; };
+		B40000000000000000000001 /* NativeMarketplace.swift in Sources */ = {isa = PBXBuildFile; fileRef = F40000000000000000000001 /* NativeMarketplace.swift */; };
+		341B044B539ED69558472557 /* NativeWebviewService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9348A723E741CA99BFF4103B /* NativeWebviewService.swift */; };
+		3004055E0021E7870B79AD64 /* NativeWorkbenchAssetServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BC3067B9119FCE0F64AE5A1 /* NativeWorkbenchAssetServer.swift */; };
+		37ED77DD5CEC0ED6A0047EC2 /* NativeStorageMigration.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECB8EF9752F3D284262E569A /* NativeStorageMigration.swift */; };
+		45325F4834DC0E74ECCEE292 /* NativeWorkspaceState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1182D08415710B497C882A7B /* NativeWorkspaceState.swift */; };
+		B40000000000000000000002 /* NativeExtensionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F40000000000000000000002 /* NativeExtensionStore.swift */; };
+		B40000000000000000000003 /* codipad_vsix_extract.c in Sources */ = {isa = PBXBuildFile; fileRef = F40000000000000000000003 /* codipad_vsix_extract.c */; };
+		B100000000000000000000A8 /* CodiPadWorkspace in Frameworks */ = {isa = PBXBuildFile; productRef = E100000000000000000000B2; };
+		B100000000000000000000AA /* WorkbenchViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F100000000000000000000AA /* WorkbenchViewController.swift */; };
+		B100000000000000000000A9 /* Workbench in Resources */ = {isa = PBXBuildFile; fileRef = F100000000000000000000A9 /* Workbench */; };
+		B100000000000000000000AB /* NativeWorkspaceBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = F100000000000000000000AB /* NativeWorkspaceBridge.swift */; };
+		B100000000000000000000A1 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F100000000000000000000A1 /* AppDelegate.swift */; };
+		B100000000000000000000A2 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F100000000000000000000A2 /* SceneDelegate.swift */; };
+		B100000000000000000000A3 /* BuildReceipt.swift in Sources */ = {isa = PBXBuildFile; fileRef = F100000000000000000000A3 /* BuildReceipt.swift */; };
+		B100000000000000000000A5 /* BuildReceipt.json in Resources */ = {isa = PBXBuildFile; fileRef = F100000000000000000000A5 /* BuildReceipt.json */; };
+		B20000000000000000000001 /* CodeRegion.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000001 /* CodeRegion.cpp */; };
+		B80000000000000000000001 /* ExecutionRegion.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F80000000000000000000001 /* ExecutionRegion.cpp */; };
+		B80000000000000000000003 /* GuestMemoryWindow.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F80000000000000000000003 /* GuestMemoryWindow.cpp */; };
+		B80000000000000000000002 /* NativeExecutionPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = F80000000000000000000002 /* NativeExecutionPages.swift */; };
+		B90000000000000000000001 /* LinuxRootFilesystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = F90000000000000000000001 /* LinuxRootFilesystem.swift */; };
+		B20000000000000000000002 /* PageAllocator.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000002 /* PageAllocator.cpp */; };
+		B20000000000000000000003 /* NodeRuntime.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000003 /* NodeRuntime.cpp */; };
+		B20000000000000000000004 /* NativeExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000004 /* NativeExtensionHost.swift */; };
+		B20000000000000000000008 /* LinuxExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000008 /* LinuxExtensionHost.swift */; };
+		B20000000000000000000033 /* NativeAgentHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000033 /* NativeAgentHost.swift */; };
+		B20000000000000000000006 /* Exthost in Resources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000006 /* Exthost */; };
+		B20000000000000000000007 /* NativeExtensionCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000000000000000000007 /* NativeExtensionCatalog.swift */; };
+		B30000000000000000000001 /* NativeTerminalHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = F30000000000000000000001 /* NativeTerminalHost.swift */; };
+		B30000000000000000000002 /* IshKernel.c in Sources */ = {isa = PBXBuildFile; fileRef = F30000000000000000000002 /* IshKernel.c */; settings = {COMPILER_FLAGS = "-DENGINE_ASBESTOS=1 -DGUEST_ARM64=1 -DISH_JIT=1"; }; };
+		B30000000000000000000003 /* ShellBootstrap.c in Sources */ = {isa = PBXBuildFile; fileRef = F30000000000000000000003 /* ShellBootstrap.c */; settings = {COMPILER_FLAGS = "-DENGINE_ASBESTOS=1 -DGUEST_ARM64=1 -DISH_JIT=1"; }; };
+		B30000000000000000000004 /* ShellRootfs.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = F30000000000000000000004 /* ShellRootfs.tar.gz */; };
+		B30000000000000000000005 /* NodeProcess.c in Sources */ = {isa = PBXBuildFile; fileRef = F30000000000000000000005 /* NodeProcess.c */; };
+		B30000000000000000000007 /* NativeTerminalState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F30000000000000000000007 /* NativeTerminalState.swift */; };
+		B30000000000000000000008 /* JavaScriptCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F30000000000000000000008 /* JavaScriptCore.framework */; };
+		B30000000000000000000009 /* NativeExtensionURLQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = F30000000000000000000009 /* NativeExtensionURLQueue.swift */; };
+		B3000000000000000000000A /* NativeTerminalRevival.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3000000000000000000000A /* NativeTerminalRevival.swift */; };
+		B80000000000000000000004 /* NativeRuntimeConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = F80000000000000000000004 /* NativeRuntimeConfiguration.swift */; };
+		B80000000000000000000005 /* NativeRuntimeStartup.swift in Sources */ = {isa = PBXBuildFile; fileRef = F80000000000000000000005 /* NativeRuntimeStartup.swift */; };
+		B80000000000000000000006 /* stikdebug.js in Resources */ = {isa = PBXBuildFile; fileRef = F80000000000000000000006 /* stikdebug.js */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		FEE3ABF2D74E4AC8AC180003 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = SOURCE_ROOT; };
+		FEE3ABF2D74E4AC8AC180001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		FEE3ABF2D74E4AC8AC180002 /* CodiPad.svg */ = {isa = PBXFileReference; lastKnownFileType = image.svg; path = CodiPad.svg; sourceTree = "<group>"; };
+		F100000000000000000000A4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		F100000000000000000000A1 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		F100000000000000000000A2 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
+		F100000000000000000000A3 /* BuildReceipt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuildReceipt.swift; sourceTree = "<group>"; };
+		F100000000000000000000AA /* WorkbenchViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkbenchViewController.swift; sourceTree = "<group>"; };
+		F100000000000000000000AB /* NativeWorkspaceBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeWorkspaceBridge.swift; sourceTree = "<group>"; };
+		1182D08415710B497C882A7B /* NativeWorkspaceState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeWorkspaceState.swift; sourceTree = "<group>"; };
+		9BC3067B9119FCE0F64AE5A1 /* NativeWorkbenchAssetServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeWorkbenchAssetServer.swift; sourceTree = "<group>"; };
+		9348A723E741CA99BFF4103B /* NativeWebviewService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeWebviewService.swift; sourceTree = "<group>"; };
+		ECB8EF9752F3D284262E569A /* NativeStorageMigration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStorageMigration.swift; sourceTree = "<group>"; };
+		F20000000000000000000004 /* NativeExtensionHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeExtensionHost.swift; sourceTree = "<group>"; };
+		F20000000000000000000008 /* LinuxExtensionHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinuxExtensionHost.swift; sourceTree = "<group>"; };
+		F20000000000000000000007 /* NativeExtensionCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeExtensionCatalog.swift; sourceTree = "<group>"; };
+		F40000000000000000000002 /* NativeExtensionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeExtensionStore.swift; sourceTree = "<group>"; };
+		F30000000000000000000009 /* NativeExtensionURLQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeExtensionURLQueue.swift; sourceTree = "<group>"; };
+		F40000000000000000000001 /* NativeMarketplace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeMarketplace.swift; sourceTree = "<group>"; };
+		F20000000000000000000033 /* NativeAgentHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAgentHost.swift; sourceTree = "<group>"; };
+		F30000000000000000000001 /* NativeTerminalHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalHost.swift; sourceTree = "<group>"; };
+		F30000000000000000000007 /* NativeTerminalState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalState.swift; sourceTree = "<group>"; };
+		F3000000000000000000000A /* NativeTerminalRevival.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalRevival.swift; sourceTree = "<group>"; };
+		F30000000000000000000091 /* TerminalKeyboardBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalKeyboardBar.swift; sourceTree = "<group>"; };
+		F80000000000000000000004 /* NativeRuntimeConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeRuntimeConfiguration.swift; sourceTree = "<group>"; };
+		F80000000000000000000005 /* NativeRuntimeStartup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeRuntimeStartup.swift; sourceTree = "<group>"; };
+		F80000000000000000000002 /* NativeExecutionPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeExecutionPages.swift; sourceTree = "<group>"; };
+		F90000000000000000000001 /* LinuxRootFilesystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinuxRootFilesystem.swift; sourceTree = "<group>"; };
+		F100000000000000000000A5 /* BuildReceipt.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = BuildReceipt.json; sourceTree = "<group>"; };
+		F100000000000000000000A9 /* Workbench */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Workbench; sourceTree = "<group>"; };
+		F20000000000000000000005 /* NativeRuntime.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = NativeRuntime.xcconfig; sourceTree = "<group>"; };
+		F20000000000000000000006 /* Exthost */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Exthost; sourceTree = "<group>"; };
+		F30000000000000000000004 /* ShellRootfs.tar.gz */ = {isa = PBXFileReference; lastKnownFileType = archive.gzip; path = ShellRootfs.tar.gz; sourceTree = "<group>"; };
+		F20000000000000000000001 /* CodeRegion.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = CodeRegion.cpp; sourceTree = "<group>"; };
+		F20000000000000000000002 /* PageAllocator.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = PageAllocator.cpp; sourceTree = "<group>"; };
+		F20000000000000000000003 /* NodeRuntime.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NodeRuntime.cpp; sourceTree = "<group>"; };
+		F80000000000000000000001 /* ExecutionRegion.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = ExecutionRegion.cpp; sourceTree = "<group>"; };
+		F80000000000000000000003 /* GuestMemoryWindow.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = GuestMemoryWindow.cpp; sourceTree = "<group>"; };
+		F80000000000000000000006 /* stikdebug.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = stikdebug.js; sourceTree = "<group>"; };
+		F40000000000000000000003 /* codipad_vsix_extract.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = codipad_vsix_extract.c; sourceTree = "<group>"; };
+		F30000000000000000000002 /* IshKernel.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = IshKernel.c; sourceTree = "<group>"; };
+		F30000000000000000000003 /* ShellBootstrap.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = ShellBootstrap.c; sourceTree = "<group>"; };
+		F30000000000000000000005 /* NodeProcess.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = NodeProcess.c; sourceTree = "<group>"; };
+		F30000000000000000000008 /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
+		F100000000000000000000B0 /* CodiPad.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CodiPad.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D100000000000000000000A2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B100000000000000000000A8 /* CodiPadWorkspace in Frameworks */,
+				B30000000000000000000008 /* JavaScriptCore.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A100000000000000000000A0 = {
+			isa = PBXGroup;
+			children = (
+				FEE3ABF2D74E4AC8AC180003 /* LICENSE */,
+				A100000000000000000000A1 /* app */,
+				A100000000000000000000B0 /* native */,
+				F30000000000000000000008 /* JavaScriptCore.framework */,
+				A100000000000000000000A3 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A1 /* app */ = {
+			isa = PBXGroup;
+			children = (
+				A100000000000000000000A2 /* CodiPad */,
+				A100000000000000000000A9 /* generated */,
+			);
+			path = app;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A2 /* CodiPad */ = {
+			isa = PBXGroup;
+			children = (
+				A100000000000000000000A4 /* App */,
+				A100000000000000000000A5 /* Workbench */,
+				A100000000000000000000A6 /* Extensions */,
+				A100000000000000000000A7 /* Terminal */,
+				A100000000000000000000A8 /* Runtime */,
+				FEE3ABF2D74E4AC8AC180001 /* Assets.xcassets */,
+				FEE3ABF2D74E4AC8AC180002 /* CodiPad.svg */,
+				F100000000000000000000A4 /* Info.plist */,
+			);
+			path = CodiPad;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A4 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				F100000000000000000000A1 /* AppDelegate.swift */,
+				F100000000000000000000A2 /* SceneDelegate.swift */,
+				F100000000000000000000A3 /* BuildReceipt.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A5 /* Workbench */ = {
+			isa = PBXGroup;
+			children = (
+				F100000000000000000000AA /* WorkbenchViewController.swift */,
+				F100000000000000000000AB /* NativeWorkspaceBridge.swift */,
+				1182D08415710B497C882A7B /* NativeWorkspaceState.swift */,
+				9BC3067B9119FCE0F64AE5A1 /* NativeWorkbenchAssetServer.swift */,
+				9348A723E741CA99BFF4103B /* NativeWebviewService.swift */,
+				ECB8EF9752F3D284262E569A /* NativeStorageMigration.swift */,
+			);
+			path = Workbench;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A6 /* Extensions */ = {
+			isa = PBXGroup;
+			children = (
+				F20000000000000000000004 /* NativeExtensionHost.swift */,
+				F20000000000000000000008 /* LinuxExtensionHost.swift */,
+				F20000000000000000000007 /* NativeExtensionCatalog.swift */,
+				F40000000000000000000002 /* NativeExtensionStore.swift */,
+				F30000000000000000000009 /* NativeExtensionURLQueue.swift */,
+				F40000000000000000000001 /* NativeMarketplace.swift */,
+				F20000000000000000000033 /* NativeAgentHost.swift */,
+			);
+			path = Extensions;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A7 /* Terminal */ = {
+			isa = PBXGroup;
+			children = (
+				F30000000000000000000001 /* NativeTerminalHost.swift */,
+				F30000000000000000000007 /* NativeTerminalState.swift */,
+				F3000000000000000000000A /* NativeTerminalRevival.swift */,
+				F30000000000000000000091 /* TerminalKeyboardBar.swift */,
+			);
+			path = Terminal;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A8 /* Runtime */ = {
+			isa = PBXGroup;
+			children = (
+				F80000000000000000000004 /* NativeRuntimeConfiguration.swift */,
+				F80000000000000000000005 /* NativeRuntimeStartup.swift */,
+				F80000000000000000000002 /* NativeExecutionPages.swift */,
+				F90000000000000000000001 /* LinuxRootFilesystem.swift */,
+			);
+			path = Runtime;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A9 /* generated */ = {
+			isa = PBXGroup;
+			children = (
+				F20000000000000000000005 /* NativeRuntime.xcconfig */,
+				F100000000000000000000A5 /* BuildReceipt.json */,
+				F100000000000000000000A9 /* Workbench */,
+				F20000000000000000000006 /* Exthost */,
+				F30000000000000000000004 /* ShellRootfs.tar.gz */,
+			);
+			path = generated;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000B0 /* native */ = {
+			isa = PBXGroup;
+			children = (
+				A100000000000000000000B1 /* CodiPadExecution */,
+				A100000000000000000000B2 /* CodiPadExtensions */,
+				A100000000000000000000B3 /* CodiPadNode */,
+				A100000000000000000000B4 /* CodiPadProcess */,
+			);
+			path = native;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000B1 /* CodiPadExecution */ = {
+			isa = PBXGroup;
+			children = (
+				F80000000000000000000001 /* ExecutionRegion.cpp */,
+				F80000000000000000000003 /* GuestMemoryWindow.cpp */,
+				F80000000000000000000006 /* stikdebug.js */,
+			);
+			path = CodiPadExecution;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000B2 /* CodiPadExtensions */ = {
+			isa = PBXGroup;
+			children = (
+				F40000000000000000000003 /* codipad_vsix_extract.c */,
+			);
+			path = CodiPadExtensions;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000B3 /* CodiPadNode */ = {
+			isa = PBXGroup;
+			children = (
+				F20000000000000000000001 /* CodeRegion.cpp */,
+				F20000000000000000000002 /* PageAllocator.cpp */,
+				F20000000000000000000003 /* NodeRuntime.cpp */,
+			);
+			path = CodiPadNode;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000B4 /* CodiPadProcess */ = {
+			isa = PBXGroup;
+			children = (
+				F30000000000000000000002 /* IshKernel.c */,
+				F30000000000000000000003 /* ShellBootstrap.c */,
+				F30000000000000000000005 /* NodeProcess.c */,
+			);
+			path = CodiPadProcess;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000A3 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F100000000000000000000B0 /* CodiPad.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E100000000000000000000A1 /* CodiPad */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C100000000000000000000B2 /* Build configuration list for PBXNativeTarget "CodiPad" */;
+			buildPhases = (
+				D100000000000000000000A1 /* Sources */,
+				D100000000000000000000A2 /* Frameworks */,
+				D100000000000000000000A3 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CodiPad;
+			packageProductDependencies = (E100000000000000000000B2 /* CodiPadWorkspace */);
+			productName = CodiPad;
+			productReference = F100000000000000000000B0 /* CodiPad.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		C100000000000000000000A0 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+					E100000000000000000000A1 = {
+						CreatedOnToolsVersion = 27.0;
+					};
+				};
+			};
+			buildConfigurationList = C100000000000000000000B1 /* Build configuration list for PBXProject "CodiPad" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A100000000000000000000A0;
+			productRefGroup = A100000000000000000000A3 /* Products */;
+			projectDirPath = "";
+			packageReferences = (E100000000000000000000B1 /* CodiPadWorkspace local package */);
+			projectRoot = "";
+			targets = (
+				E100000000000000000000A1 /* CodiPad */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		D100000000000000000000A3 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BEE3ABF2D74E4AC8AC180002 /* LICENSE in Resources */,
+				BEE3ABF2D74E4AC8AC180001 /* Assets.xcassets in Resources */,
+				B100000000000000000000A5 /* BuildReceipt.json in Resources */,
+				B80000000000000000000006 /* stikdebug.js in Resources */,
+				B20000000000000000000006 /* Exthost in Resources */,
+				B30000000000000000000004 /* ShellRootfs.tar.gz in Resources */,
+				B100000000000000000000A9 /* Workbench in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		D100000000000000000000A1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B100000000000000000000A1 /* AppDelegate.swift in Sources */,
+				B100000000000000000000A2 /* SceneDelegate.swift in Sources */,
+				B100000000000000000000A3 /* BuildReceipt.swift in Sources */,
+				B100000000000000000000AA /* WorkbenchViewController.swift in Sources */,
+				B100000000000000000000AB /* NativeWorkspaceBridge.swift in Sources */,
+				45325F4834DC0E74ECCEE292 /* NativeWorkspaceState.swift in Sources */,
+				3004055E0021E7870B79AD64 /* NativeWorkbenchAssetServer.swift in Sources */,
+				341B044B539ED69558472557 /* NativeWebviewService.swift in Sources */,
+				37ED77DD5CEC0ED6A0047EC2 /* NativeStorageMigration.swift in Sources */,
+				B20000000000000000000004 /* NativeExtensionHost.swift in Sources */,
+				B20000000000000000000008 /* LinuxExtensionHost.swift in Sources */,
+				B20000000000000000000007 /* NativeExtensionCatalog.swift in Sources */,
+				B40000000000000000000002 /* NativeExtensionStore.swift in Sources */,
+				B30000000000000000000009 /* NativeExtensionURLQueue.swift in Sources */,
+				B40000000000000000000001 /* NativeMarketplace.swift in Sources */,
+				B20000000000000000000033 /* NativeAgentHost.swift in Sources */,
+				B30000000000000000000001 /* NativeTerminalHost.swift in Sources */,
+				B30000000000000000000007 /* NativeTerminalState.swift in Sources */,
+				B3000000000000000000000A /* NativeTerminalRevival.swift in Sources */,
+				B30000000000000000000091 /* TerminalKeyboardBar.swift in Sources */,
+				B80000000000000000000004 /* NativeRuntimeConfiguration.swift in Sources */,
+				B80000000000000000000005 /* NativeRuntimeStartup.swift in Sources */,
+				B80000000000000000000002 /* NativeExecutionPages.swift in Sources */,
+				B90000000000000000000001 /* LinuxRootFilesystem.swift in Sources */,
+				B40000000000000000000003 /* codipad_vsix_extract.c in Sources */,
+				B20000000000000000000001 /* CodeRegion.cpp in Sources */,
+				B20000000000000000000002 /* PageAllocator.cpp in Sources */,
+				B20000000000000000000003 /* NodeRuntime.cpp in Sources */,
+				B80000000000000000000001 /* ExecutionRegion.cpp in Sources */,
+				B80000000000000000000003 /* GuestMemoryWindow.cpp in Sources */,
+				B30000000000000000000002 /* IshKernel.c in Sources */,
+				B30000000000000000000003 /* ShellBootstrap.c in Sources */,
+				B30000000000000000000005 /* NodeProcess.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		C100000000000000000000C1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				"ARCHS[sdk=iphonesimulator*]" = arm64;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		C100000000000000000000C2 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				"ARCHS[sdk=iphonesimulator*]" = arm64;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		C100000000000000000000C3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F20000000000000000000005;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "$(CODIPAD_APP_ENTITLEMENTS)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = app/CodiPad/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bendews.codipad;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "app/CodiPad/CodiPad-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Debug;
+		};
+		C100000000000000000000C4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F20000000000000000000005;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = app/CodiPad/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bendews.codipad;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "app/CodiPad/CodiPad-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		C100000000000000000000B1 /* Build configuration list for PBXProject "CodiPad" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C100000000000000000000C1 /* Debug */,
+				C100000000000000000000C2 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C100000000000000000000B2 /* Build configuration list for PBXNativeTarget "CodiPad" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C100000000000000000000C3 /* Debug */,
+				C100000000000000000000C4 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+		E100000000000000000000B1 /* CodiPadWorkspace local package */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = native/CodiPadWorkspace;
+		};
+		E100000000000000000000B2 /* CodiPadWorkspace */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E100000000000000000000B1;
+			productName = CodiPadWorkspace;
+		};
+	};
+	rootObject = C100000000000000000000A0 /* Project object */;
+}

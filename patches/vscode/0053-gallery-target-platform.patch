@@ -1,0 +1,47 @@
+--- a/src/vs/platform/extensionManagement/common/extensionGalleryService.ts
++++ b/src/vs/platform/extensionManagement/common/extensionGalleryService.ts
+@@ -653,6 +653,8 @@
+ }
+ 
+ export abstract class AbstractExtensionGalleryService implements IExtensionGalleryService {
++
++	protected get defaultTargetPlatform(): TargetPlatform { return CURRENT_TARGET_PLATFORM; }
+ 
+ 	declare readonly _serviceBrand: undefined;
+ 
+@@ -785,7 +787,7 @@
+ 		const { extensions } = await this.queryGalleryExtensions(
+ 			query,
+ 			{
+-				targetPlatform: options.targetPlatform ?? CURRENT_TARGET_PLATFORM,
++				targetPlatform: options.targetPlatform ?? this.defaultTargetPlatform,
+ 				includePreRelease,
+ 				versions,
+ 				compatible: !!options.compatible,
+@@ -927,7 +929,7 @@
+ 	}
+ 
+ 	private async getValidRawGalleryExtensionVersionFromLatestVersions(rawGalleryExtension: IRawGalleryExtension, latestVersions: IRawGalleryExtensionVersion[], extensionInfo: IExtensionInfo, options: IExtensionQueryOptions, allTargetPlatforms: TargetPlatform[]): Promise<IRawGalleryExtensionVersion | null> {
+-		const targetPlatform = options.targetPlatform ?? CURRENT_TARGET_PLATFORM;
++		const targetPlatform = options.targetPlatform ?? this.defaultTargetPlatform;
+ 		const latestExtensionVersionsForTargetPlatform = filterLatestExtensionVersionsForTargetPlatform(latestVersions, targetPlatform, allTargetPlatforms);
+ 
+ 		// First, find a valid version matching the requested type (pre-release or release)
+@@ -1213,7 +1215,7 @@
+ 		}
+ 
+ 		const runQuery = async (query: Query, token: CancellationToken) => {
+-			const { extensions, total } = await this.queryGalleryExtensions(query, { targetPlatform: CURRENT_TARGET_PLATFORM, compatible: false, includePreRelease: !!options.includePreRelease, productVersion: options.productVersion ?? { version: this.productService.version, date: this.productService.date } }, extensionGalleryManifest, token);
++			const { extensions, total } = await this.queryGalleryExtensions(query, { targetPlatform: this.defaultTargetPlatform, compatible: false, includePreRelease: !!options.includePreRelease, productVersion: options.productVersion ?? { version: this.productService.version, date: this.productService.date } }, extensionGalleryManifest, token);
+ 
+ 			const result: IGalleryExtension[] = [];
+ 			let defaultChatAgentExtension: IGalleryExtension | undefined;
+@@ -1953,7 +1955,7 @@
+ 
+ 		const result: IGalleryExtensionVersion[] = [];
+ 		const seen = new Map<string, number>();
+-		for (const version of sortExtensionVersions(versions, onlyCompatible?.targetPlatform ?? CURRENT_TARGET_PLATFORM)) {
++		for (const version of sortExtensionVersions(versions, onlyCompatible?.targetPlatform ?? this.defaultTargetPlatform)) {
+ 			const index = seen.get(version.version);
+ 			const existing = index !== undefined ? result[index] : undefined;
+ 			const targetPlatform = getTargetPlatformForExtensionVersion(version);

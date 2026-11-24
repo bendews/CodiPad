@@ -1,0 +1,35 @@
+--- a/src/vs/workbench/api/browser/mainThreadTerminalService.ts
++++ b/src/vs/workbench/api/browser/mainThreadTerminalService.ts
+@@ -122,6 +122,18 @@
+ 		this._register(this._terminalProfileService.onDidChangeAvailableProfiles(() => this._updateDefaultProfile()));
+ 	}
+ 
++	override dispose(): void {
++		// A stopped extension host may never report exit for its still-owned pseudoterminals.
++		for (const terminalId of this._terminalService.instances.map(instance => instance.instanceId)) {
++			const entry = this._terminalProcessProxies.get(terminalId);
++			if (entry) {
++				entry.proxy.emitExit(1);
++				this._terminalProcessProxies.deleteAndDispose(terminalId);
++			}
++		}
++		super.dispose();
++	}
++
+ 	private async _updateDefaultProfile() {
+ 		const remoteAuthority = this._environmentService.remoteAuthority;
+ 		const defaultProfile = this._terminalProfileResolverService.getDefaultProfile({ remoteAuthority, os: this._os });
+@@ -221,7 +233,12 @@
+ 	}
+ 
+ 	public $sendProcessExit(terminalId: number, exitCode: number | undefined): void {
+-		this._terminalProcessProxies.get(terminalId)?.proxy.emitExit(exitCode);
++		const entry = this._terminalProcessProxies.get(terminalId);
++		if (!entry) {
++			return;
++		}
++		entry.proxy.emitExit(exitCode);
++		this._terminalProcessProxies.deleteAndDispose(terminalId);
+ 	}
+ 
+ 	public $startSendingDataEvents(): void {

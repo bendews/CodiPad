@@ -1,0 +1,21 @@
+--- a/src/vs/workbench/services/host/browser/browserHostService.ts
++++ b/src/vs/workbench/services/host/browser/browserHostService.ts
+@@ -160,6 +160,9 @@
+ 		this._register(Event.runAndSubscribe(onDidRegisterWindow, ({ window, disposables }) => {
+ 			const focusTracker = disposables.add(trackFocus(window));
+ 			const visibilityTracker = disposables.add(new DomEmitter(window.document, 'visibilitychange'));
++			const onNativeSceneFocus = () => emitter.fire(this.hasFocus);
++			window.addEventListener('codipad-scene-focus', onNativeSceneFocus);
++			disposables.add(toDisposable(() => window.removeEventListener('codipad-scene-focus', onNativeSceneFocus)));
+ 
+ 			Event.any(
+ 				Event.map(focusTracker.onDidFocus, () => this.hasFocus, disposables),
+@@ -173,7 +176,7 @@
+ 	}
+ 
+ 	get hasFocus(): boolean {
+-		return getActiveDocument().hasFocus();
++		return (mainWindow as typeof mainWindow & { __codipadSceneFocused?: boolean }).__codipadSceneFocused !== false && getActiveDocument().hasFocus();
+ 	}
+ 
+ 	async hadLastFocus(): Promise<boolean> {

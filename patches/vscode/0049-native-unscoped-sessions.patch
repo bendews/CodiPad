@@ -1,0 +1,121 @@
+--- a/src/vs/sessions/contrib/chat/browser/newChatWidget.ts
++++ b/src/vs/sessions/contrib/chat/browser/newChatWidget.ts
+@@ -49,6 +49,10 @@
+ import { getLabeledPickerResponsiveItems, NEW_SESSION_PROMPT_PLACEHOLDER, NewChatInputWidget } from './newChatInput.js';
+ import { ChatInputPickerResponsiveLayout } from '../../../../workbench/contrib/chat/browser/widget/input/chatInputPickerResponsiveLayout.js';
+ import { NoAgentHostEmptyState } from './noAgentHostEmptyState.js';
++import { hasNativeUnscopedSessionProvider } from './nativeUnscopedSessions.js';
++import { IWorkbenchEnvironmentService } from '../../../../workbench/services/environment/common/environmentService.js';
++import { IChatSessionsService } from '../../../../workbench/contrib/chat/common/chatSessionsService.js';
++import { IChatEntitlementService } from '../../../../workbench/services/chat/common/chatEntitlementService.js';
+ import { IChatRequestVariableEntry } from '../../../../workbench/contrib/chat/common/attachments/chatVariableEntries.js';
+ import { IAgentHostFilterService } from '../../../services/agentHostFilter/common/agentHostFilter.js';
+ import { IChatViewOptions, ISelectNoWorkspaceOptions, ISelectWorkspaceOptions, WorkspaceSelectionResult } from '../../../browser/parts/chatView.js';
+@@ -217,6 +221,9 @@
+ 		@ISessionsRecentWorkspacesService private readonly recentWorkspacesService: ISessionsRecentWorkspacesService,
+ 		@IAquariumService private readonly aquariumService: IAquariumService,
+ 		@IAgentHostFilterService private readonly agentHostFilterService: IAgentHostFilterService,
++		@IWorkbenchEnvironmentService private readonly environmentService: IWorkbenchEnvironmentService,
++		@IChatSessionsService private readonly chatSessionsService: IChatSessionsService,
++		@IChatEntitlementService private readonly chatEntitlementService: IChatEntitlementService,
+ 		@IUriIdentityService private readonly uriIdentityService: IUriIdentityService,
+ 		@IAgentFeedbackService private readonly agentFeedbackService: IAgentFeedbackService,
+ 		@IChatPetService private readonly chatPetService: IChatPetService,
+@@ -1664,7 +1671,8 @@
+ 		}
+ 
+ 		const update = () => {
+-			if (hasCompletedDiscovery && !filter.isDiscovering && filter.hosts.length === 0) {
++			if (hasCompletedDiscovery && !filter.isDiscovering && filter.hosts.length === 0 &&
++				!hasNativeUnscopedSessionProvider(this.environmentService, this.sessionsProvidersService, this.chatSessionsService, this.chatEntitlementService)) {
+ 				showEmptyState();
+ 			} else {
+ 				showPicker();
+@@ -1672,6 +1680,10 @@
+ 		};
+ 
+ 		update();
++		store.add(this.sessionsProvidersService.onDidChangeProviders(update));
++		store.add(this.sessionsManagementService.onDidChangeSessionTypes(update));
++		store.add(this.chatSessionsService.onDidChangeContentProviderSchemes(update));
++		store.add(this.chatEntitlementService.onDidChangeSentiment(update));
+ 
+ 		// `onDidChange` fires when the host list changes — entering or
+ 		// leaving the empty state if the last host disconnects or the
+--- a/src/vs/sessions/contrib/chat/browser/webWorkspacePicker.ts
++++ b/src/vs/sessions/contrib/chat/browser/webWorkspacePicker.ts
+@@ -30,6 +30,10 @@
+ import { ISessionWorkspaceBrowseAction, SESSION_WORKSPACE_GROUP_GITHUB } from '../../../services/sessions/common/session.js';
+ import { ISessionsRecentWorkspacesService } from '../../../services/sessions/browser/sessionsRecentWorkspacesService.js';
+ import { IAgentHostFilterService } from '../../../services/agentHostFilter/common/agentHostFilter.js';
++import { IWorkbenchEnvironmentService } from '../../../../workbench/services/environment/common/environmentService.js';
++import { IChatSessionsService } from '../../../../workbench/contrib/chat/common/chatSessionsService.js';
++import { IChatEntitlementService } from '../../../../workbench/services/chat/common/chatEntitlementService.js';
++import { hasNativeUnscopedSessionProvider } from './nativeUnscopedSessions.js';
+ import { IWorkspacePickerItem, IWorkspacePickerOptions, WorkspacePicker } from './sessionWorkspacePicker.js';
+ import { showMobileWorkspacePickerSheet, shouldUseMobileWorkspacePickerSheet } from './mobile/mobileWorkspacePickerSheet.js';
+ 
+@@ -76,13 +80,17 @@
+ 		@IDialogService dialogService: IDialogService,
+ 		@IAgentHostFilterService private readonly _agentHostFilterService: IAgentHostFilterService,
+ 		@IWorkbenchLayoutService private readonly _layoutService: IWorkbenchLayoutService,
++		@IWorkbenchEnvironmentService private readonly _nativeEnvironmentService: IWorkbenchEnvironmentService,
++		@IChatSessionsService private readonly _chatSessionsService: IChatSessionsService,
++		@IChatEntitlementService private readonly _chatEntitlementService: IChatEntitlementService,
+ 	) {
+ 		super(
+ 			{
+ 				...options,
+ 				sessionWorkspaceProviderFilter: providerId => {
+ 					const host = _agentHostFilterService.selectedHost;
+-					return host?.sessionCreationProviderId ? providerId === host.sessionCreationProviderId : host?.providerIds.includes(providerId) === true;
++					return host ? (host.sessionCreationProviderId ? providerId === host.sessionCreationProviderId : host.providerIds.includes(providerId)) :
++						hasNativeUnscopedSessionProvider(_nativeEnvironmentService, sessionsProvidersService, _chatSessionsService, _chatEntitlementService, providerId);
+ 				},
+ 			},
+ 			actionWidgetService,
+@@ -183,7 +191,11 @@
+ 	}
+ 
+ 	protected override _getAllBrowseActions(): ISessionWorkspaceBrowseAction[] {
+-		const providerId = this._agentHostFilterService?.selectedHost?.sessionCreationProviderId;
++		const host = this._agentHostFilterService?.selectedHost;
++		if (!host && hasNativeUnscopedSessionProvider(this._nativeEnvironmentService, this.sessionsProvidersService, this._chatSessionsService, this._chatEntitlementService)) {
++			return super._getAllBrowseActions().filter(action => action.providerId ? hasNativeUnscopedSessionProvider(this._nativeEnvironmentService, this.sessionsProvidersService, this._chatSessionsService, this._chatEntitlementService, action.providerId) : this.sessionsProvidersService.getProviders().some(provider => provider.supportsLocalWorkspaces && hasNativeUnscopedSessionProvider(this._nativeEnvironmentService, this.sessionsProvidersService, this._chatSessionsService, this._chatEntitlementService, provider.id)));
++		}
++		const providerId = host?.sessionCreationProviderId;
+ 		return super._getAllBrowseActions().filter(action => !providerId || action.providerId === providerId);
+ 	}
+ 
+@@ -192,7 +204,7 @@
+ 
+ 		const scoped = this._agentHostFilterService.selectedHost;
+ 		if (!scoped) {
+-			return [];
++			return hasNativeUnscopedSessionProvider(this._nativeEnvironmentService, this.sessionsProvidersService, this._chatSessionsService, this._chatEntitlementService) ? super._buildItems() : [];
+ 		}
+ 		const scopedProviderIds = new Set(scoped.providerIds);
+ 		if (!scoped.providerIds.some(id => this.sessionsProvidersService.getProvider(id))) {
+--- /dev/null
++++ b/src/vs/sessions/contrib/chat/browser/nativeUnscopedSessions.ts
+@@ -0,0 +1,20 @@
++/*---------------------------------------------------------------------------------------------
++ * Native embedders may have session providers without a discoverable remote agent host.
++ *--------------------------------------------------------------------------------------------*/
++import { IWorkbenchEnvironmentService } from '../../../../workbench/services/environment/common/environmentService.js';
++import { IChatSessionsService } from '../../../../workbench/contrib/chat/common/chatSessionsService.js';
++import { ISessionsProvidersService } from '../../../services/sessions/browser/sessionsProvidersService.js';
++import { isAgentHostProvider } from '../../../common/agentHostSessionsProvider.js';
++import { IChatEntitlementService } from '../../../../workbench/services/chat/common/chatEntitlementService.js';
++
++/** Only surface a real, visible creation provider backed by a registered content provider. */
++export function hasNativeUnscopedSessionProvider(environment: IWorkbenchEnvironmentService,
++ providers: ISessionsProvidersService, chats: IChatSessionsService, entitlement: IChatEntitlementService, providerId?: string): boolean {
++ if (!environment.supportsLocalNodeExtensionHost || entitlement.sentiment.hidden || entitlement.sentiment.disabled || entitlement.sentiment.disabledInWorkspace) { return false; }
++ const schemes = new Set(chats.getContentProviderSchemes());
++ return providers.getProviders().some(provider =>
++  (!providerId || provider.id === providerId) && provider.supportsWorkspaceSelection !== false &&
++  (!isAgentHostProvider(provider) || provider.isVisibleInEnvironmentPicker?.get() !== false) &&
++  provider.sessionTypes.some(type => schemes.has(type.chatSessionType ?? type.id)) &&
++  (provider.supportsLocalWorkspaces || provider.browseActions.some(action => !action.attachesContext)));
++}

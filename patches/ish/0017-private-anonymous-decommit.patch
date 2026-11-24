@@ -1,0 +1,146 @@
+--- a/kernel/memory.c
++++ b/kernel/memory.c
+@@ -32,7 +32,6 @@
+ 
+ #include "kernel/mm.h"
+ #include "emu/tlb.h"
+-
+ 
+ #ifdef GUEST_ARM64
+ // ============================================================
+@@ -800,7 +799,7 @@
+     return pt_unmap_always(mem, start, pages);
+ }
+ 
+-int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
++static int pt_unmap_internal(struct mem *mem, page_t start, pages_t pages, bool remove_reservations) {
+ #ifdef GUEST_ARM64
+     // Revoke aliases before any page can drop the final struct data reference.
+     flat_unbind_range(mem, start, pages);
+@@ -810,7 +809,7 @@
+     if (start + pages - 1 > mem->mmap_hint)
+         mem->mmap_hint = start + pages - 1;
+ 
+-    mem_remove_reservations(mem, start, pages);
++    if (remove_reservations) mem_remove_reservations(mem, start, pages);
+ 
+     for (page_t page = start; page < start + pages; mem_next_page(mem, &page)) {
+         struct pt_entry *pt = mem_pt(mem, page);
+@@ -846,6 +845,74 @@
+     }
+     mem_changed(mem);
+     return 0;
++}
++
++// Keep the public unmap contract unchanged; decommit preserves reservations until commit.
++int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
++    return pt_unmap_internal(mem, start, pages, true);
++}
++
++static void reservation_list_free(struct mem_reservation *r) {
++    while (r) { struct mem_reservation *next = r->next; free(r); r = next; }
++}
++
++// Preserve the lookup priority of legacy reservations, including existing overlaps.
++static int reservation_list_append(struct mem_reservation ***tail, page_t start,
++                                   pages_t pages, unsigned flags) {
++    if (!pages) return 0;
++    struct mem_reservation *r = malloc(sizeof(*r));
++    if (!r) return _ENOMEM;
++    *r = (struct mem_reservation){ .start = start, .pages = pages, .flags = flags, .next = NULL };
++    **tail = r;
++    *tail = &r->next;
++    return 0;
++}
++
++// Caller holds mem->lock for writing. Metadata allocation completes before any
++// mapping changes, so failure leaves permissions, backing and aliases untouched.
++int pt_decommit_private_anonymous(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
++    struct mem_reservation *replacement = NULL;
++    struct mem_reservation **tail = &replacement;
++    page_t end = start + pages;
++    int error = 0;
++    for (struct mem_reservation *r = mem->reservations; r; r = r->next) {
++        page_t r_end = r->start + r->pages;
++        if (r_end <= start || r->start >= end) {
++            error = reservation_list_append(&tail, r->start, r->pages, r->flags);
++        } else {
++            if (r->start < start)
++                error = reservation_list_append(&tail, r->start, start - r->start, r->flags);
++            if (!error && r_end > end)
++                error = reservation_list_append(&tail, end, r_end - end, r->flags);
++        }
++        if (error) goto fail;
++    }
++    struct mem_reservation *zero = malloc(sizeof(*zero));
++    if (!zero) { error = _ENOMEM; goto fail; }
++    *zero = (struct mem_reservation){ .start = start, .pages = pages,
++        .flags = (flags & P_RWX) | P_ANONYMOUS, .next = replacement };
++    replacement = zero;
++    // Only merge the priority head: promoting a later legacy overlap could
++    // change permissions elsewhere. Sequential equal-permission batches coalesce.
++    while (zero->next && zero->next->flags == zero->flags) {
++        struct mem_reservation *next = zero->next;
++        if (zero->start + zero->pages == next->start) {
++            zero->pages += next->pages;
++        } else if (next->start + next->pages == zero->start) {
++            zero->start = next->start; zero->pages += next->pages;
++        } else break;
++        zero->next = next->next; free(next);
++    }
++    // This follows ordinary unmap's alias revocation, compiled-block invalidation,
++    // PTE release and TLB generation ordering. Shared owners remain retained.
++    pt_unmap_internal(mem, start, pages, false);
++    struct mem_reservation *old = mem->reservations;
++    mem->reservations = replacement;
++    reservation_list_free(old);
++    return 0;
++fail:
++    reservation_list_free(replacement);
++    return error;
+ }
+ 
+ // [T-ish-cluster-hitrate] Every anonymous host allocation, and the guest pages
+--- a/kernel/memory.h
++++ b/kernel/memory.h
+@@ -184,6 +184,8 @@
+ int pt_unmap(struct mem *mem, page_t start, pages_t pages);
+ // like pt_unmap but doesn't care if part of the range isn't mapped
+ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages);
++// Atomically replace a validated private-anonymous run with lazy zero-fill. Writer lock required.
++int pt_decommit_private_anonymous(struct mem *mem, page_t start, pages_t pages, unsigned flags);
+ 
+ // [T-ish-cluster-commit] Commit the faulting page as part of an aligned,
+ // host-page-sized cluster so a 4KB guest page doesn't consume a whole 16KB
+--- a/kernel/mmap.c
++++ b/kernel/mmap.c
+@@ -704,6 +704,29 @@
+         addr_t end = addr + len;
+         bool any = false;
+         for (addr_t p = addr; p < end; p += PAGE_SIZE) {
++            // Private anonymous discard must not acquire a writable pointer:
++            // doing so commits untouched backing and can copy every COW page.
++            write_wrlock(&current->mem->lock);
++            struct pt_entry *entry = mem_pt(current->mem, PAGE(p));
++            if (entry && (entry->flags & (P_ANONYMOUS | P_SHARED | P_GROWSDOWN)) == P_ANONYMOUS) {
++                unsigned flags = entry->flags & P_RWX;
++                page_t first = PAGE(p), last = first + 1;
++                page_t limit = PAGE_ROUND_UP(end);
++                if (limit > first + 1024) limit = first + 1024;
++                while (last < limit) {
++                    struct pt_entry *next = mem_pt(current->mem, last);
++                    if (!next || (next->flags & (P_ANONYMOUS | P_SHARED | P_GROWSDOWN)) != P_ANONYMOUS ||
++                            (next->flags & P_RWX) != flags) break;
++                    last++;
++                }
++                int error = pt_decommit_private_anonymous(current->mem, first, last - first, flags);
++                write_wrunlock(&current->mem->lock);
++                if (error) return error;
++                p = (last << PAGE_BITS) - PAGE_SIZE;
++                continue;
++            }
++            write_wrunlock(&current->mem->lock);
++            // Keep existing file/shared/stack behavior outside the private heap path.
+             read_wrlock(&current->mem->lock);
+             struct pt_entry *pt = mem_pt(current->mem, PAGE(p));
+             bool skip = pt == NULL ||

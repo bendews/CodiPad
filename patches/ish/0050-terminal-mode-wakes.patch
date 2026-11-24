@@ -1,0 +1,94 @@
+--- a/fs/tty.c
++++ b/fs/tty.c
+@@ -214,10 +214,16 @@
+     return 0;
+ }
+ 
++// tty->lock held. Canonical overflow still accepts controls and a delimiter.
++bool tty_can_accept_input(struct tty *tty) {
++    return tty->bufsize < sizeof(tty->buf) ||
++        ((tty->termios.lflags & ICANON_) && memchr(tty->buf_flag, true, tty->bufsize) == NULL);
++}
++
+ // All callers hold tty->lock; notification and rearming observe the same input state.
+ static void tty_notify_consumed(struct tty *tty) {
+     notify(&tty->consumed);
+-    if (tty->bufsize < sizeof(tty->buf) && tty->driver->ops->input_ready)
++    if (tty_can_accept_input(tty) && tty->driver->ops->input_ready)
+         tty->driver->ops->input_ready(tty);
+ }
+ 
+@@ -469,12 +475,21 @@
+     unsigned deciseconds = tty->termios.cc[VTIME_];
+     if (minimum > requested) minimum = requested;
+     if (nonblocking) return tty->bufsize ? 0 : _EAGAIN;
+-    if (!minimum && !deciseconds) return 0;
+-    size_t target = minimum ? minimum : 1;
+     uint64_t sequence = tty->input_sequence;
+     bool timer_started = false;
+     struct timespec deadline = {0};
+     for (;;) {
++        if (tty->termios.lflags & ICANON_) return 1; // caller restarts in canonical mode
++        size_t new_minimum = tty->termios.cc[VMIN_];
++        if (new_minimum > requested) new_minimum = requested;
++        unsigned new_time = tty->termios.cc[VTIME_];
++        if (new_minimum != minimum || new_time != deciseconds) {
++            minimum = new_minimum;
++            deciseconds = new_time;
++            timer_started = false;
++        }
++        if (!minimum && !deciseconds) return 0;
++        size_t target = minimum ? minimum : 1;
+         if (tty->bufsize >= target) return 0;
+         if (tty->hung_up || pty_is_half_closed_master(tty)) return tty->bufsize ? 0 : _EIO;
+         struct timespec remaining, *timeout = NULL;
+@@ -538,10 +553,12 @@
+             goto out;
+     }
+ 
+-    // wait loop(s)
++    // Termios changes wake produced; reevaluate the active mode before waiting again.
++retry_mode:
+     if (tty->termios.lflags & ICANON_) {
+         size_t canon_size;
+         while ((canon_size = tty_canon_size(tty)) == (size_t) -1) {
++            if (!(tty->termios.lflags & ICANON_)) goto retry_mode;
+             err = _EIO;
+             if (pty_is_half_closed_master(tty))
+                 goto error;
+@@ -551,6 +568,7 @@
+             err = wait_for(&tty->produced, &tty->lock, NULL);
+             if (err < 0)
+                 goto error;
++            if (!(tty->termios.lflags & ICANON_)) goto retry_mode;
+         }
+         // null byte means eof was typed
+         if (tty->buf[canon_size-1] == '\0')
+@@ -560,6 +578,7 @@
+             bufsize = canon_size;
+     } else {
+         err = tty_wait_noncanonical(tty, bufsize, (fd->flags & O_NONBLOCK_) != 0);
++        if (err > 0) goto retry_mode;
+         if (err < 0) goto error;
+     }
+ 
+@@ -744,6 +763,8 @@
+             // we have no output buffer currently
+         case TCSETS_:
+             tty->termios = *(struct termios_ *) arg;
++            notify(&tty->produced);
++            tty_notify_consumed(tty);
+             break;
+ 
+         case TIOCGWINSZ_:
+--- a/fs/tty.h
++++ b/fs/tty.h
+@@ -152,6 +152,8 @@
+ };
+ 
+ // if blocking, may return _EINTR, otherwise, may return _EAGAIN
++// Caller holds tty->lock; includes canonical overflow that can consume controls.
++bool tty_can_accept_input(struct tty *tty);
+ ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking);
+ void tty_set_winsize(struct tty *tty, struct winsize_ winsize);
+ void tty_hangup(struct tty *tty);

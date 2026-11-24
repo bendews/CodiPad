@@ -1,0 +1,1589 @@
+diff --git a/asbestos/asbestos.c b/asbestos/asbestos.c
+index 67e815b248f5aeb8e7a5683f44cba524672cecee..edfb8a1d4c8cbe24fb2e09fb67eea1e7a3499e62 100644
+--- a/asbestos/asbestos.c
++++ b/asbestos/asbestos.c
+@@ -1,6 +1,7 @@
+ #define DEFAULT_CHANNEL instr
+ #include "debug.h"
+ #include <signal.h>
++#include <sched.h>
+ #include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -389,12 +390,18 @@ struct asbestos *asbestos_new(struct mmu *mmu) {
+     list_init(&asbestos->jetsam);
+     lock_init(&asbestos->lock);
+     wrlock_init(&asbestos->jetsam_lock);
++#ifdef ISH_JIT
++    atomic_init(&asbestos->jit_generation, 0);
++#endif
+     atomic_init(&asbestos->jit_active_threads, 0);
+     atomic_init(&asbestos->jetsam_gen, 0);
+     return asbestos;
+ }
+ 
+ void asbestos_free(struct asbestos *asbestos) {
++#ifdef ISH_JIT
++    jit_cache_enter(false);
++#endif
+     for (size_t i = 0; i < asbestos->hash_size; i++) {
+         struct fiber_block *block, *tmp;
+         if (list_null(&asbestos->hash[i]))
+@@ -410,6 +417,9 @@ void asbestos_free(struct asbestos *asbestos) {
+     free(asbestos->page_hash);
+     free(asbestos->hash);
+     free(asbestos);
++#ifdef ISH_JIT
++    jit_cache_leave();
++#endif
+ }
+ 
+ static inline struct list *blocks_list(struct asbestos *asbestos, page_t page, int i) {
+@@ -423,6 +433,9 @@ void asbestos_invalidate_range(struct asbestos *absestos, page_t start, page_t e
+     // been freed and nulled (see mem_destroy). Treat as no-op — the freed
+     // asbestos had already been invalidated by the winning cleanup.
+     if (absestos == NULL) return;
++#ifdef ISH_JIT
++    jit_cache_enter(false);
++#endif
+     lock(&absestos->lock);
+     bool did_invalidate = false;
+     struct fiber_block *block, *tmp;
+@@ -473,6 +486,9 @@ void asbestos_invalidate_range(struct asbestos *absestos, page_t start, page_t e
+     if (did_invalidate)
+         absestos->invalidate_gen++;
+     unlock(&absestos->lock);
++#ifdef ISH_JIT
++    jit_cache_leave();
++#endif
+ }
+ 
+ void asbestos_invalidate_page(struct asbestos *asbestos, page_t page) {
+@@ -496,6 +512,9 @@ slow_path:
+ void asbestos_invalidate_all(struct asbestos *asbestos) {
+     // [T-ish-mm-double-destroy-crash] Safe no-op after cleanup race.
+     if (asbestos == NULL) return;
++#ifdef ISH_JIT
++    jit_cache_enter(false);
++#endif
+     lock(&asbestos->lock);
+     bool did_invalidate = false;
+     struct fiber_block *block, *tmp;
+@@ -515,6 +534,9 @@ void asbestos_invalidate_all(struct asbestos *asbestos) {
+     if (did_invalidate)
+         asbestos->invalidate_gen++;
+     unlock(&asbestos->lock);
++#ifdef ISH_JIT
++    jit_cache_leave();
++#endif
+ }
+ 
+ // hash_size is a power of two. ARM64 code addresses are 4-byte aligned, so
+@@ -1044,8 +1066,12 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
+                 // and is thus assumed to have no pointers left
+                 if (!last_block->is_jetsam && !block->is_jetsam) {
+                     for (int i = 0; i <= 1; i++) {
+-                        if (last_block->jump_ip[i] == NULL ||
+-                                (*last_block->jump_ip[i] & 0xffffffff) != block->addr)
++                        // Unpatched slots hold the target as a fake_ip (bit 63
++                        // set, 48-bit guest address). The old low-32-bit compare
++                        // never chained branches above 4 GB (V8/JSC code heaps,
++                        // libpas) and could match an already-patched host pointer.
++                        unsigned long slot = last_block->jump_ip[i] != NULL ? *last_block->jump_ip[i] : 0;
++                        if (!(slot >> 63) || (slot & 0xffffffffffffUL) != block->addr)
+                             continue;
+ #ifdef ISH_JIT
+                         if (!jit_chain_ok(last_block, i, block)) {
+@@ -1158,6 +1184,10 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
+                 }
+             }
+         }
++#ifdef ISH_JIT
++        if (interrupt == INT_NONE && atomic_load_explicit(&jit_cache_pending, memory_order_relaxed))
++            interrupt = INT_TIMER;   // leave even when a native chain returned INT_NONE
++#endif
+         if (interrupt == INT_NONE && (++frame->cpu.cycle & ((1 << 10) - 1)) == 0) {
+             interrupt = INT_TIMER;
+             {
+@@ -1272,6 +1302,27 @@ uint64_t prebuilt_call(struct cpu_state *cpu, struct tlb *tlb, addr_t target_pc)
+ }
+ #endif
+ 
++#ifdef ISH_JIT
++static void asbestos_recycle(struct asbestos *a) {
++    unsigned generation = jit_cache_generation();
++    if (a->jit_generation == generation) return;
++    while (!write_wrtrylock(&a->jetsam_lock)) {
++        if (a->jit_generation == generation) return;
++        sched_yield();   // one cleaner; avoid queued competing rwlock writers
++    }
++    if (a->jit_generation != generation) {
++        asbestos_invalidate_all(a);
++        lock(&a->lock);
++        fiber_free_jetsam(a);
++        jit_asbestos_free(a);
++        a->invalidate_gen++;   // clear every thread's block and return caches
++        a->jit_generation = generation;
++        unlock(&a->lock);
++    }
++    write_wrunlock(&a->jetsam_lock);
++}
++#endif
++
+ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
+     ish_thread_marker = 1;
+     if (cpu->poked_ptr == NULL)
+@@ -1286,6 +1337,10 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
+     // and by context switches / signal delivery.
+ #endif
+     struct asbestos *asbestos = cpu->mmu->asbestos;
++#ifdef ISH_JIT
++    jit_cache_enter(true);
++    asbestos_recycle(asbestos);
++#endif
+     __atomic_add_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
+     tlb_refresh(tlb, cpu->mmu);
+     int interrupt = (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
+@@ -1312,6 +1367,9 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
+         unlock(&asbestos->lock);
+     }
+ 
++#ifdef ISH_JIT
++    jit_cache_leave();
++#endif
+     return interrupt;
+ }
+ 
+diff --git a/asbestos/asbestos.h b/asbestos/asbestos.h
+index 0f0027bcf19556ca5058a527368febf3658871ff..398da7e1adfb7a2fcd4761bcecca9c52d6cc2814 100644
+--- a/asbestos/asbestos.h
++++ b/asbestos/asbestos.h
+@@ -48,6 +48,7 @@ struct asbestos {
+     lock_t lock;
+     wrlock_t jetsam_lock;
+ #ifdef ISH_JIT
++    _Atomic unsigned jit_generation; // generation owning this address space's blocks
+     void *jit_ctxs;             // guest-arm64/jit.c: per-module contexts of this address space
+ #endif
+ };
+@@ -87,6 +88,7 @@ struct fiber_block {
+     uint32_t *native_loop;      // self-loop block: head of the promoted loop body
+     uintptr_t native_entry;     // hot entry of the native code at code[0], 0 if none
+     void *jit_ctx;              // PIC: module context the native code runs with (x29)
++    unsigned jit_generation;
+     unsigned jit_idx;           // PIC: its translation's slot in that context
+ #endif
+ 
+diff --git a/asbestos/guest-arm64/jit.c b/asbestos/guest-arm64/jit.c
+index b727b6ec38e24347758e7e4fd393e08e01dc4757..9ba6b2ccfdab704b78b7057201e010dc2b1a8ec2 100644
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -17,7 +17,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
++#include <sys/sysctl.h>
+ #include <sys/ucontext.h>
++#include <unistd.h>
+ #include "asbestos/guest-arm64/jit.h"
+ #include "asbestos/guest-arm64/aot.h"
+ #include "asbestos/asbestos.h"
+@@ -38,7 +40,7 @@ static bool link_off;     // ISH_JIT_LINK=0: no direct links between blocks
+ static bool loop_off;     // ISH_JIT_LOOP=0: no register promotion in self-loops
+ static bool simd_on;      // ISH_JIT_SIMD=0: leave SIMD/FP instructions to the gadgets
+ static bool pin_on;       // ISH_JIT_PIN=0: no guest registers pinned in host registers
+-static bool pic_on;       // ISH_JIT_PIC=1: position-independent code (see "PIC" below)
++static bool pic_on;       // ISH_JIT_PIC=0: disable translation sharing (see "PIC" below)
+ static bool aot_only;     // ISH_JIT_AOT_ONLY=1: install AOT translations, translate nothing
+                           // (what a build without the JIT would run)
+ 
+@@ -47,6 +49,12 @@ static bool env_off(const char *name) {
+     return v && (!strcmp(v, "0") || !strcmp(v, "off"));
+ }
+ 
++// ISH_JIT_CACHE_MB: a size in MB, or `def` when unset (see region_size).
++static size_t env_mb(const char *name, size_t def) {
++    const char *v = getenv(name);
++    return v != NULL && v[0] != '\0' ? (size_t) atol(v) << 20 : def;
++}
++
+ // ---------------------------------------------------------------- stats
+ 
+ static _Atomic uint64_t st_blocks, st_segments, st_units, st_bytes, st_ticks;
+@@ -64,15 +72,33 @@ static double jit_ticks_ms(uint64_t ticks) {
+     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+     return hz ? (double) ticks * 1e3 / (double) hz : 0;
+ }
++// Optional diagnostic build only; never applied by the SDK build.
++static pthread_mutex_t profile_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct { uint32_t opcode; unsigned reason; uint64_t count; } profile_fail[1024];
++static bool profile_on;
++static void profile_note(uint32_t opcode, unsigned reason) {
++    if (!profile_on) return;
++    pthread_mutex_lock(&profile_lock);
++    unsigned i = (opcode ^ (opcode >> 16) ^ reason) % 1024;
++    for (unsigned n = 0; n < 1024; n++, i = (i + 1) % 1024) {
++        if (!profile_fail[i].count || (profile_fail[i].opcode == opcode && profile_fail[i].reason == reason)) {
++            profile_fail[i].opcode = opcode; profile_fail[i].reason = reason;
++            profile_fail[i].count++;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&profile_lock);
++}
+ static _Atomic uint64_t st_unsupported_insns, st_fail_regs;
+ static _Atomic uint64_t st_block_ends, st_block_end_fail, st_links, st_loops;
+ static _Atomic uint64_t st_shared, st_aot, st_aot_moved, st_aot_busy, st_aot_fixed;
++static _Atomic uint64_t st_registry_entries, st_registry_bytes;
+ static _Atomic uint64_t st_find_ticks;   // jit_ticks() spent in aot_lookup()
+ 
+ // ---------------------------------------------------------------- code region
+ //
+ // One region, bump-allocated and never freed; branches between native code
+-// and to the exit stub stay within +-128MB. Every write goes through
++// and to bank-local exit stubs stay within +-128MB. Every write goes through
+ // install_code() / patch_insn(), so the code is only ever written through
+ // `region + rw_delta`:
+ // - MAP_JIT (macOS): rw_delta = 0 and the thread toggles the region between
+@@ -80,29 +106,43 @@ static _Atomic uint64_t st_find_ticks;   // jit_ticks() spent in aot_lookup()
+ // - Dual mapping (iOS, or ISH_JIT_DUALMAP=1 on macOS): a second, writable
+ //   view of the same pages; the executable view is never writable.
+ 
+-#define REGION_SIZE (120u << 20)
++// Power-of-two executable region, split into banks within ARM64 B's reach.
++// Debugger-prepared device mappings charge the entire reservation to memory.
++static size_t region_size = 256u << 20;
++static unsigned region_shift = 28;
++#define CODE_BANK (128u << 20)
++static size_t stub_bytes;   // permanent prefix copied at the start of each bank
+ static uint8_t *region;   // executable view
+ static intptr_t rw_delta; // writable view - executable view
+ static bool dual_map;
+ static _Atomic size_t region_used;
++static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t cache_cond = PTHREAD_COND_INITIALIZER;
++static unsigned cache_users;
++static bool cache_retiring;
++_Atomic bool jit_cache_pending;
++static bool recycle_on;
++static __thread unsigned cache_depth;
++static _Atomic unsigned cache_generation = 1;
++static _Atomic uint64_t cache_recycles, cache_reclaimed, cache_max_ticks;
+ static _Atomic bool region_full;   // an allocation failed: what came after runs as gadgets
+ 
+ #ifndef ISH_JIT_NO_EMIT   // AOT-only builds never map executable memory
+ static bool map_dual(void) {
+-    void *rw = mmap(NULL, REGION_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    void *rw = mmap(NULL, region_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+     if (rw == MAP_FAILED)
+         return false;
+     vm_address_t rx = 0;
+     vm_prot_t cur, max;
+-    kern_return_t kr = vm_remap(mach_task_self(), &rx, REGION_SIZE, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
++    kern_return_t kr = vm_remap(mach_task_self(), &rx, region_size, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+                                 (vm_address_t) rw, false, &cur, &max, VM_INHERIT_NONE);
+     if (kr != KERN_SUCCESS) {
+-        munmap(rw, REGION_SIZE);
++        munmap(rw, region_size);
+         return false;
+     }
+-    if (mprotect((void *) rx, REGION_SIZE, PROT_READ | PROT_EXEC) != 0) {
+-        munmap((void *) rx, REGION_SIZE);
+-        munmap(rw, REGION_SIZE);
++    if (mprotect((void *) rx, region_size, PROT_READ | PROT_EXEC) != 0) {
++        munmap((void *) rx, region_size);
++        munmap(rw, region_size);
+         return false;
+     }
+     region = (uint8_t *) rx;
+@@ -114,7 +154,7 @@ static bool map_dual(void) {
+ static bool map_jit(void) {
+ #if TARGET_OS_OSX
+     // MAP_JIT memory is placed by the kernel (hints are ignored).
+-    void *p = mmap(NULL, REGION_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
++    void *p = mmap(NULL, region_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+     if (p == MAP_FAILED)
+         return false;
+@@ -127,11 +167,22 @@ static bool map_jit(void) {
+ #endif
+ 
+ static uint8_t *region_alloc(size_t bytes) {
+-    size_t off = atomic_fetch_add(&region_used, (bytes + 15) & ~(size_t) 15);
+-    if (off + bytes > REGION_SIZE) {
+-        region_full = true;
+-        return NULL;
+-    }
++    if (!bytes) return NULL;
++    size_t aligned = (bytes + 15) & ~(size_t) 15;
++    size_t old = atomic_load(&region_used), off;
++    do {
++        off = old;
++        // A segment and its shared stubs must stay within one branch bank.
++        if (stub_bytes && off % CODE_BANK < stub_bytes)
++            off += stub_bytes - off % CODE_BANK;
++        if (off / CODE_BANK != (off + aligned - 1) / CODE_BANK)
++            off = (off / CODE_BANK + 1) * CODE_BANK + stub_bytes;
++        if (off + aligned > region_size) {
++            region_full = true;
++            if (recycle_on) jit_cache_pending = true;
++            return NULL;
++        }
++    } while (!atomic_compare_exchange_weak(&region_used, &old, off + aligned));
+     return region + off;
+ }
+ 
+@@ -307,10 +358,11 @@ static unsigned greg_off(int g) {
+     return g == G_SP ? offsetof(struct cpu_state, sp) : offsetof(struct cpu_state, regs) + 8 * g;
+ }
+ 
+-// host register holding guest register g (0..30 or G_SP), loading it on first
+-// use. Lazy registers are written through, so when the pool is full a mapping
++// Host register for g (0..30 or G_SP); write-only allocations skip the old value.
++// Sources precede destinations, preserving aliases and eviction locks.
++// Lazy registers are written through, so when the pool is full a mapping
+ // not used by the current instruction can simply be dropped.
+-static int hreg(struct em *e, int g) {
++static int map_reg(struct em *e, int g, bool read) {
+     if (e->uses[g] < 0xffff) e->uses[g]++;
+     if (e->pin[g] >= 0)
+         return e->pin[g];
+@@ -331,6 +383,7 @@ static int hreg(struct em *e, int g) {
+         if (h < 0) {
+             e->fail = true;
+             atomic_fetch_add_explicit(&st_fail_regs, 1, memory_order_relaxed);
++            profile_note(0, 1);
+             return 0;
+         }
+         if (e->owner[h] >= 0)
+@@ -339,10 +392,14 @@ static int hreg(struct em *e, int g) {
+     e->host[g] = (int8_t) h;
+     e->owner[h] = (int8_t) g;
+     e->locked |= 1u << h;
+-    put(e, 0xF9400000u | ((greg_off(g) / 8) << 10) | (1u << 5) | (uint32_t) h);  // ldr xh, [x1, #off]
++    if (read)
++        put(e, 0xF9400000u | ((greg_off(g) / 8) << 10) | (1u << 5) | (uint32_t) h);  // ldr xh, [x1, #off]
+     return h;
+ }
+ 
++static int hreg(struct em *e, int g) { return map_reg(e, g, true); }
++static int hdest(struct em *e, int g) { return map_reg(e, g, false); }
++
+ static void writeback(struct em *e, int g) {
+     if (e->pin[g] >= 0)
+         return;   // pinned: stored at exits
+@@ -661,7 +718,7 @@ static uint32_t remap(struct em *e, uint32_t x, int kd, int kn, int km, int ka,
+         }
+         if (f != 0 || rd_read)
+             (void) hreg(e, g);
+-        int h = hreg(e, g);
++        int h = f != 0 || rd_read ? hreg(e, g) : hdest(e, g);
+         out = (out & ~(31u << shift[f])) | ((uint32_t) h << shift[f]);
+         if (f == 0)
+             *wrote = g;
+@@ -723,7 +780,7 @@ static bool emit_simd(struct em *e, uint32_t x) {
+     if ((x & 0xBFE0FC00u) == 0x0E003C00u) {                                   // umov / mov (to general)
+         vload(e, V_N, rn);
+         if (rd == 31) return true;
+-        int hd = hreg(e, rd);
++        int hd = hdest(e, rd);
+         put(e, (x & ~0x3FFu) | (V_N << 5) | (uint32_t) hd);
+         writeback(e, rd);
+         return true;
+@@ -752,11 +809,45 @@ static bool emit_simd(struct em *e, uint32_t x) {
+     if (fm == 0x9E660000u || fm == 0x1E260000u) {                              // fmov x, d / w, s
+         vload(e, V_N, rn);
+         if (rd == 31) return true;
+-        int hd = hreg(e, rd);
++        int hd = hdest(e, rd);
+         put(e, fm | (V_N << 5) | (uint32_t) hd);
+         writeback(e, rd);
+         return true;
+     }
++    // Scalar S/D arithmetic: remap only FP operands. The host instruction
++    // clears the upper lanes, as do the scalar gadget stores. No NZCV change.
++    if ((x & 0xFFA0CC00u) == 0x1E200800u) {                 // fmul/fdiv/fadd/fsub
++        vload(e, V_N, rn);
++        vload(e, V_M, rm);
++        put(e, base | (V_M << 16) | (V_N << 5) | V_D);
++        vstore(e, V_D, rd);
++        return true;
++    }
++    uint32_t unary = x & 0xFFBFFC00u;
++    if (unary == 0x1E204000u || unary == 0x1E20C000u ||
++        unary == 0x1E214000u || unary == 0x1E21C000u) {       // fmov/fabs/fneg/fsqrt
++        vload(e, V_N, rn);
++        put(e, (x & ~0x3FFu) | (V_N << 5) | V_D);
++        vstore(e, V_D, rd);
++        return true;
++    }
++    uint32_t cvt = x & 0x7FFFFC00u;
++    if (cvt == 0x1E620000u || cvt == 0x1E630000u) {         // scvtf/ucvtf Dd, Wn/Xn
++        int hn = rn == 31 ? 31 : hreg(e, rn);
++        put(e, (x & ~0x3FFu) | ((uint32_t) hn << 5) | V_D);
++        vstore(e, V_D, rd);
++        return true;
++    }
++    // Only X destinations: the existing W gadgets convert to 64 bits then
++    // truncate/sign-extend, which differs from ARM saturation at the W limit.
++    if (fm == 0x9E380000u || fm == 0x9E390000u ||
++        fm == 0x9E780000u || fm == 0x9E790000u) {             // fcvtzs/fcvtzu Xd, Sn/Dn
++        vload(e, V_N, rn);
++        int hd = rd == 31 ? 31 : hdest(e, rd);
++        put(e, fm | (V_N << 5) | (uint32_t) hd);
++        if (rd != 31) writeback(e, rd);
++        return true;
++    }
+     bool three = false, two = false, rd_in = true;
+     if ((x & 0x9FF80400u) == 0x0F000400u) {                                   // modified immediate (movi/mvni/orr/bic/fmov)
+         vload(e, V_D, rd);
+@@ -888,7 +979,8 @@ static bool emit_ldst(struct em *e, uint32_t x, unsigned spos) {
+         else if (imm >= 0) put(e, 0x91000000u | ((uint32_t) imm << 10) | ((uint32_t) hn << 5) | T_A);
+         else put(e, 0xD1000000u | ((uint32_t) -imm << 10) | ((uint32_t) hn << 5) | T_A);
+         tlb_lookup(e, 2u << scale, !L, spos);
+-        int ht = rt == 31 ? 31 : hreg(e, rt), ht2 = rt2 == 31 ? 31 : hreg(e, rt2);
++        int ht = rt == 31 ? 31 : L ? hdest(e, rt) : hreg(e, rt);
++        int ht2 = rt2 == 31 ? 31 : L ? hdest(e, rt2) : hreg(e, rt2);
+         // host pair access, signed-offset form, offset 0
+         put(e, (x & 0xC0400000u) | 0x29000000u | ((uint32_t) ht2 << 10) | (T_A << 5) | (uint32_t) ht);
+         if (L) {
+@@ -945,7 +1037,7 @@ static bool emit_ldst(struct em *e, uint32_t x, unsigned spos) {
+         goto writeback_base;
+     tlb_lookup(e, 1u << size, !load, spos);
+     {
+-        int ht = rt == 31 ? 31 : hreg(e, rt);
++        int ht = rt == 31 ? 31 : load ? hdest(e, rt) : hreg(e, rt);
+         put(e, (x & 0xC0C00000u) | 0x39000000u | (T_A << 5) | (uint32_t) ht);   // host access: same size/opc, [x9]
+         if (load && rt != 31)
+             writeback(e, rt);
+@@ -978,7 +1070,7 @@ static bool emit_insn(struct em *e, uint32_t x, uint64_t pc, unsigned spos, bool
+         int64_t imm = sext(((x >> 5) & 0x7ffff) << 2 | ((x >> 29) & 3), 21);
+         uint64_t v = (x & 0x80000000u) ? (pc & ~0xfffULL) + ((uint64_t) imm << 12) : pc + (uint64_t) imm;
+         if (rd == 31) return true;
+-        int h = hreg(e, rd);
++        int h = hdest(e, rd);
+         mov_guest_ref(e, h, v, T_Q);
+         writeback(e, rd);
+         return true;
+@@ -986,7 +1078,7 @@ static bool emit_insn(struct em *e, uint32_t x, uint64_t pc, unsigned spos, bool
+     if ((x & 0xFFFFFFE0u) == 0xD53BD040u || (x & 0xFFFFFFE0u) == 0xD51BD040u) {   // mrs/msr tpidr_el0
+         int rt = x & 31;
+         bool read = (x & 0x00200000u) != 0;
+-        int h = rt == 31 ? 31 : hreg(e, rt);
++        int h = rt == 31 ? 31 : read ? hdest(e, rt) : hreg(e, rt);
+         put(e, (read ? 0xF9400000u : 0xF9000000u) | ((CPU_tls_ptr / 8) << 10) | (1u << 5) | (uint32_t) h);
+         if (read && rt != 31) writeback(e, rt);
+         return true;
+@@ -1148,7 +1240,8 @@ static uint8_t *finish_native(struct em *e, struct fiber_block *b, uintptr_t ori
+         return NULL;
+     for (unsigned i = 0; i < e->nfix; i++) {
+         if (e->fix[i].kind == 4) {   // absolute target (a shared stub)
+-            int64_t d = (int64_t) e->fix[i].abs - (int64_t) ((uintptr_t) dst + 4 * e->fix[i].at);
++            uintptr_t stub = e->fix[i].abs + ((size_t) (dst - region) / CODE_BANK) * CODE_BANK;
++            int64_t d = (int64_t) stub - (int64_t) ((uintptr_t) dst + 4 * e->fix[i].at);
+             if (!fits(d >> 2, 26)) return NULL;
+             e->buf[e->fix[i].at] = ENC_B(d);
+             if (e->record) {
+@@ -1229,7 +1322,7 @@ bool jit_chain_ok(struct fiber_block *from, int i, struct fiber_block *to) {
+     if (!pic_on || !from->native_link[i])
+         return true;
+     uint32_t *site = from->native_link[i];
+-    bool writable = (uintptr_t) site >= (uintptr_t) region && (uintptr_t) site < (uintptr_t) region + REGION_SIZE;
++    bool writable = (uintptr_t) site >= (uintptr_t) region && (uintptr_t) site < (uintptr_t) region + region_size;
+     uint64_t lit = __atomic_load_n((uint64_t *) (site + 1), __ATOMIC_ACQUIRE);
+     if (lit == LINK_UNSET && (!writable || link_off))
+         return true;   // never linked (read-only AOT code, or links off): the branch falls through
+@@ -1273,7 +1366,7 @@ void jit_link(struct fiber_block *from, int i, struct fiber_block *to) {
+         if (to != from)
+             return;
+         target = (uintptr_t) from->native_loop;
+-    } else if (entry < (uintptr_t) region || entry >= (uintptr_t) region + REGION_SIZE) {
++    } else if (entry < (uintptr_t) region || entry >= (uintptr_t) region + region_size) {
+         return;   // successor starts in the gadget world
+     }
+     int64_t d = (int64_t) target - (int64_t) (uintptr_t) from->native_link[i];
+@@ -1284,6 +1377,8 @@ void jit_link(struct fiber_block *from, int i, struct fiber_block *to) {
+ }
+ 
+ void jit_unlink(struct fiber_block *from, int i) {
++    if (from->jit_generation != cache_generation)
++        return;   // dormant address space: its old code has already been recycled
+     if (pic_on) {
+         // PIC links are guarded, never undone; a refused successor goes away
+         struct jit_ctx *ctx = from->jit_ctx;
+@@ -1336,7 +1431,7 @@ static void emit_native_dispatch_ex(struct em *e, bool block_start) {
+     }
+     mov_host_ptr(e, 10, region);
+     put(e, 0xCB0A010Au);                                         // sub x10, x8, x10
+-    put(e, 0xD35BFD4Au);                                         // lsr x10, x10, #27  (region < 128MB)
++    put(e, 0xD340FD4Au | (region_shift << 16));                  // lsr x10, x10, #log2(region_size)
+     unsigned cold = e->n; put(e, 0xB500000Au);                   // cbnz x10, cold
+     if (pic_on && block_start) {
+         put(e, 0x91000108u | ((uint32_t) (4 * (prologue_words - 1)) << 10));   // add x8, x8, #cross-module entry
+@@ -1937,7 +2032,8 @@ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct j
+             ok = emit_insn(e, u->w[k], u->pc + 4 * k, u->start, &has_mem) && !e->fail;
+             // A bailout re-runs the whole unit's gadget, so everything the
+             // unit did before the access must be safe to redo.
+-            if (has_mem && k > 0 && !pure) ok = false;
++            if (has_mem && k > 0 && !pure) { profile_note(u->w[k], 2); ok = false; }
++            else if (!ok && !e->fail) profile_note(u->w[k], 0);
+             pure &= is_pure_const(u->w[k]);
+             if (!ok && !has_mem)
+                 atomic_fetch_add_explicit(&st_unsupported_insns, 1, memory_order_relaxed);
+@@ -2043,6 +2139,7 @@ static void jit_native(struct fiber_block *b, const struct jit_units *U, struct
+             uintptr_t orig_first = b->code[U->u[first].start];
+             e->last_rec = NULL;
+             uint8_t *code = e->fail ? NULL : finish_native(e, b, orig_first, U->u[first].start);
++            if (!code) profile_note(0, 3);
+             if (code) {
+                 jit_segment_installed(b, U, first, ui, code, e->n);
+                 if (e->ninst < sizeof(e->inst) / sizeof(e->inst[0])) {
+@@ -2297,7 +2394,7 @@ void ish_aot_register(const struct aot_module *m) {
+ 
+ // Bump whenever the code emitted for some guest instruction, stub or exit
+ // changes: images made before would still pass every other check.
+-#define JIT_CODE_VERSION 10
++#define JIT_CODE_VERSION 14
+ 
+ // Everything the emitted code bakes in besides the gadgets it names: the
+ // conventions, the struct layouts it loads from and the TLB / block cache
+@@ -2862,8 +2959,10 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
+     for (; r; r = r->next)
+         if (r->hash == h && r->nkey == nkey && !memcmp(r->key, key, nkey * 4))
+             break;
+-    unsigned idx = 0;
+-    if (!r && reg_table)
++    // Reuse remains available after exhaustion; new empty registry entries
++    // would only retain keys and consume context indices for gadget code.
++    unsigned idx = CTX_MAX;
++    if (!r && reg_table && !region_full)
+         idx = mod_tables_fit(mod) ? mod_next_idx[mod]++ : CTX_MAX;
+     pthread_mutex_unlock(&reg_lock);
+     if (r) {
+@@ -2871,8 +2970,10 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
+         atomic_fetch_add_explicit(&st_shared, 1, memory_order_relaxed);
+         return;
+     }
+-    if (!reg_table || idx >= CTX_MAX)
++    if (!reg_table || idx >= CTX_MAX) {
++        if (recycle_on) jit_cache_pending = true;
+         return;
++    }
+     // The code may run as soon as the first segment is installed.
+     e->record = rec_module(mod);
+     e->idx = idx;
+@@ -2880,7 +2981,7 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
+     b->jit_ctx = ctx;
+     slot_set(ctx, idx, b, base, base);
+     jit_native(b, U, e);
+-    if (e->ninst > sizeof(e->inst) / sizeof(e->inst[0]))
++    if (!e->ninst || e->ninst > sizeof(e->inst) / sizeof(e->inst[0]))
+         return;
+     r = malloc(sizeof(*r) + nkey * 4);
+     if (!r)
+@@ -2903,8 +3004,18 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
+         r->seg[i].rec = e->inst[i].rec;
+     }
+     pthread_mutex_lock(&reg_lock);
++    size_t cost = sizeof(*r) + nkey * 4 + e->ninst * sizeof(*r->seg) + 1;
++    if (recycle_on && st_registry_bytes + cost > region_size) {
++        jit_cache_pending = true;
++        pthread_mutex_unlock(&reg_lock);
++        free(r->seg);
++        free(r);
++        return;   // the installed native block remains valid until retirement
++    }
+     r->next = reg_table[h & (REG_BUCKETS - 1)];
+     reg_table[h & (REG_BUCKETS - 1)] = r;
++    atomic_fetch_add_explicit(&st_registry_entries, 1, memory_order_relaxed);
++    atomic_fetch_add_explicit(&st_registry_bytes, cost, memory_order_relaxed);
+     pthread_mutex_unlock(&reg_lock);
+ }
+ 
+@@ -2912,12 +3023,12 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
+ // registers, so copy them from the signal context into cpu_state before the
+ // crash-recovery path re-runs the block.
+ bool jit_crash_sync(void *ucontext) {
+-    if (!region || n_pinned <= 0)
++    if (n_pinned <= 0)
+         return false;
+     ucontext_t *uc = ucontext;
+     uintptr_t pc = uc->uc_mcontext->__ss.__pc;
+     const struct aot_module *img = NULL;
+-    bool in_region = pc >= (uintptr_t) region && pc < (uintptr_t) region + REGION_SIZE;
++    bool in_region = pc >= (uintptr_t) region && pc < (uintptr_t) region + region_size;
+     if (!in_region && !in_aot_text(pc, &img))
+         return false;
+     char *cpu = (char *) uc->uc_mcontext->__ss.__x[1];
+@@ -3213,7 +3324,7 @@ static void rec_write(const char *path) {
+     fprintf(f, "{\"header\": {\"abi\": %u, \"prologue_words\": %d, \"entry_off\": %lu, \"n_pinned\": %d, "
+             "\"region_full\": %s, \"region_used\": %zu, \"exit_stub\": [",
+             jit_abi(), prologue_words, (unsigned long) entry_off(), n_pinned, region_full ? "true" : "false",
+-            region_full ? (size_t) REGION_SIZE : (size_t) region_used);
++            region_full ? (size_t) region_size : (size_t) region_used);
+     for (unsigned i = 0; i < exit_stub_words; i++)
+         fprintf(f, "%s%u", i ? ", " : "", ((uint32_t *) exit_stub)[i]);
+     fprintf(f, "], \"stubs\": [");
+@@ -3376,9 +3487,15 @@ size_t jit_describe(char *buf, size_t size) {
+                        pic_on ? "JIT, position-independent" : "JIT";
+     OUT("mode: %s\n", mode);
+     if (jit_on && !aot_only)
+-        OUT("code region: %.1f of %u MB used%s\n",
+-            (region_full ? REGION_SIZE : (size_t) region_used) / 1048576.0, REGION_SIZE >> 20,
++        OUT("code region: %.1f of %zu MB used%s\n",
++            (region_full ? region_size : (size_t) region_used) / 1048576.0, region_size >> 20,
+             region_full ? " (full: blocks compiled since run as gadgets)" : "");
++    OUT("cache recycling: %llu, generation %u, %.1f MB reused, max drain %.2f ms\n",
++        (unsigned long long) cache_recycles, (unsigned) cache_generation,
++        cache_reclaimed / 1048576.0, jit_ticks_ms(cache_max_ticks));
++    if (pic_on)
++        OUT("shared registry: %llu translations, %.1f MB metadata\n",
++            (unsigned long long) st_registry_entries, st_registry_bytes / 1048576.0);
+     OUT("AOT: %s (echo on|off > /proc/ish/jit; affects blocks compiled afterwards, i.e. new processes)\n",
+         aot_off ? "off" : "on");
+     OUT("blocks translated or looked up: %llu, AOT installs: %llu (moved: %llu, with pc-relative immediates "
+@@ -3426,11 +3543,19 @@ void jit_report(void) {
+     // host PC samples to generated code.
+     if (!jit_on)
+         return;
++    if (profile_on) {
++        const char *reasons[] = {"unsupported", "register-pressure", "replay-restriction", "installation-failure"};
++        for (unsigned i = 0; i < 1024; i++)
++            if (profile_fail[i].count)
++                fprintf(stderr, "PROFILE-FAIL %s %08x %llu\n", reasons[profile_fail[i].reason],
++                        profile_fail[i].opcode, profile_fail[i].count);
++    }
+     const char *dump = getenv("ISH_JIT_DUMP");
+     if (dump) {
+         FILE *f = fopen(dump, "wb");
+         if (f) {
+             uint64_t base = (uint64_t) (uintptr_t) region, used = region_used;
++            if (used > region_size) used = region_size;   // failed allocations advanced the counter
+             fwrite(&base, 8, 1, f);
+             fwrite(&used, 8, 1, f);
+             fwrite(region, 1, used, f);
+@@ -3443,8 +3568,8 @@ void jit_report(void) {
+     if (rec_file) {
+         rec_write(rec_file);
+         if (region_full)
+-            fprintf(stderr, "❌ JIT: the %u MB code region filled up: %s misses what ran after that\n",
+-                    REGION_SIZE >> 20, rec_file);
++            fprintf(stderr, "❌ JIT: the %zu MB code region filled up: %s misses what ran after that\n",
++                    region_size >> 20, rec_file);
+     }
+     if (!getenv("ISH_JIT_STATS"))
+         return;
+@@ -3456,17 +3581,185 @@ void jit_report(void) {
+             st_block_ends, st_block_end_fail, st_links, st_loops, st_unsupported_insns, st_fail_regs, st_shared, st_aot, aot_nimages);
+ }
+ 
++// ---------------------------------------------------------------- JIT fast mode (M11)
++//
++// A sideloaded app cannot make memory executable by itself: on TXM (iOS 26+) only pages a debugger
++// wrote become executable, and StikDebug's universal.js supplies them -- `brk #0xf00d` with x16 = 1
++// and x1 = the size asks debugserver for an RX region in this process (address back in x0), x16 = 0
++// detaches. The app asks StikDebug for that through its URL scheme before boot, then calls
++// ish_jit_try_enable(); the waiting is the app's, so nothing here loops. A failure is a journal
++// line and the gadget engine, never a crash.
++
++static void jit_note(const char *msg) {
++    fprintf(stderr, "ish: %s\n", msg);
++}
++
++#ifndef ISH_JIT_NO_EMIT   // an AOT-only build never maps executable memory
++// An RX region -> an RW alias of it (map_dual's two calls), so the emitter writes via rw_delta.
++static bool jit_region_from(uint8_t *rx, const char *ok_note) {
++    vm_address_t rw = 0;
++    vm_prot_t cur, max;
++    // universal.js answers an error with 0xE0000069; a misaligned or absurd address is no region.
++    bool ok = rx != NULL && ((uintptr_t) rx & 0x3fff) == 0 && (uintptr_t) rx != 0xE0000069 &&
++              (uintptr_t) rx < 0x1000000000ull &&
++              vm_remap(mach_task_self(), &rw, region_size, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
++                       (vm_address_t) rx, false, &cur, &max, VM_INHERIT_NONE) == KERN_SUCCESS &&
++              mprotect((void *) rw, region_size, PROT_READ | PROT_WRITE) == 0;
++    if (!ok) {
++        jit_note("jit: fallback (debugger region unusable)");
++        return false;
++    }
++    region = rx;
++    rw_delta = (intptr_t) rw - (intptr_t) rx;
++    dual_map = true;
++    jit_note(ok_note);
++    return true;
++}
++
++#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++// universal.js. Call these only while a debugger is attached (ish_jit_debugger_ready): a `brk`
++// the attached debugger does not answer is a fatal SIGTRAP.
++__attribute__((naked, noinline)) static void *jit_brk_region(void *addr, size_t size) {
++    __asm__("mov x16, #1\n brk #0xf00d\n ret");
++}
++__attribute__((naked, noinline)) static void jit_brk_detach(void) {
++    __asm__("mov x16, #0\n brk #0xf00d\n ret");
++}
++
++static bool jit_cs_debugged(void) {   // CS_DEBUGGED: a debugger attached at least once
++    uint32_t flags = 0;
++    extern int csops(pid_t, unsigned, void *, size_t);
++    return csops(getpid(), 0, &flags, sizeof(flags)) == 0 && (flags & 0x10000000u) != 0;
++}
++
++static bool jit_traced(void) {   // P_TRACED: attached right now
++    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
++    struct kinfo_proc info;
++    size_t size = sizeof(info);
++    memset(&info, 0, sizeof(info));
++    return sysctl(mib, 4, &info, &size, NULL, 0) == 0 && (info.kp_proc.p_flag & P_TRACED) != 0;
++}
++
++// TXM (iOS 26+): executable memory must be prepared by the debugger. The rule (and the device
++// table) is StikDebug's ProcessInfo.hasTXM.
++static bool jit_txm_present(void) {
++    char os[32] = "", hw[64] = "";
++    size_t len = sizeof(os);
++    if (sysctlbyname("kern.osproductversion", os, &len, NULL, 0) != 0)
++        return false;
++    len = sizeof(hw);
++    if (sysctlbyname("hw.machine", hw, &len, NULL, 0) != 0)
++        return false;
++    int major = atoi(os);
++    if (major >= 27)   // everything except the two 2020 iPads StikDebug excludes
++        return strcmp(hw, "iPad8,11") != 0 && strcmp(hw, "iPad8,12") != 0;
++    if (major < 26)
++        return false;
++    const char *num = strncmp(hw, "iPad", 4) == 0 ? hw + 4 : strncmp(hw, "iPhone", 6) == 0 ? hw + 6 : NULL;
++    int a = 0, b = 0;
++    if (num == NULL || sscanf(num, "%d,%d", &a, &b) != 2)
++        return false;
++    double ver = a, div = 1;   // "14,5" is 14.5 and "14,10" is 14.10 (StikDebug's decimal reading)
++    for (int t = b; t > 0; t /= 10)
++        div *= 10;
++    ver += b / div;
++    return ver >= (num == hw + 4 ? 14.5 : 14.2);   // iPad A15/M2+, iPhone A15+
++}
++#else
++static bool jit_txm_present(void) { return false; }   // no TXM rule off the device
++#endif
++
++static void jit_cache_size(void) {
++    uint64_t ram = 0;
++    size_t len = sizeof(ram), default_size = 128u << 20;
++    if (sysctlbyname("hw.memsize", &ram, &len, NULL, 0) == 0 && ram > (4ull << 30))
++        default_size = 256u << 20;
++    region_size = env_mb("ISH_JIT_CACHE_MB", default_size);
++    if (region_size < (16u << 20) || region_size > (256u << 20))
++        region_size = default_size;
++    region_shift = 24;
++    while (((size_t) 1 << region_shift) < region_size) region_shift++;
++    region_size = (size_t) 1 << region_shift;   // exact flag-preserving range test
++}
++
++// ish_jit_try_enable() has normally mapped the region before boot; this covers the rest.
++static bool jit_select_region(bool dual) {
++    jit_cache_size();
++    if (region != NULL)
++        return true;   // prepared by ish_jit_try_enable()
++#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++    if (jit_txm_present()) {   // TXM: without a debugger nothing mapped here could be executable
++        jit_note("jit: fallback (fast mode off)");
++        return false;
++    }
++#endif
++    return dual ? map_dual() : map_jit();
++}
++#endif
++
++// The app's half (FastMode.swift): can a debugger prepare executable memory right now? With TXM its
++// script must still be attached; before TXM, CS_DEBUGGED alone lets jit_init do the mapping.
++bool ish_jit_debugger_ready(void) {
++#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR && !defined(ISH_JIT_NO_EMIT)
++    return jit_txm_present() ? jit_traced() && jit_cs_debugged() : jit_cs_debugged();
++#else
++    return false;
++#endif
++}
++
++bool ish_jit_txm_present(void) {
++#ifdef ISH_JIT_NO_EMIT
++    return false;
++#else
++    return jit_txm_present();
++#endif
++}
++
++// Start the JIT now: the debugger's region if a debugger is ready, otherwise false and the app
++// sets ISH_JIT=0 for the gadget engine. Called on one thread, before the guest boots.
++bool ish_jit_try_enable(void) {
++#ifndef ISH_JIT_NO_EMIT
++    if (region != NULL)
++        return true;
++#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++    if (!ish_jit_debugger_ready())
++        return false;
++    jit_cache_size();
++    if (!jit_txm_present()) {
++        jit_note("jit: fast mode ok (cs_debugged)");   // pre-TXM: jit_init maps, no brk involved
++        return true;
++    }
++    uint8_t *rx = jit_brk_region(NULL, region_size);
++    bool ok = jit_region_from(rx, "jit: fast mode ok");
++    jit_brk_detach();   // the script stays attached until the detach, so always detach
++    return ok;
++#else
++    // No TXM rule off the device: the platform mapping is what the harness exercises here.
++    bool on = jit_select_region(!TARGET_OS_OSX || getenv("ISH_JIT_DUALMAP") != NULL);
++    if (on)
++        jit_note("jit: fast mode ok (platform map)");
++    return on;
++#endif
++#else
++    return false;
++#endif
++}
++
+ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+ 
+ static void jit_init(void) {
+-    if (env_off("ISH_JIT"))
++    if (env_off("ISH_JIT")) {
++        jit_note("jit: fallback (ISH_JIT=0)");
+         return;
++    }
+     // Without a code region (-Djit_emit=false, or no executable memory at
+     // run time) only AOT images run: PIC conventions, nothing translated.
+     bool have_region = false;
+     bool dual = !TARGET_OS_OSX || getenv("ISH_JIT_DUALMAP") != NULL;
+ #ifndef ISH_JIT_NO_EMIT
+-    have_region = dual ? map_dual() : map_jit();
++    const char *only = getenv("ISH_JIT_AOT_ONLY");
++    if (!(only && only[0] == '1'))
++        have_region = jit_select_region(dual);
+ #endif
+     bool have_images = aot_nregistered > 0;
+     if (!have_region && !have_images) {
+@@ -3478,9 +3771,10 @@ static void jit_init(void) {
+     loop_off = env_off("ISH_JIT_LOOP");
+     simd_on = !env_off("ISH_JIT_SIMD");
+     pin_on = !env_off("ISH_JIT_PIN");
+-    // AOT images are PIC code, so PIC is the default once one is linked in.
++    // Share translations across guest processes so repeated tools do not
++    // fill the executable region with copies of the same library code.
+     const char *pic = getenv("ISH_JIT_PIC");
+-    pic_on = pic ? pic[0] == '1' : have_images;
++    pic_on = !pic || pic[0] == '1';
+     if (!have_region)
+         pic_on = true;
+     pin_init(pin_on);
+@@ -3491,6 +3785,9 @@ static void jit_init(void) {
+         make_exit_stub();
+         if (pic_on && n_pinned && !env_off("ISH_JIT_STUBS"))
+             make_stubs();
++        stub_bytes = (region_used + 15) & ~(size_t) 15;
++        for (size_t bank = CODE_BANK; bank < region_size; bank += CODE_BANK)
++            install_code(region + bank, (const uint32_t *) region, stub_bytes / 4);
+         jit_exec_ready();
+     }
+     if (pic_on)
+@@ -3501,7 +3798,88 @@ static void jit_init(void) {
+     aot_only = pic_on && (!have_region || (ao && ao[0] == '1'));
+     if (aot_only && !aot_nimages)
+         return;
++    recycle_on = have_region && !rec_file && !cm_on && !env_off("ISH_JIT_RECYCLE");
+     jit_on = true;
++    profile_on = getenv("ISH_JIT_PROFILE") != NULL;
++    if (profile_on) {
++        if (region) fprintf(stderr, "PROFILE-RANGE jit %p %p dynamic\n", region, region + region_size);
++        for (unsigned i = 0; i < aot_nimages; i++)
++            fprintf(stderr, "PROFILE-RANGE aot %p %p %s\n", aot_images[i]->text_start,
++                    aot_images[i]->text_end, aot_images[i]->path);
++    }
++}
++
++// Called with cache_lock held and no executing/compiling/invalidation users.
++// Keep permanent stubs; per-address-space blocks/contexts are discarded lazily.
++static void cache_reset(void) {
++    pthread_mutex_lock(&reg_lock);
++    for (unsigned i = 0; reg_table && i < REG_BUCKETS; i++) {
++        struct reg_entry *r = reg_table[i];
++        while (r) {
++            struct reg_entry *next = r->next;
++            free(r->seg);
++            free(r);
++            r = next;
++        }
++        reg_table[i] = NULL;
++    }
++    if (mod_next_cap) memset(mod_next_idx, 0, mod_next_cap * sizeof(*mod_next_idx));
++    st_registry_entries = st_registry_bytes = 0;
++    pthread_mutex_unlock(&reg_lock);
++    pthread_mutex_lock(&loopmap_lock);
++    free(loopmaps);
++    loopmaps = NULL;
++    nloopmaps = cap_loopmaps = 0;
++    pthread_mutex_unlock(&loopmap_lock);
++    cache_reclaimed += region_used - stub_bytes;
++    region_used = stub_bytes;
++    region_full = false;
++    jit_cache_pending = false;
++    cache_generation++;
++    cache_recycles++;
++}
++
++unsigned jit_cache_generation(void) { return cache_generation; }
++
++void jit_cache_enter(bool running) {
++    if (cache_depth) { cache_depth++; return; }
++    pthread_once(&init_once, jit_init);
++    if (!jit_on) return;
++    pthread_mutex_lock(&cache_lock);
++    // CPU admission happens BEFORE taking mem->lock. Kernel invalidation must
++    // remain admitted while draining: an executing CPU may need its mem lock.
++    while (running && cache_retiring) pthread_cond_wait(&cache_cond, &cache_lock);
++    if (running && jit_cache_pending) {
++        uint64_t start = jit_ticks();
++        cache_retiring = true;
++        while (cache_users) pthread_cond_wait(&cache_cond, &cache_lock);
++        cache_reset();
++        uint64_t ticks = jit_ticks() - start;
++        if (ticks > cache_max_ticks) cache_max_ticks = ticks;
++        cache_retiring = false;
++        pthread_cond_broadcast(&cache_cond);
++    }
++    cache_users++;
++    cache_depth = 1;
++    pthread_mutex_unlock(&cache_lock);
++}
++
++void jit_cache_leave(void) {
++    if (!cache_depth || --cache_depth) return;
++    pthread_mutex_lock(&cache_lock);
++    if (--cache_users == 0) pthread_cond_broadcast(&cache_cond);
++    pthread_mutex_unlock(&cache_lock);
++}
++
++void jit_cache_cleanup(void) {
++    if (cache_depth) { cache_depth = 1; jit_cache_leave(); }
++}
++
++// Boot journal: 2 = signed AOT only, 1 = dynamic JIT, 0 = gadgets. Forces the one-time
++// init, so the host glue can call it before the guest's first block.
++int ish_jit_engine(void) {
++    pthread_once(&init_once, jit_init);
++    return jit_on ? (aot_only ? 2 : 1) : 0;
+ }
+ 
+ // Per-thread scratch: the units of the block being compiled and the emitter.
+@@ -3567,6 +3945,7 @@ void jit_block_init(struct fiber_block *b) {
+     b->native_entry = 0;
+     b->jit_ctx = NULL;
+     b->jit_idx = 0;
++    b->jit_generation = cache_generation;
+ }
+ 
+ void jit_block(struct fiber_block *b, struct jit_units *U) {
+diff --git a/asbestos/guest-arm64/jit.h b/asbestos/guest-arm64/jit.h
+index cc9d46ac6099009e8555779167c7c1dfa6932c73..59fbddc605b19e523f9000e6d575ffc1fac05d4f 100644
+--- a/asbestos/guest-arm64/jit.h
++++ b/asbestos/guest-arm64/jit.h
+@@ -22,9 +22,10 @@
+ // ISH_JIT_LOOP=0, ISH_JIT_SIMD=0, ISH_JIT_STATS=1, ISH_JIT_DUMP=<file>,
+ // ISH_JIT_MAP=<file> (native code -> guest module and file offset).
+ //
+-// ISH_JIT_PIC=1 emits position-independent code (jit.c, "PIC"): nothing in it
++// Position-independent code is the default (jit.c, "PIC"): nothing in it
+ // depends on where the guest module or its blocks live, and a registry reuses
+ // a translation for every block with the same key, across processes.
++// ISH_JIT_PIC=0 selects private translations for comparison.
+ //
+ // AOT: in PIC mode ISH_JIT_RECORD=<file> writes the translations of one module
+ // (ISH_JIT_RECORD_MOD, default ld-musl) at exit, and tools/jit_aot turns them
+@@ -93,6 +94,16 @@ bool jit_chain_ok(struct fiber_block *from, int i, struct fiber_block *to);
+ // relation so that `to` leaving the cache unlinks it (jit_unlink()).
+ bool jit_chain_refused(struct fiber_block *from, int i, struct fiber_block *to);
+ 
++#include <stdatomic.h>
++extern _Atomic bool jit_cache_pending;
++
++// Generation gate: CPU admission precedes mem->lock; kernel invalidations
++// remain admitted while a generation drains. Recursive on the calling thread.
++void jit_cache_enter(bool running);
++void jit_cache_leave(void);
++void jit_cache_cleanup(void);
++unsigned jit_cache_generation(void);
++
+ // Leave the thread's JIT write mode (if a compile or link entered it) before
+ // running guest code.
+ void jit_exec_ready(void);
+diff --git a/emu/tlb.c b/emu/tlb.c
+index d30469e441d7b615934c48fa7771435cca05e292..fede5504c4313e98dab5f391563e005b851fb532 100644
+--- a/emu/tlb.c
++++ b/emu/tlb.c
+@@ -5,6 +5,18 @@
+ #include "kernel/fs.h"
+ #include "util/sync.h"
+ 
++#ifdef GUEST_ARM64
++// T11: ISH_TLB_FULL_CLEAR=1 forces the pre-T8 whole-array clear, so T8 itself is A/B-able on device
++// without a rebuilt variant. Read once per process (tlb_flush must not getenv per flush); the
++// environment is fixed before the guest boots. The bitmap stays exact on either path.
++static bool tlb_forced_full_clear;
++static pthread_once_t tlb_forced_once = PTHREAD_ONCE_INIT;
++static void tlb_forced_init(void) {
++    const char *v = getenv("ISH_TLB_FULL_CLEAR");
++    tlb_forced_full_clear = v != NULL && v[0] != '0';
++}
++#endif
++
+ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
+     if (tlb->mmu == mmu && tlb->mem_changes == mmu->changes)
+         return;
+@@ -59,8 +71,37 @@ void mmu_tlbs_stale(struct mmu *mmu) {
+ 
+ void tlb_flush(struct tlb *tlb) {
+     tlb->mem_changes = tlb->mmu->changes;
++#ifdef GUEST_ARM64
++    pthread_once(&tlb_forced_once, tlb_forced_init);
++    if (tlb->occupied_valid && !tlb_forced_full_clear) {
++        // Only slots that hold (or may hold) a mapping need clearing. The
++        // bitmap is exact -- set where an entry is filled, cleared here -- so
++        // this clears exactly the entries a full 8192-entry clear would make
++        // non-empty, and skips the ~99% that are already empty.
++        for (unsigned w = 0; w < TLB_SIZE / 64; w++) {
++            uint64_t bits = tlb->occupied[w];
++            if (bits == 0)
++                continue;
++            tlb->occupied[w] = 0;
++            while (bits != 0) {
++                unsigned b = (unsigned) __builtin_ctzll(bits);
++                bits &= bits - 1;
++                tlb->entries[w * 64 + b] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
++            }
++        }
++    } else {
++        // First flush, or ISH_TLB_FULL_CLEAR=1 forcing the pre-T8 path: a zero-initialised TLB
++        // (calloc/static) starts with page==0, not TLB_PAGE_EMPTY, so clear every slot and keep the
++        // bitmap exact.
++        for (unsigned i = 0; i < TLB_SIZE; i++)
++            tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
++        memset(tlb->occupied, 0, sizeof(tlb->occupied));
++        tlb->occupied_valid = true;
++    }
++#else
+     for (unsigned i = 0; i < TLB_SIZE; i++)
+         tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
++#endif
+ }
+ 
+ void tlb_free(struct tlb *tlb) {
+@@ -144,6 +185,11 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
+     tlb->dirty_page = TLB_PAGE(addr);
+ 
+     struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
++#ifdef GUEST_ARM64
++    // Record the slot as occupied so tlb_flush knows to clear it. This is the
++    // only point an entry's .page becomes non-empty.
++    tlb->occupied[TLB_INDEX(addr) / 64] |= 1ull << (TLB_INDEX(addr) % 64);
++#endif
+     tlb_ent->page = TLB_PAGE(addr);
+     tlb_ent->data_minus_addr = (uintptr_t) ptr - TLB_PAGE(addr);
+ #ifdef GUEST_ARM64
+diff --git a/emu/tlb.h b/emu/tlb.h
+index 7d346743d783833c94a64cb4f7706e7af64c8ff5..b36d03927746dde03630c5aaaf6095cd6c19bf34 100644
+--- a/emu/tlb.h
++++ b/emu/tlb.h
+@@ -52,6 +52,14 @@ struct tlb {
+ #ifdef GUEST_ARM64
+     struct mmu *attached;      // whose tlbs list this is on, while running guest code
+     struct list tlbs_link;
++    // T8: one bit per TLB slot, set where an entry is filled and cleared by
++    // tlb_flush, so a flush only touches slots that can be live instead of all
++    // 8192. 1 KiB. Placed after every offset the JIT bakes in.
++    uint64_t occupied[TLB_SIZE / 64];
++    // False for a freshly zeroed TLB (calloc/static): its entries are page==0,
++    // not TLB_PAGE_EMPTY, so the first flush clears the whole array once and
++    // turns the bitmap on.
++    bool occupied_valid;
+ #endif
+ };
+ 
+diff --git a/fs/fake-migrate.c b/fs/fake-migrate.c
+index 67e47936bf5f12ebe2f6709f6c9de0988b65b0fd..c9d63b7552784ef5522e6b3ad75b8f5c756fb0ff 100644
+--- a/fs/fake-migrate.c
++++ b/fs/fake-migrate.c
+@@ -35,7 +35,7 @@ static struct migration {
+     // version 4: inodes that may have lost their last path, so mount only
+     // checks those instead of sweeping the whole stats table; one last sweep
+     {
+-        "create table orphans (inode integer primary key);"
++        "create table if not exists orphans (inode integer primary key);"
+         "delete from stats where not exists (select 1 from paths where inode = stats.inode);"
+     },
+ };
+diff --git a/fs/sock.h b/fs/sock.h
+index ed34b5176e1638fd0c5172f5e7a7e0a9e4dea886..d86e5230098dc589e78a43e1d2ebe244ca4344c7 100644
+--- a/fs/sock.h
++++ b/fs/sock.h
+@@ -71,14 +71,24 @@ struct msghdr64_ {
+ #endif
+ 
+ struct cmsghdr_ {
++#ifdef GUEST_ARM64
++    // aarch64 Linux: size_t cmsg_len, then level/type; 16 bytes, 8-byte aligned.
++    uint64_t len;
++#else
+     dword_t len;
++#endif
+     int_t level;
+     int_t type;
+     uint8_t data[];
+ };
+ #define SCM_RIGHTS_ 1
+ // copied and ported from musl
+-#define CMSG_LEN_(cmsg) (((cmsg)->len + sizeof(dword_t) - 1) & ~(dword_t)(sizeof(dword_t) - 1))
++#ifdef GUEST_ARM64
++#define CMSG_DWORD_ uint64_t
++#else
++#define CMSG_DWORD_ dword_t
++#endif
++#define CMSG_LEN_(cmsg) (((cmsg)->len + sizeof(CMSG_DWORD_) - 1) & ~(CMSG_DWORD_)(sizeof(CMSG_DWORD_) - 1))
+ #define CMSG_NEXT_(cmsg) ((uint8_t *)(cmsg) + CMSG_LEN_(cmsg))
+ #define CMSG_NXTHDR_(cmsg, mhdr_end) ((cmsg)->len < sizeof (struct cmsghdr_) || \
+         CMSG_LEN_(cmsg) + sizeof(struct cmsghdr_) >= (size_t) (mhdr_end - (uint8_t *)(cmsg)) \
+@@ -217,6 +227,7 @@ static inline int sock_flags_from_real(int real) {
+ #define IP_HDRINCL_ 3
+ #define IP_RETOPTS_ 7
+ #define IP_MTU_DISCOVER_ 10
++#define IP_RECVERR_ 11
+ #define IP_RECVTTL_ 12
+ #define IP_RECVTOS_ 13
+ #define TCP_NODELAY_ 1
+@@ -267,6 +278,9 @@ static inline int sock_opt_to_real(int fake, int level) {
+             case IP_TTL_: return IP_TTL;
+             case IP_HDRINCL_: return IP_HDRINCL;
+             case IP_RETOPTS_: return IP_RETOPTS;
++            // Darwin has no ICMP error queue; glibc's stub resolver sets IP_RECVERR and
++            // then refuses to use the socket at all if it is refused (M7 Debian guest).
++            case IP_RECVERR_: return 0;
+             case IP_RECVTTL_: return IP_RECVTTL;
+             case IP_RECVTOS_: return IP_RECVTOS;
+         } break;
+diff --git a/fs/stat.c b/fs/stat.c
+index 33f0234fa09cd1d9374bc7124e536c1b741ba032..db8bbc438520cfe2ce3aa6d388bae2d9302febb9 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -75,6 +75,20 @@ static struct fd *at_fd(fd_t f) {
+     return f_get(f);
+ }
+ 
++// Shared tail of the stat syscalls: convert and copy the guest statbuf out.
++static dword_t put_stat(addr_t statbuf_addr, struct statbuf *stat) {
++#ifdef GUEST_ARM64
++    struct stat_arm64 arm64stat = stat_convert_arm64(*stat);
++    if (user_put(statbuf_addr, arm64stat))
++        return _EFAULT;
++#else
++    struct newstat64 newstat = stat_convert_newstat64(*stat);
++    if (user_put(statbuf_addr, newstat))
++        return _EFAULT;
++#endif
++    return 0;
++}
++
+ static dword_t sys_stat_path(fd_t at_f, addr_t path_addr, addr_t statbuf_addr, bool follow_links) {
+     int err;
+     char path[MAX_PATH];
+@@ -87,16 +101,7 @@ static dword_t sys_stat_path(fd_t at_f, addr_t path_addr, addr_t statbuf_addr, b
+     struct statbuf stat = {};
+     if ((err = generic_statat(at, path, &stat, follow_links)) < 0)
+         return err;
+-#ifdef GUEST_ARM64
+-    struct stat_arm64 arm64stat = stat_convert_arm64(stat);
+-    if (user_put(statbuf_addr, arm64stat))
+-        return _EFAULT;
+-#else
+-    struct newstat64 newstat = stat_convert_newstat64(stat);
+-    if (user_put(statbuf_addr, newstat))
+-        return _EFAULT;
+-#endif
+-    return 0;
++    return put_stat(statbuf_addr, &stat);
+ }
+ 
+ dword_t sys_stat64(addr_t path_addr, addr_t statbuf_addr) {
+@@ -108,6 +113,24 @@ dword_t sys_lstat64(addr_t path_addr, addr_t statbuf_addr) {
+ }
+ 
+ dword_t sys_fstatat64(fd_t at, addr_t path_addr, addr_t statbuf_addr, dword_t flags) {
++    // glibc's fstat() is fstatat(fd, "", &st, AT_EMPTY_PATH), and generic_statat cannot
++    // resolve an empty path, so stat the fd directly. Before this every glibc binary died
++    // in ld.so with "cannot stat shared object" (M7 Debian rootfs).
++    if (at != AT_FDCWD_ && (flags & AT_EMPTY_PATH_)) {
++        char path[MAX_PATH];
++        if (user_read_string(path_addr, path, sizeof(path)))
++            return _EFAULT;
++        if (path[0] == '\0') {
++            struct fd *fd = at_fd(at);
++            if (fd == NULL)
++                return _EBADF;
++            struct statbuf stat = {};
++            int err = fd->mount->fs->fstat(fd, &stat);
++            if (err < 0)
++                return err;
++            return put_stat(statbuf_addr, &stat);
++        }
++    }
+     return sys_stat_path(at, path_addr, statbuf_addr, !(flags & AT_SYMLINK_NOFOLLOW_));
+ }
+ 
+@@ -120,16 +143,7 @@ dword_t sys_fstat64(fd_t fd_no, addr_t statbuf_addr) {
+     int err = fd->mount->fs->fstat(fd, &stat);
+     if (err < 0)
+         return err;
+-#ifdef GUEST_ARM64
+-    struct stat_arm64 arm64stat = stat_convert_arm64(stat);
+-    if (user_put(statbuf_addr, arm64stat))
+-        return _EFAULT;
+-#else
+-    struct newstat64 newstat = stat_convert_newstat64(stat);
+-    if (user_put(statbuf_addr, newstat))
+-        return _EFAULT;
+-#endif
+-    return 0;
++    return put_stat(statbuf_addr, &stat);
+ }
+ 
+ dword_t sys_statx(fd_t at_f, addr_t path_addr, int_t flags, uint_t mask, addr_t statx_addr) {
+diff --git a/fs/tty.c b/fs/tty.c
+index b289a7467bc4974d3b722b006338e93ce3ed2e64..fdb42b8605374e7618a033c8f965c8721e05fe37 100644
+--- a/fs/tty.c
++++ b/fs/tty.c
+@@ -229,7 +229,12 @@ static int tty_push_char(struct tty *tty, char ch, bool flag, int blocking) {
+ }
+ 
+ static void tty_echo(struct tty *tty, const char *data, size_t size) {
++    // PTY echo enters the peer's input and wakes its pollers. Holding this
++    // lock would invert poll -> master -> slave against slave -> poll.
++    // As in tty_write, the active fd keeps the driver and tty alive.
++    unlock(&tty->lock);
+     tty->driver->ops->write(tty, data, size, false);
++    lock(&tty->lock);
+ }
+ 
+ static bool tty_send_input_signal(struct tty *tty, char ch, sigset_t_ *queue) {
+@@ -298,14 +303,15 @@ ssize_t tty_input(struct tty *tty, const char *input, size_t size, bool blocking
+                 }
+                 if (!(lflags & ECHO_))
+                     echo = false;
+-                for (int i = 0; i < count; i++) {
++                for (int i = 0; i < count && tty->bufsize > 0; i++) {
+                     // don't delete past a flag
+                     if (tty->buf_flag[tty->bufsize - 1])
+                         break;
+                     tty->bufsize--;
++                    bool echoctl = SHOULD_ECHOCTL(tty->buf[tty->bufsize]);
+                     if (echo) {
+                         tty_echo(tty, "\b \b", 3);
+-                        if (SHOULD_ECHOCTL(tty->buf[tty->bufsize]))
++                        if (echoctl)
+                             tty_echo(tty, "\b \b", 3);
+                     }
+                 }
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 26fd31733e2d8f552a053156ca38b7caf70df6d3..6e0176d0a701cf43d785f02c15d5aa6d7912d178 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -978,10 +978,6 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
+             // recorded in this mode): 9 agent workloads 15.6s -> 14.0s, 13 MCP servers start
+             // 10-27% faster (mcp-remote only starts in this mode).
+             static const char *inject_args_default[] = {
+-                "--no-sparkplug",
+-                "--no-maglev",
+-                "--no-opt",
+-                "--regexp-interpret-all",
+                 "--max-old-space-size=512",
+                 "--no-concurrent-marking",
+                 "--no-concurrent-recompilation",
+@@ -1056,33 +1052,6 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
+                 }
+             }
+         }
+-
+-        // Inject LD_PRELOAD for zero_malloc.so to zero large malloc/free.
+-        // V8's Zone allocator reuses freed memory without zeroing, causing
+-        // stale pointer dereferences. This library zeros blocks >= 4096 bytes
+-        // on both malloc and free (Zone segments are >= 8KB).
+-        if (strcmp(base, "node") == 0) {
+-            static const char *ld_preload = "LD_PRELOAD=/lib/zero_free.so";
+-            size_t env_len = strlen(ld_preload) + 1;
+-
+-            // Check if LD_PRELOAD is already set
+-            bool found = false;
+-            char *q = envp;
+-            while (*q != '\0') {
+-                if (strncmp(q, "LD_PRELOAD=", 11) == 0) { found = true; break; }
+-                q += strlen(q) + 1;
+-            }
+-            if (!found) {
+-                char *p = envp;
+-                while (*p != '\0')
+-                    p += strlen(p) + 1;
+-                size_t total_used = (p - envp) + 1;
+-                if (total_used + env_len + 1 <= ARGV_MAX) {
+-                    memcpy(p, ld_preload, env_len);
+-                    p[env_len] = '\0';
+-                }
+-            }
+-        }
+     }
+ #endif
+ 
+diff --git a/kernel/mm.h b/kernel/mm.h
+index f3b55bd28cf7344ff44c568d0a23ef8332550e69..91dcc7df58cb70ec40bd655ebe2eeca172d39f0c 100644
+--- a/kernel/mm.h
++++ b/kernel/mm.h
+@@ -54,7 +54,7 @@
+ // derives it from os_proc_available_memory() at kernel boot and installs it
+ // via ish_set_anon_page_limit(), which clamps to at most this ceiling.
+ // Builds whose host never calls the setter (tests, Linux) keep the ceiling.
+-#define ANON_MMAP_LIMIT_PAGES 131072
++#define ANON_MMAP_LIMIT_PAGES 8388608
+ 
+ #if ANON_MMAP_LIMIT_PAGES > 0
+ extern _Atomic long anon_page_count;
+diff --git a/kernel/poll.c b/kernel/poll.c
+index aa74895a66871690e7cd327e2194dee988c9bd39..14175542b108c3587d580f9ea4cadb77861d5f1e 100644
+--- a/kernel/poll.c
++++ b/kernel/poll.c
+@@ -228,18 +228,20 @@ dword_t sys_pselect(fd_t nfds, addr_t readfds_addr, addr_t writefds_addr, addr_t
+     struct {
+         addr_t mask_addr;
+         dword_t mask_size;
+-    } sigmask;
++    } sigmask = {};
+ #ifdef GUEST_ARM64
+     struct {
+         uint64_t mask_addr;
+         uint64_t mask_size;
+     } sigmask64;
+-    if (user_get(sigmask_addr, sigmask64))
+-        return _EFAULT;
+-    sigmask.mask_addr = (addr_t) sigmask64.mask_addr;
+-    sigmask.mask_size = (dword_t) sigmask64.mask_size;
++    if (sigmask_addr != 0) {
++        if (user_get(sigmask_addr, sigmask64))
++            return _EFAULT;
++        sigmask.mask_addr = (addr_t) sigmask64.mask_addr;
++        sigmask.mask_size = (dword_t) sigmask64.mask_size;
++    }
+ #else
+-    if (user_get(sigmask_addr, sigmask))
++    if (sigmask_addr != 0 && user_get(sigmask_addr, sigmask))
+         return _EFAULT;
+ #endif
+     sigset_t_ mask;
+diff --git a/kernel/task.c b/kernel/task.c
+index 44311ba63f462f007236d26c96a083492e6d25cf..d912d034f4d4f4e958f6f56c48f85785bf2b1cfc 100644
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -1,4 +1,7 @@
+ #define _GNU_SOURCE
++#ifdef ISH_JIT
++#include "asbestos/guest-arm64/jit.h"
++#endif
+ #include <errno.h>
+ #include <pthread.h>
+ #include <stdlib.h>
+@@ -165,6 +168,9 @@ void task_destroy(struct task *task) {
+ }
+ 
+ static void task_run_tlb_cleanup(void *arg) {
++#ifdef ISH_JIT
++    jit_cache_cleanup();
++#endif
+ #ifdef GUEST_ARM64
+     tlb_detach((struct tlb *) arg);   // exited while running guest code
+ #endif
+@@ -225,6 +231,9 @@ void task_run_current() {
+         if (self->mem == NULL) {
+             pthread_exit(NULL);
+         }
++#ifdef ISH_JIT
++        jit_cache_enter(true);
++#endif
+         read_wrlock(&self->mem->lock);
+ #ifdef GUEST_ARM64
+         tlb_attach(tlb, &self->mem->mmu);
+@@ -235,6 +244,9 @@ void task_run_current() {
+         tlb_detach(tlb);
+ #endif
+         read_wrunlock(&self->mem->lock);
++#ifdef ISH_JIT
++        jit_cache_leave();
++#endif
+         handle_interrupt(interrupt);
+     }
+ 
+diff --git a/main.c b/main.c
+index 9ae29064744ac9d5e47ce874560239501bbbf9ec..868a1e9a6341169fd8b78aaeab2468de7b53a135 100644
+--- a/main.c
++++ b/main.c
+@@ -498,3 +498,5 @@ int main(int argc, char *const argv[]) {
+     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
+     task_run_current();
+ }
++
++// CLI has no app journal. The app links its implementation from ish_glue.m.
+diff --git a/tools/fakefs.c b/tools/fakefs.c
+index 3e91ec07acaa17891808a5b2303ab93335284270..1bf2356667ab942d5e057eb4f28122b2324fe6ef 100644
+--- a/tools/fakefs.c
++++ b/tools/fakefs.c
+@@ -68,18 +68,18 @@ static bool path_normalize(const char *path, char *out) {
+ }
+ 
+ static const char *schema = Q(
+-    create table meta (id integer unique default 0, db_inode integer);
+-    insert into meta (db_inode) values (0);
+-    create table stats (inode integer primary key, stat blob);
+-    create table paths (path blob primary key, inode integer references stats(inode));
+-    create index inode_to_path on paths (inode, path);
++    create table if not exists meta (id integer unique default 0, db_inode integer);
++    insert or ignore into meta (db_inode) values (0);
++    create table if not exists stats (inode integer primary key, stat blob);
++    create table if not exists paths (path blob primary key, inode integer references stats(inode));
++    create index if not exists inode_to_path on paths (inode, path);
+     // no index is needed on stats, because the rows are ordered by the primary key
+     pragma user_version=3;
+ );
+ 
+ bool fakefs_import(const char *archive_path, const char *fs, struct fakefsify_error *err_out, struct progress p) {
+     int err = mkdir(fs, 0777);
+-    if (err < 0)
++    if (err < 0 && errno != EEXIST)
+         POSIX_ERR();
+ 
+     // make the data root dir
+@@ -123,6 +123,8 @@ bool fakefs_import(const char *archive_path, const char *fs, struct fakefsify_er
+     struct archive_entry *entry;
+     while ((err = archive_read_next_header(archive, &entry)) == ARCHIVE_OK) {
+         char entry_path[MAX_PATH];
++        // Raw archive bytes: a guest filename is a byte string, so libarchive is patched to skip
++        // host charset conversion and Unicode normalization (patches/ish-libarchive-linux-paths.patch).
+         if (!path_normalize(archive_entry_pathname(entry), entry_path)) {
+             // Avoid pwnage
+             fprintf(stderr, "warning: skipped possible path traversal %s\n", archive_entry_pathname(entry));
+@@ -140,7 +142,10 @@ bool fakefs_import(const char *archive_path, const char *fs, struct fakefsify_er
+                 fprintf(stderr, "warning: almost pwned by hardlink %s\n", hardlink);
+                 continue;
+             }
+-            if (linkat(root_fd, fix_path(hardlink_path), root_fd, fix_path(entry_path), 0) < 0)
++            // A merge import relinks files the rootfs already has (perl, git-sh-setup, ...);
++            // EEXIST just means an earlier import already put it there.
++            if (linkat(root_fd, fix_path(hardlink_path), root_fd, fix_path(entry_path), 0) < 0 &&
++                    errno != EEXIST)
+                 POSIX_ERR();
+             sqlite3_bind_blob64(insert_hardlink, 1, entry_path, strlen(entry_path), SQLITE_TRANSIENT);
+             sqlite3_bind_blob64(insert_hardlink, 2, hardlink_path, strlen(hardlink_path), SQLITE_TRANSIENT);
+@@ -223,8 +228,11 @@ bool fakefs_import(const char *archive_path, const char *fs, struct fakefsify_er
+         if (!archive_entry_mtime_is_set(entry))
+             times[1].tv_nsec = UTIME_OMIT;
+         err = utimensat(root_fd, fix_path(entry_path), times, 0);
+-        if (err < 0)
+-            POSIX_ERR();
++        if (err < 0) {
++            char detail[MAX_PATH + 80];
++            snprintf(detail, sizeof(detail), "utimensat %s: %s", entry_path, strerror(errno));
++            FILL_ERR(ERR_POSIX, errno, detail);
++        }
+ 
+         struct ish_stat stat = {
+             .mode = (uint32_t) archive_entry_mode(entry),
+diff --git a/tools/jit_aot/gen.py b/tools/jit_aot/gen.py
+index 88c08dbbea81aaef00a1ab6eabac4fdc244b5297..13ac5fad9a020f5c5d93c50f8d74e674c516694c 100755
+--- a/tools/jit_aot/gen.py
++++ b/tools/jit_aot/gen.py
+@@ -31,7 +31,6 @@ import struct
+ import subprocess
+ import sys
+ 
+-from tqdm import tqdm
+ 
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ from compact import compact_lines   # noqa: E402
+@@ -102,6 +101,12 @@ def emit_segment(out, syms, t, s, seg, stats, label=None):
+         if target is None:
+             return False          # a host address we cannot name: leave this translation out
+         special[at] = ('sym', target, words[at] & 31)
++        if rel[2] == '@region':
++            # An image dispatches within its own <=128 MiB text, independently
++            # of the runtime JIT cache size. All other entries take the cold path.
++            if words[at + 4] != 0xCB0A010A or words[at + 5] & ~(0x3f << 16) != 0xD340FD4A:
++                raise ValueError('unknown native dispatch layout')
++            special[at + 5] = ('aot_range',)
+     for slot, at, tt, ts, tw in seg['links']:
+         special[at] = ('link', slot, tt, ts, tw)
+ 
+@@ -114,6 +119,10 @@ def emit_segment(out, syms, t, s, seg, stats, label=None):
+             out.append(f'    .inst 0x{words[i]:08x}')
+             i += 1
+             continue
++        if sp[0] == 'aot_range':
++            out.append('    lsr x10, x10, #27')
++            i += 1
++            continue
+         if sp[0] == 'stub':
+             out.append(f'    b {sp[1]}')
+             stats['exit'] += 1
+@@ -290,7 +299,7 @@ def main():
+             stats['labels'].add((ti, si))
+ 
+     code, keep = [], []
+-    for ti, t in enumerate(tqdm(trans, desc='🛠  code', unit='tr')):
++    for ti, t in enumerate(trans):
+         body = []
+         ok = all(emit_segment(body, syms, ti, si, seg, stats) for si, seg in enumerate(t['segs']))
+         if not ok:
+@@ -307,7 +316,7 @@ def main():
+ 
+     exit_stub = header['exit_stub']
+     data = []
+-    for ti, t in enumerate(tqdm(trans, desc='📋 tables', unit='tr')):
++    for ti, t in enumerate(trans):
+         key = list(t['key'])
+         key[0] = 0                                     # module word: filled in by the loader
+         nunits = key[4]
+@@ -343,6 +352,13 @@ def main():
+             data.append('    .byte ' + ', '.join(str(x) for x in pad(g) + pad(d) + pad(h)))
+         t['_loop'] = bool(loop)
+ 
++    # Conservative bound includes every alignment gap and stub. Mach-O's
++    # assembler cannot evaluate section differences inside .if directives.
++    text_bound = 4 * len(exit_stub) + 3 + sum(4 * len(seg['words']) + 15
++        for t in trans for seg in t['segs']) + sum(4 * len(stub['words']) + 15
++        for stub in header.get('stubs', []))
++    if text_bound > 0x8000000:
++        sys.exit('AOT image text exceeds its 128 MiB dispatch window')
+     lines = [f'// AOT image of {mod}: {len(trans)} translations, generated by tools/jit_aot/gen.py.',
+              '// Do not edit.', '',
+              '    .section __TEXT,__ish_aot,regular,pure_instructions',
+diff --git a/xX_main_Xx.h b/xX_main_Xx.h
+index 22f14352bc99f83deb98152b347c849a7e46b28f..93a66a09858dd4cd22186cfa2ad674a23d77b8a7 100644
+--- a/xX_main_Xx.h
++++ b/xX_main_Xx.h
+@@ -237,17 +237,6 @@ do_exec:
+                 }
+             }
+         }
+-        // Node-specific: LD_PRELOAD for zero_free.so
+-        const char *base2 = strrchr(argv[optind], '/');
+-        base2 = base2 ? base2 + 1 : argv[optind];
+-        if (strcmp(base2, "node") == 0) {
+-            static const char *ld_preload = "LD_PRELOAD=/lib/zero_free.so";
+-            size_t plen = strlen(ld_preload) + 1;
+-            if (ep + plen < sizeof(envp_buf) - 2) {
+-                memcpy(&envp_buf[ep], ld_preload, plen);
+-                ep += plen;
+-            }
+-        }
+         envp_buf[ep] = '\0';
+         err = do_execve(argv[optind], exec_argc, argv_copy, envp_buf);
+     }

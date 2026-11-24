@@ -1,0 +1,230 @@
+--- a/src/vs/workbench/contrib/webview/browser/webviewElement.ts
++++ b/src/vs/workbench/contrib/webview/browser/webviewElement.ts
+@@ -670,6 +670,10 @@
+ 	public setTitle(title: string) {
+ 		this._content = { ...this._content, title };
+ 		this._send('set-title', title);
++	}
++
++	public get contentOptions(): WebviewContentOptions {
++		return this._content.options;
+ 	}
+ 
+ 	public set contentOptions(options: WebviewContentOptions) {
+--- a/src/vs/workbench/api/common/extHost.protocol.ts
++++ b/src/vs/workbench/api/common/extHost.protocol.ts
+@@ -1969,6 +1969,7 @@
+ }
+ 
+ export interface ExtHostChatOutputRendererShape {
++	$disposeChatOutput(webviewHandle: string): void;
+ 	$renderChatOutput(viewType: string, mime: string, valueData: VSBuffer, webviewHandle: string, context: IChatOutputRenderContextDto, token: CancellationToken): Promise<void>;
+ }
+ 
+--- a/src/vs/workbench/api/common/extHostWebview.ts
++++ b/src/vs/workbench/api/common/extHostWebview.ts
+@@ -266,6 +266,10 @@
+ 		});
+ 	}
+ 
++	public disposeWebview(handle: string): void {
++		this.getWebview(handle)?.dispose();
++	}
++
+ 	public deleteWebview(handle: string) {
+ 		this._webviews.delete(handle);
+ 	}
+--- a/src/vs/workbench/api/common/extHostChatOutputRenderer.ts
++++ b/src/vs/workbench/api/common/extHostChatOutputRenderer.ts
+@@ -4,6 +4,8 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import type * as vscode from 'vscode';
++import { raceCancellationError } from '../../../base/common/async.js';
++import { CancellationError } from '../../../base/common/errors.js';
+ import { CancellationToken } from '../../../base/common/cancellation.js';
+ import { ExtHostChatOutputRendererShape, type IChatOutputRenderContextDto, IMainContext, MainContext, MainThreadChatOutputRendererShape } from './extHost.protocol.js';
+ import { Disposable } from './extHostTypes.js';
+@@ -41,17 +43,26 @@
+ 		});
+ 	}
+ 
++	$disposeChatOutput(webviewHandle: string): void {
++		this.webviews.disposeWebview(webviewHandle);
++	}
++
+ 	async $renderChatOutput(viewType: string, mime: string, valueData: VSBuffer, webviewHandle: string, context: IChatOutputRenderContextDto, token: CancellationToken): Promise<void> {
+ 		const entry = this._renderers.get(viewType);
+ 		if (!entry) {
+ 			throw new Error(`No chat output renderer registered for: ${viewType}`);
+ 		}
+ 
++		if (token.isCancellationRequested) {
++			throw new CancellationError();
++		}
++
+ 		const extHostWebview = this.webviews.createNewWebview(webviewHandle, {}, entry.extension);
++		this.webviews.ensureDefaultContentOptions(webviewHandle, {}, entry.extension);
+ 		const chatOutputWebview: vscode.ChatOutputWebview = Object.freeze({
+ 			webview: extHostWebview,
+ 			onDidDispose: extHostWebview._onDidDispose,
+ 		});
+-		return entry.renderer.renderChatOutput(Object.freeze({ mime, value: valueData.buffer }), chatOutputWebview, Object.freeze(context), token);
++		return raceCancellationError(entry.renderer.renderChatOutput(Object.freeze({ mime, value: valueData.buffer }), chatOutputWebview, Object.freeze(context), token), token);
+ 	}
+ }
+--- a/src/vs/workbench/api/browser/mainThreadChatOutputRenderer.ts
++++ b/src/vs/workbench/api/browser/mainThreadChatOutputRenderer.ts
+@@ -3,8 +3,10 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
++import { Event } from '../../../base/common/event.js';
++import { IWebview } from '../../contrib/webview/browser/webview.js';
+ import { VSBuffer } from '../../../base/common/buffer.js';
+-import { Disposable, IDisposable } from '../../../base/common/lifecycle.js';
++import { Disposable, DisposableMap, IDisposable } from '../../../base/common/lifecycle.js';
+ import { URI, UriComponents } from '../../../base/common/uri.js';
+ import { ExtensionIdentifier } from '../../../platform/extensions/common/extensions.js';
+ import { ILogService } from '../../../platform/log/common/log.js';
+@@ -18,6 +20,7 @@
+ 	private readonly _proxy: ExtHostChatOutputRendererShape;
+ 
+ 	private _webviewHandlePool = 0;
++	private readonly _webviews = this._register(new DisposableMap<string, IWebview>());
+ 
+ 	private readonly registeredRenderers = new Map</* viewType */ string, IDisposable>();
+ 
+@@ -48,6 +51,11 @@
+ 		const disposable = this._rendererService.registerRenderer(viewType, {
+ 			renderOutputPart: async (mime, data, webview, context, token) => {
+ 				const webviewHandle = `chat-output-${++this._webviewHandlePool}`;
++				this._webviews.set(webviewHandle, webview);
++				Event.once(webview.onDidDispose)(() => {
++					this._webviews.deleteAndLeak(webviewHandle);
++					this._proxy.$disposeChatOutput(webviewHandle);
++				});
+ 
+ 				this._mainThreadWebview.addWebview(webviewHandle, webview, {
+ 					serializeBuffersForPostMessage: true,
+--- a/src/vs/workbench/contrib/chat/browser/chatOutputItemRenderer.ts
++++ b/src/vs/workbench/contrib/chat/browser/chatOutputItemRenderer.ts
+@@ -5,7 +5,7 @@
+ 
+ import { getWindow } from '../../../../base/browser/dom.js';
+ import { raceCancellationError } from '../../../../base/common/async.js';
+-import { CancellationToken } from '../../../../base/common/cancellation.js';
++import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
+ import { matchesMimeType } from '../../../../base/common/dataTransfer.js';
+ import { CancellationError } from '../../../../base/common/errors.js';
+ import { Emitter, Event } from '../../../../base/common/event.js';
+@@ -150,49 +150,56 @@
+ 
+ 		const store = new DisposableStore();
+ 
+-		const webview = store.add(this._webviewService.createWebviewElement({
+-			title: webviewOptions.title ?? '',
+-			origin: this.getOrigin(rendererData),
+-			providedViewType: rendererData.viewType,
+-			options: {
+-				enableFindWidget: false,
+-				purpose: WebviewContentPurpose.ChatOutputItem,
+-				tryRestoreScrollPosition: false,
+-			},
+-			contentOptions: {},
+-			extension: rendererData.options.extension ? rendererData.options.extension : undefined,
+-		}));
+-		webview.setContextKeyService(store.add(this._contextKeyService.createScoped(parent)));
+-		if (webviewOptions.chatSessionResource) {
+-			store.add(this.delegateScrollToChatWidget(webview, webviewOptions.chatSessionResource));
+-		}
+-
+-		const onDidChangeHeight = store.add(new Emitter<number>());
+-		store.add(autorun(reader => {
+-			const height = reader.readObservable(webview.intrinsicContentSize);
+-			if (height) {
+-				onDidChangeHeight.fire(height.height);
+-				parent.style.height = `${height.height}px`;
+-			}
+-		}));
+-
+-		if (webviewOptions.webviewState) {
+-			webview.state = webviewOptions.webviewState;
+-		}
+-
+-		webview.mountTo(parent, getWindow(parent));
+-		await rendererData.renderer.renderOutputPart(mime, data, webview, context, token);
+-
+-		return {
+-			get webview() { return webview; },
+-			onDidChangeHeight: onDidChangeHeight.event,
+-			dispose: () => {
+-				store.dispose();
+-			},
+-			reinitialize: () => {
+-				webview.reinitializeAfterDismount();
+-			},
+-		};
++		try {
++			const webview = store.add(this._webviewService.createWebviewElement({
++				title: webviewOptions.title ?? '',
++				origin: this.getOrigin(rendererData),
++				providedViewType: rendererData.viewType,
++				options: {
++					enableFindWidget: false,
++					purpose: WebviewContentPurpose.ChatOutputItem,
++					tryRestoreScrollPosition: false,
++				},
++				contentOptions: {},
++				extension: rendererData.options.extension ? rendererData.options.extension : undefined,
++			}));
++			webview.setContextKeyService(store.add(this._contextKeyService.createScoped(parent)));
++			if (webviewOptions.chatSessionResource) {
++				store.add(this.delegateScrollToChatWidget(webview, webviewOptions.chatSessionResource));
++			}
++
++			const onDidChangeHeight = store.add(new Emitter<number>());
++			store.add(autorun(reader => {
++				const height = reader.readObservable(webview.intrinsicContentSize);
++				if (height) {
++					onDidChangeHeight.fire(height.height);
++					parent.style.height = `${height.height}px`;
++				}
++			}));
++
++			if (webviewOptions.webviewState) {
++				webview.state = webviewOptions.webviewState;
++			}
++
++			webview.mountTo(parent, getWindow(parent));
++			const rendering = store.add(new CancellationTokenSource(token));
++			store.add(webview.onDidDispose(() => rendering.cancel()));
++			await raceCancellationError(rendererData.renderer.renderOutputPart(mime, data, webview, context, rendering.token), rendering.token);
++
++			return {
++				get webview() { return webview; },
++				onDidChangeHeight: onDidChangeHeight.event,
++				dispose: () => {
++					store.dispose();
++				},
++				reinitialize: () => {
++					webview.reinitializeAfterDismount();
++				},
++			};
++		} catch (error) {
++			store.dispose();
++			throw error;
++		}
+ 	}
+ 
+ 	private delegateScrollToChatWidget(webview: IWebview, chatSessionResource: URI): IDisposable {
+--- a/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatToolOutputPart.ts
++++ b/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatToolOutputPart.ts
+@@ -97,6 +97,7 @@
+ 			chatSessionResource: this.context.element.sessionResource,
+ 		}, this._disposeCts.token).then((renderedItem) => {
+ 			if (this._disposeCts.token.isCancellationRequested) {
++				renderedItem.dispose();
+ 				return;
+ 			}
+ 

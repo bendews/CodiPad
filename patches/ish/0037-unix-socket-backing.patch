@@ -1,0 +1,64 @@
+--- a/fs/sock.c
++++ b/fs/sock.c
+@@ -559,6 +559,12 @@
+ }
+ 
+ const char *sock_tmp_prefix = "/tmp/ishsock";
++
++static int unix_socket_host_path(char *out, size_t size, const char *prefix,
++                                 pid_t pid, uint32_t socket_id) {
++    int n = snprintf(out, size, "%s%d.%u", prefix, (int) pid, socket_id);
++    return n < 0 || (size_t) n >= size ? _ENAMETOOLONG : 0;
++}
+ 
+ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
+     // Make sure we can read things without overflowing buffers
+@@ -584,6 +590,11 @@
+             break;
+ 
+         case PF_LOCAL: {
++            // Validate before unix_socket_get can create a guest filesystem node.
++            char backing_path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
++            int path_err = unix_socket_host_path(backing_path, sizeof(backing_path),
++                                                 sock_tmp_prefix, getpid(), UINT32_MAX);
++            if (path_err < 0) return path_err;
+             // First pull out the path, being careful to not overflow anything.
+             char path[SOCKADDR_DATA_MAX + 1];
+             size_t path_size = *sockaddr_len - offsetof(struct sockaddr_, data);
+@@ -609,7 +620,10 @@
+             }
+ 
+             struct sockaddr_un *real_addr_un = sockaddr;
+-            size_t path_len = sprintf(real_addr_un->sun_path, "%s%d.%u", sock_tmp_prefix, getpid(), socket_id);
++            int formatted = unix_socket_host_path(real_addr_un->sun_path, sizeof(real_addr_un->sun_path),
++                                                  sock_tmp_prefix, getpid(), socket_id);
++            if (formatted < 0) return formatted;
++            size_t path_len = strlen(real_addr_un->sun_path);
+             // The call to real bind will fail if the backing socket already
+             // exists from a previous run or something. We already checked that
+             // the fake file doesn't exist in unix_socket_get, so try a simple
+@@ -726,6 +740,9 @@
+     err = connect(sock->real_fd, (void *) &sockaddr, sockaddr_len);
+     if (err < 0) {
+         int ce = errno;
++        // The guest pathname still exists when a bound socket is closed.
++        // Its removed host backing has the same Linux result as a closed listener.
++        if (ce == ENOENT && sock->socket.domain == AF_LOCAL_) return _ECONNREFUSED;
+         // Log connect failures except the routine nonblock in-progress case,
+         // so VPN / routing issues are visible in user-shared logs.
+         if (ce != EINPROGRESS && ce != EALREADY) {
+@@ -2179,6 +2196,14 @@
+         fd->socket.netlink_peer_fd = -1;
+     }
+     sockrestart_end_listen(fd);
++    // Drop the host-only backing pathname while retaining the guest pathname.
++    uint32_t socket_id = fd->socket.unix_name_inode ? fd->socket.unix_name_inode->socket_id :
++                         fd->socket.unix_name_abstract ? fd->socket.unix_name_abstract->socket_id : 0;
++    if (socket_id) {
++        char backing_path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
++        if (unix_socket_host_path(backing_path, sizeof(backing_path), sock_tmp_prefix, getpid(), socket_id) == 0)
++            unlink(backing_path);
++    }
+     // FIXME next 3 lines should go in a function like release_unix_names
+     inode_release_if_exist(fd->socket.unix_name_inode);
+     if (fd->socket.unix_name_abstract != NULL)

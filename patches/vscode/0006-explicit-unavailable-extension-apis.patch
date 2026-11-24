@@ -1,0 +1,126 @@
+--- a/src/vs/workbench/services/extensions/common/extensions.ts
++++ b/src/vs/workbench/services/extensions/common/extensions.ts
+@@ -124,6 +124,9 @@
+ 	readonly runningLocation: ExtensionRunningLocation;
+ 	readonly remoteAuthority: string | null;
+ 	readonly startup: ExtensionHostStartup;
++	/** Explicitly unavailable main-thread APIs in a custom platform composition.
++	 * Calls reject with the supplied reason; missing undeclared APIs remain fatal. */
++	readonly unavailableMainThreadCustomers?: ReadonlyMap<string, string>;
+ 	/**
+ 	 * A collection of extensions which includes information about which
+ 	 * extension will execute or is executing on this extension host.
+--- a/src/vs/workbench/services/extensions/common/extensionHostManager.ts
++++ b/src/vs/workbench/services/extensions/common/extensionHostManager.ts
+@@ -262,6 +262,7 @@
+ 		const extHostContext: IInternalExtHostContext = {
+ 			remoteAuthority: this._extensionHost.remoteAuthority,
+ 			extensionHostKind: this.kind,
++			unavailableMainThreadCustomers: this._extensionHost.unavailableMainThreadCustomers,
+ 			getProxy: <T>(identifier: ProxyIdentifier<T>): Proxied<T> => this._rpcProtocol!.getProxy(identifier),
+ 			set: <T, R extends T>(identifier: ProxyIdentifier<T>, instance: R): R => this._rpcProtocol!.set(identifier, instance),
+ 			dispose: (): void => this._rpcProtocol!.dispose(),
+@@ -279,10 +280,19 @@
+ 			//#endregion
+ 		};
+ 
++		// Declare platform exclusions before constructing customers. No actor is fabricated.
++		const unavailable = this._extensionHost.unavailableMainThreadCustomers;
++		for (const [sid, reason] of unavailable ?? []) {
++			this._logService.info(`Extension API unavailable: ${sid}: ${reason}`);
++		}
++
+ 		// Named customers
+ 		const namedCustomers = ExtHostCustomersRegistry.getNamedCustomers();
+ 		for (let i = 0, len = namedCustomers.length; i < len; i++) {
+ 			const [id, ctor] = namedCustomers[i];
++			if (unavailable?.has(id.sid)) {
++				continue;
++			}
+ 			try {
+ 				const instance = this._instantiationService.createInstance(ctor, extHostContext);
+ 				this._customers.push(instance);
+@@ -308,6 +318,14 @@
+ 
+ 		if (!extensionHostProxy) {
+ 			throw new Error(`Missing IExtensionHostProxy!`);
++		}
++
++		for (const [sid, reason] of unavailable ?? []) {
++			const identifier = mainProxyIdentifiers.find(identifier => identifier.sid === sid);
++			if (!identifier || !reason.trim()) {
++				throw new Error(`Invalid unavailable extension API: ${sid}`);
++			}
++			this._rpcProtocol.setUnavailable(identifier, reason);
+ 		}
+ 
+ 		// Check that no named customers are missing
+--- a/src/vs/workbench/services/extensions/common/extHostCustomers.ts
++++ b/src/vs/workbench/services/extensions/common/extHostCustomers.ts
+@@ -13,6 +13,8 @@
+ export interface IExtHostContext extends IRPCProtocol {
+ 	readonly remoteAuthority: string | null;
+ 	readonly extensionHostKind: ExtensionHostKind;
++	/** Allows composite customers to omit explicitly unavailable child APIs. */
++	readonly unavailableMainThreadCustomers?: ReadonlyMap<string, string>;
+ }
+ 
+ export interface IInternalExtHostContext extends IExtHostContext {
+--- a/src/vs/workbench/services/extensions/common/rpcProtocol.ts
++++ b/src/vs/workbench/services/extensions/common/rpcProtocol.ts
+@@ -263,7 +263,19 @@
+ 		return new Proxy(Object.create(null), handler);
+ 	}
+ 
++	private readonly _unavailable = new Map<number, string>();
++
++	public setUnavailable(identifier: ProxyIdentifier<unknown>, reason: string): void {
++		if (this._locals[identifier.nid] || !reason.trim()) {
++			throw new Error(`Cannot mark registered API unavailable: ${identifier.sid}`);
++		}
++		this._unavailable.set(identifier.nid, reason);
++	}
++
+ 	public set<T, R extends T>(identifier: ProxyIdentifier<T>, value: R): R {
++		if (this._unavailable.has(identifier.nid)) {
++			throw new Error(`Cannot register unavailable API: ${identifier.sid}`);
++		}
+ 		this._locals[identifier.nid] = value;
+ 		return value;
+ 	}
+@@ -271,7 +283,7 @@
+ 	public assertRegistered(identifiers: ProxyIdentifier<any>[]): void {
+ 		for (let i = 0, len = identifiers.length; i < len; i++) {
+ 			const identifier = identifiers[i];
+-			if (!this._locals[identifier.nid]) {
++			if (!this._locals[identifier.nid] && !this._unavailable.has(identifier.nid)) {
+ 				throw new Error(`Missing proxy instance ${identifier.sid}`);
+ 			}
+ 		}
+@@ -447,6 +459,12 @@
+ 	}
+ 
+ 	private _doInvokeHandler(rpcId: number, methodName: string, args: any[]): any {
++		const unavailable = this._unavailable.get(rpcId);
++		if (unavailable !== undefined) {
++			const error = new Error(`${getStringIdentifierForProxy(rpcId)}.${methodName}: ${unavailable}`);
++			error.name = 'UnsupportedExtensionApi';
++			throw error;
++		}
+ 		const actor = this._locals[rpcId];
+ 		if (!actor) {
+ 			throw new Error('Unknown actor ' + getStringIdentifierForProxy(rpcId));
+--- a/src/vs/workbench/api/browser/mainThreadWebviewManager.ts
++++ b/src/vs/workbench/api/browser/mainThreadWebviewManager.ts
+@@ -33,7 +33,9 @@
+ 		const webviewViews = this._register(instantiationService.createInstance(MainThreadWebviewsViews, context, webviews));
+ 		context.set(extHostProtocol.MainContext.MainThreadWebviewViews, webviewViews);
+ 
+-		const chatOutputRenderers = this._register(instantiationService.createInstance(MainThreadChatOutputRenderer, context, webviews));
+-		context.set(extHostProtocol.MainContext.MainThreadChatOutputRenderer, chatOutputRenderers);
++		if (!context.unavailableMainThreadCustomers?.has(extHostProtocol.MainContext.MainThreadChatOutputRenderer.sid)) {
++			const chatOutputRenderers = this._register(instantiationService.createInstance(MainThreadChatOutputRenderer, context, webviews));
++			context.set(extHostProtocol.MainContext.MainThreadChatOutputRenderer, chatOutputRenderers);
++		}
+ 	}
+ }

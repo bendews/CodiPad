@@ -1,0 +1,378 @@
+--- a/fs/fd.h
++++ b/fs/fd.h
+@@ -68,6 +68,9 @@
+             // queue is still owed its NLMSG_DONE, and the receive timeout.
+             // See fs/sock.c.
+             int netlink_peer_fd;
++            // Borrowed host AF_UNIX stream installed by CodiPad's process authority. Its flags and
++            // blocking behavior are virtualized; socket I/O uses per-call nonblocking operations.
++            bool adopted_host;
+             uint32_t netlink_groups;
+             uint32_t netlink_owe_seq;
+             bool netlink_owe_done;
+--- a/fs/sock.c
++++ b/fs/sock.c
+@@ -6,6 +6,7 @@
+ #include <sys/stat.h>
+ #include <sys/un.h>
+ #include "kernel/calls.h"
++#include "kernel/signal.h"
+ #include "fs/fd.h"
+ #include "fs/inode.h"
+ #include "fs/path.h"
+@@ -21,6 +22,21 @@
+ #define SOCKET_TYPE_MASK 0xf
+ 
+ const struct fd_ops socket_fdops;
++static int sock_wait_for(int real_fd, short events, int timeout_opt);
++static ssize_t sock_adopted_host_io(struct fd *fd, void *buf, size_t size, bool writing);
++
++static bool sock_guest_signal_pending(void) {
++    if (current->sighand == NULL)
++        return false;
++    lock(&current->sighand->lock);
++    bool pending = !!(current->pending & ~current->blocked);
++    unlock(&current->sighand->lock);
++    return pending;
++}
++
++static bool sock_is_adopted_host(const struct fd *fd) {
++    return fd != NULL && fd->ops == &socket_fdops && fd->socket.adopted_host;
++}
+ 
+ // ---------------------------------------------------------------------------
+ // AF_NETLINK stub -- the socket half. fs/netlink.c is the other half: it
+@@ -1004,8 +1020,48 @@
+             goto error;
+     }
+ 
+-    ssize_t res = sendto(sock->real_fd, buffer, len, real_flags,
+-            sockaddr_addr ? (void *) &sockaddr : NULL, sockaddr_len);
++    ssize_t res;
++    if (sock_is_adopted_host(sock)) {
++        bool should_wait = !(real_flags & MSG_DONTWAIT) &&
++                           !(sock->flags & O_NONBLOCK_);
++        for (;;) {
++            int host_flags = real_flags | MSG_DONTWAIT;
++#ifdef MSG_NOSIGNAL
++            host_flags |= MSG_NOSIGNAL;
++#endif
++            res = sendto(sock->real_fd, buffer, len, host_flags,
++                    sockaddr_addr ? (void *) &sockaddr : NULL, sockaddr_len);
++            if (res >= 0)
++                break;
++            if (errno == EINTR) {
++                if (sock_guest_signal_pending()) {
++                    free(buffer);
++                    return _EINTR;
++                }
++                continue;
++            }
++            if (errno != EAGAIN && errno != EWOULDBLOCK) {
++                int saved_errno = errno;
++                free(buffer);
++                if (saved_errno == EPIPE)
++                    send_signal(current, SIGPIPE_, SIGINFO_NIL);
++                errno = saved_errno;
++                return errno_map();
++            }
++            if (!should_wait) {
++                free(buffer);
++                return _EAGAIN;
++            }
++            int wait_result = sock_wait_for(sock->real_fd, POLLOUT, SO_SNDTIMEO);
++            if (wait_result < 0) {
++                free(buffer);
++                return wait_result;
++            }
++        }
++    } else {
++        res = sendto(sock->real_fd, buffer, len, real_flags,
++                sockaddr_addr ? (void *) &sockaddr : NULL, sockaddr_len);
++    }
+     free(buffer);
+     if (res < 0)
+         return errno_map();
+@@ -1145,8 +1201,9 @@
+     // the fd itself is nonblock, musl loops forever and DNS resolution
+     // appears to hang. We check both the iSH-level fd flags and the host
+     // fd's real flags, in case they diverge (e.g. set via fcntl only).
+-    int host_flags = fcntl(sock->real_fd, F_GETFL, 0);
+-    bool host_nonblock = (host_flags >= 0) && (host_flags & O_NONBLOCK);
++    bool adopted_host = sock_is_adopted_host(sock);
++    int host_flags = adopted_host ? 0 : fcntl(sock->real_fd, F_GETFL, 0);
++    bool host_nonblock = !adopted_host && (host_flags >= 0) && (host_flags & O_NONBLOCK);
+     bool guest_nonblock = (sock->flags & O_NONBLOCK_) != 0;
+     bool should_wait = !(real_flags & MSG_DONTWAIT) && !guest_nonblock && !host_nonblock;
+ 
+@@ -1154,7 +1211,35 @@
+     // when data is already buffered). Only if it returns EAGAIN and we
+     // should wait do we fall back to the bounded-poll wait.
+     ssize_t res;
+-    if (should_wait) {
++    if (adopted_host) {
++        for (;;) {
++            res = recvfrom(sock->real_fd, buffer, len, real_flags | MSG_DONTWAIT,
++                    sockaddr_addr != 0 ? (void *) sockaddr : NULL,
++                    sockaddr_len_addr != 0 ? &sockaddr_len : NULL);
++            if (res >= 0)
++                break;
++            if (errno == EINTR) {
++                if (sock_guest_signal_pending()) {
++                    free(buffer);
++                    return _EINTR;
++                }
++                continue;
++            }
++            if (errno != EAGAIN && errno != EWOULDBLOCK) {
++                free(buffer);
++                return errno_map();
++            }
++            if (!should_wait) {
++                free(buffer);
++                return _EAGAIN;
++            }
++            int wait_result = sock_wait_readable(sock->real_fd);
++            if (wait_result < 0) {
++                free(buffer);
++                return wait_result;
++            }
++        }
++    } else if (should_wait) {
+         // Diagnostic: a blocking recv is exceptional for most network
+         // programs (Node, Go, Python asyncio all use nonblock). Log it so
+         // we can see the guest/host fd state in user-shared logs.
+@@ -1455,6 +1540,10 @@
+         return _EFAULT;
+ #endif
+ 
++    // Refuse any ancillary send before copying payload into or writing to the host socket.
++    if (sock_is_adopted_host(sock) && msg_fake.msg_controllen != 0)
++        return _EOPNOTSUPP;
++
+     // msg_name
+     struct sockaddr_max_ msg_name;
+     if (msg_fake.msg_name != 0) {
+@@ -1532,6 +1621,12 @@
+         }
+         if (num_fds > 253) // *magic*
+             return _EINVAL;
++        // Authority-adopted channels carry bytes only. Refuse before opening the sentinel fd,
++        // retaining guest descriptors, queueing ancillary state, or sending any payload bytes.
++        if (sock_is_adopted_host(sock) && num_fds > 0) {
++            err = _EOPNOTSUPP;
++            goto out_free_iov;
++        }
+ 
+         if (num_fds > 0) {
+             // send one (1) real fd and put the rest in a struct scm
+@@ -1584,10 +1679,47 @@
+     if (real_flags < 0)
+         goto out_free_scm;
+ 
+-    err = sendmsg(sock->real_fd, &msg, real_flags);
+-    if (err < 0) {
+-        err = errno_map();
+-        goto out_free_scm;
++    if (sock_is_adopted_host(sock)) {
++        bool should_wait = !(real_flags & MSG_DONTWAIT) &&
++                           !(sock->flags & O_NONBLOCK_);
++        for (;;) {
++            int host_flags = real_flags | MSG_DONTWAIT;
++#ifdef MSG_NOSIGNAL
++            host_flags |= MSG_NOSIGNAL;
++#endif
++            err = (int)sendmsg(sock->real_fd, &msg, host_flags);
++            if (err >= 0)
++                break;
++            if (errno == EINTR) {
++                if (sock_guest_signal_pending()) {
++                    err = _EINTR;
++                    goto out_free_scm;
++                }
++                continue;
++            }
++            if (errno != EAGAIN && errno != EWOULDBLOCK) {
++                if (errno == EPIPE) {
++                    send_signal(current, SIGPIPE_, SIGINFO_NIL);
++                    err = _EPIPE;
++                } else {
++                    err = errno_map();
++                }
++                goto out_free_scm;
++            }
++            if (!should_wait) {
++                err = _EAGAIN;
++                goto out_free_scm;
++            }
++            err = sock_wait_for(sock->real_fd, POLLOUT, SO_SNDTIMEO);
++            if (err < 0)
++                goto out_free_scm;
++        }
++    } else {
++        err = (int)sendmsg(sock->real_fd, &msg, real_flags);
++        if (err < 0) {
++            err = errno_map();
++            goto out_free_scm;
++        }
+     }
+     goto out_free_iov;
+ 
+@@ -1697,14 +1829,41 @@
+     // recvmsg(fd, &mh, 0) — it relies on EAGAIN on empty buffer to end its
+     // "drain pending responses" loop. Same bug that used to affect
+     // sys_recvfrom before 76907b86.
+-    int host_flags_rm = fcntl(sock->real_fd, F_GETFL, 0);
+-    bool host_nonblock_rm = (host_flags_rm >= 0) && (host_flags_rm & O_NONBLOCK);
++    bool adopted_host_rm = sock_is_adopted_host(sock);
++    int host_flags_rm = adopted_host_rm ? 0 : fcntl(sock->real_fd, F_GETFL, 0);
++    bool host_nonblock_rm = !adopted_host_rm && (host_flags_rm >= 0) && (host_flags_rm & O_NONBLOCK);
+     bool guest_nonblock_rm = (sock->flags & O_NONBLOCK_) != 0;
+     bool should_wait_rm = !(real_flags & MSG_DONTWAIT) && !guest_nonblock_rm && !host_nonblock_rm;
+ 
+     ssize_t res = -1;
+     int err = 0;
+-    if (should_wait_rm) {
++    if (adopted_host_rm) {
++        for (;;) {
++            res = recvmsg(sock->real_fd, &msg, real_flags | MSG_DONTWAIT);
++            if (res >= 0)
++                break;
++            if (errno == EINTR) {
++                if (sock_guest_signal_pending()) {
++                    err = _EINTR;
++                    break;
++                }
++                continue;
++            }
++            if (errno != EAGAIN && errno != EWOULDBLOCK) {
++                err = errno_map();
++                break;
++            }
++            if (!should_wait_rm) {
++                err = _EAGAIN;
++                break;
++            }
++            int wr = sock_wait_readable(sock->real_fd);
++            if (wr < 0) {
++                err = wr;
++                break;
++            }
++        }
++    } else if (should_wait_rm) {
+         printk("NETDIAG recvmsg-block(pid=%d comm=%s fd=%d real=%d gflags=%#x hflags=%#x sflags=%#x)\n",
+                current->pid, current->comm, sock_fd, sock->real_fd,
+                (unsigned)flags, host_flags_rm, sock->flags);
+@@ -1729,6 +1888,25 @@
+         if (res < 0)
+             err = errno_map();
+     }
++    if (adopted_host_rm && res >= 0) {
++        bool unsupported_control = (msg.msg_flags & MSG_CTRUNC) != 0;
++        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
++             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++            unsupported_control = true;
++            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
++                cmsg->cmsg_len >= CMSG_LEN(0)) {
++                size_t bytes = cmsg->cmsg_len - CMSG_LEN(0);
++                size_t count = bytes / sizeof(int);
++                int *received_fds = (int *)CMSG_DATA(cmsg);
++                for (size_t i = 0; i < count; i++)
++                    close(received_fds[i]);
++            }
++        }
++        if (unsupported_control) {
++            err = _EOPNOTSUPP;
++            res = -1;
++        }
++    }
+     // don't return err quite yet, there are outstanding mallocs
+ 
+     // msg_iovec (changed)
+@@ -1936,6 +2114,8 @@
+         memcpy(buf, nlbuf, copy);
+         return (ssize_t) copy;
+     }
++    if (sock_is_adopted_host(fd))
++        return sock_adopted_host_io(fd, buf, size, false);
+     int err;
+     int eintr_count = 0;
+     for (;;) {
+@@ -1968,6 +2148,8 @@
+     // bytes into the socketpair where nobody reads them.
+     if (fd_is_netlink_stub(fd))
+         return netlink_stub_reply(fd, buf, size);
++    if (sock_is_adopted_host(fd))
++        return sock_adopted_host_io(fd, (void *)buf, size, true);
+     int err;
+     int eintr_count = 0;
+     for (;;) {
+@@ -2018,13 +2200,66 @@
+     return realfs_close(fd);
+ }
+ 
++static ssize_t sock_adopted_host_io(struct fd *fd, void *buf, size_t size, bool writing) {
++    if (size == 0)
++        return 0;
++    bool nonblock = (fd->flags & O_NONBLOCK_) != 0;
++    for (;;) {
++        ssize_t result;
++        if (writing) {
++            int flags = MSG_DONTWAIT;
++#ifdef MSG_NOSIGNAL
++            flags |= MSG_NOSIGNAL;
++#endif
++            result = send(fd->real_fd, buf, size, flags);
++        } else {
++            result = recv(fd->real_fd, buf, size, MSG_DONTWAIT);
++        }
++        if (result >= 0)
++            return result;
++        if (errno == EINTR) {
++            if (sock_guest_signal_pending())
++                return _EINTR;
++            continue;
++        }
++        if (errno != EAGAIN && errno != EWOULDBLOCK) {
++            int saved_errno = errno;
++            if (writing && saved_errno == EPIPE)
++                send_signal(current, SIGPIPE_, SIGINFO_NIL);
++            errno = saved_errno;
++            int error = errno_map();
++            sock_translate_err(fd, &error);
++            return error;
++        }
++        if (nonblock)
++            return _EAGAIN;
++        int wait_result = sock_wait_for(fd->real_fd, writing ? POLLOUT : POLLIN,
++                                        writing ? SO_SNDTIMEO : SO_RCVTIMEO);
++        if (wait_result < 0)
++            return wait_result;
++    }
++}
++
++static int sock_getflags(struct fd *fd) {
++    return sock_is_adopted_host(fd) ? fd->flags : realfs_getflags(fd);
++}
++
++static int sock_setflags(struct fd *fd, dword_t flags) {
++    if (!sock_is_adopted_host(fd))
++        return realfs_setflags(fd, flags);
++    // F_SETFL changes only guest-visible state for a borrowed socket; its host OFD is untouched.
++    const unsigned allowed = O_NONBLOCK_ | O_APPEND_;
++    fd->flags = (fd->flags & ~allowed) | (flags & allowed);
++    return 0;
++}
++
+ const struct fd_ops socket_fdops = {
+     .read = sock_read,
+     .write = sock_write,
+     .close = sock_close,
+     .poll = realfs_poll,
+-    .getflags = realfs_getflags,
+-    .setflags = realfs_setflags,
++    .getflags = sock_getflags,
++    .setflags = sock_setflags,
+     .ioctl_size = realfs_ioctl_size,
+     .ioctl = realfs_ioctl,
+ };

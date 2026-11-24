@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"
+     viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">CodiPad</title>
+  <desc id="description">A folded blue C surrounding a dark tablet screen with luminous code brackets.</desc>
+
+  <defs>
+    <linearGradient id="body" x1="214" y1="286" x2="758" y2="832" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1597f5"/>
+      <stop offset=".48" stop-color="#248ced"/>
+      <stop offset="1" stop-color="#77bdf4"/>
+    </linearGradient>
+    <linearGradient id="left-fold" x1="291" y1="361" x2="337" y2="697" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#073e89"/>
+      <stop offset=".35" stop-color="#1671d7"/>
+      <stop offset=".7" stop-color="#338fe9"/>
+      <stop offset="1" stop-color="#3887d8"/>
+    </linearGradient>
+    <linearGradient id="upper-face" x1="305" y1="195" x2="701" y2="407" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3bb9f6"/>
+      <stop offset=".38" stop-color="#198df4"/>
+      <stop offset="1" stop-color="#0877ee"/>
+    </linearGradient>
+    <radialGradient id="upper-light" cx="407" cy="164" r="488" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#68d9f8" stop-opacity=".36"/>
+      <stop offset="1" stop-color="#1a9bfa" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="upper-return" x1="747" y1="350" x2="800" y2="404" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0753a8"/>
+      <stop offset="1" stop-color="#0879cf"/>
+    </linearGradient>
+    <linearGradient id="lower-return" x1="784" y1="661" x2="819" y2="700" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4e9ee8"/>
+      <stop offset="1" stop-color="#c2eeff"/>
+    </linearGradient>
+    <linearGradient id="lower-face" x1="322" y1="571" x2="613" y2="907" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#a9e6fc"/>
+      <stop offset=".35" stop-color="#83ccf7"/>
+      <stop offset=".72" stop-color="#6bb8f4"/>
+      <stop offset="1" stop-color="#65a8ef"/>
+    </linearGradient>
+    <linearGradient id="lower-highlight" x1="513" y1="686" x2="513" y2="837" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#d2f4ff" stop-opacity=".34"/>
+      <stop offset=".4" stop-color="#a1ddff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="bezel" x1="381" y1="361" x2="775" y2="698" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071622"/>
+      <stop offset=".52" stop-color="#06101b"/>
+      <stop offset="1" stop-color="#0b1d2c"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="390" y1="374" x2="719" y2="694" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#183247"/>
+      <stop offset=".5" stop-color="#102438"/>
+      <stop offset="1" stop-color="#051525"/>
+    </linearGradient>
+    <radialGradient id="screen-light" cx="497" cy="527" r="257" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#42819a" stop-opacity=".29"/>
+      <stop offset="1" stop-color="#254c6c" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tablet-rim" x1="773" y1="356" x2="773" y2="699" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#81a6ba" stop-opacity=".65"/>
+      <stop offset=".25" stop-color="#b7dce8" stop-opacity=".9"/>
+      <stop offset=".8" stop-color="#51728d" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#243e57" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="code-lines" x1="345" y1="431" x2="594" y2="674" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6795aa" stop-opacity=".14"/>
+      <stop offset=".5" stop-color="#7396a4" stop-opacity=".09"/>
+      <stop offset="1" stop-color="#7fa4b4" stop-opacity=".19"/>
+    </linearGradient>
+    <filter id="bracket-glow" x="-.45" y="-.35" width="1.9" height="1.7" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="13"/>
+    </filter>
+    <clipPath id="screen-clip">
+      <path d="M490 374H738Q759 374 759 395V666Q759 690 738 690H489C405 690 341 619 341 531S406 374 490 374Z"/>
+    </clipPath>
+    <path id="left-bracket" d="M459 445Q465 439 468 446L481 471Q484 477 478 481L416 531L479 582Q484 586 480 593L469 616Q465 624 459 618L375 550Q365 542 365 531T376 512Z"/>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#fff"/>
+
+  <g id="folded-body">
+    <path fill="url(#body)" d="M493 190H825Q853 190 853 219V326Q853 346 838 360L780 413V658L834 683Q853 692 853 718V805Q853 837 823 837H493C314 837 172 695 172 524S314 190 493 190Z"/>
+    <path fill="url(#left-fold)" d="M173 524C219 410 339 354 490 354C397 354 323 433 323 531C323 622 397 691 490 691C341 691 218 649 173 547Z"/>
+    <path fill="url(#upper-return)" d="M740 353H817Q826 353 817 365L780 413V393Q780 363 751 357Z"/>
+    <path fill="url(#lower-return)" d="M777 656L836 684Q844 688 848 697L773 698Z"/>
+  </g>
+
+  <g id="tablet">
+    <path fill="url(#bezel)" d="M491 354H743C765 354 780 371 780 394V665Q780 708 741 708H490C397 708 323 629 323 531S397 354 491 354Z"/>
+    <path fill="url(#screen)" d="M490 374H738Q759 374 759 395V666Q759 690 738 690H489C405 690 341 619 341 531S406 374 490 374Z"/>
+    <g clip-path="url(#screen-clip)">
+      <rect x="341" y="374" width="418" height="316" fill="url(#screen-light)"/>
+      <g fill="none" stroke="url(#code-lines)" stroke-width="7" stroke-linecap="round">
+        <path d="M362 438H465M378 452H517M379 467H442M379 482H453"/>
+        <path d="M382 545H491M505 545H570M396 560H512M380 575H452"/>
+        <path d="M379 613H513M399 628H476M395 644H514M448 658H606M395 674H468"/>
+      </g>
+      <path d="M335 495V500M335 512V516M335 530V534M335 547V551M361 587V594"
+            fill="none" stroke="#759bae" stroke-opacity=".1" stroke-width="4" stroke-linecap="round"/>
+      <g id="code-brackets" transform="translate(50.5 .6)">
+        <g fill="#9cddf5" opacity=".46" filter="url(#bracket-glow)">
+          <use href="#left-bracket"/>
+          <use href="#left-bracket" transform="translate(1027 0) scale(-1 1)"/>
+        </g>
+        <g fill="#edfbff">
+          <use href="#left-bracket"/>
+          <use href="#left-bracket" transform="translate(1027 0) scale(-1 1)"/>
+        </g>
+      </g>
+    </g>
+    <path d="M747 354C767 355 780 372 780 395V665Q780 684 774 694"
+          fill="none" stroke="url(#tablet-rim)" stroke-width="3.2"/>
+  </g>
+
+  <g id="upper-ribbon">
+    <path id="upper-surface" fill="url(#upper-face)" d="M173 524C165 354 311 190 493 190H825Q853 190 853 219V326Q853 344 838 354H490C344 353 223 406 173 524Z"/>
+    <use href="#upper-surface" fill="url(#upper-light)"/>
+    <path d="M175 494C185 335 324 192 493 192H824Q848 192 851 214"
+          fill="none" stroke="#71d9f9" stroke-opacity=".38" stroke-width="2.5"/>
+  </g>
+
+  <g id="lower-ribbon">
+    <path id="lower-surface" fill="url(#lower-face)" d="M173 524C185 623 314 691 489 691H823Q853 691 853 721V805Q853 837 823 837H493C314 837 172 695 173 524Z"/>
+    <use href="#lower-surface" fill="url(#lower-highlight)"/>
+    <path d="M177 545C205 634 326 691 489 691H823Q849 691 851 715"
+          fill="none" stroke="#c5edff" stroke-opacity=".48" stroke-width="2.4"/>
+    <path d="M493 835H822Q847 835 851 810"
+          fill="none" stroke="#4794dc" stroke-opacity=".45" stroke-width="1.5"/>
+  </g>
+</svg>

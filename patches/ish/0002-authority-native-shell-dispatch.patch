@@ -1,0 +1,423 @@
+--- a/kernel/native_offload.h
++++ b/kernel/native_offload.h
+@@ -57,11 +57,26 @@
+ typedef int (*native_handler_func)(int argc, char **argv,
+                                    int stdin_fd, int stdout_fd, int stderr_fd);
+ 
++// Task-aware form used by the process authority. Unlike the legacy callback, this receives the
++// original guest argv/envp and current task, so authority can preserve cwd, owner, pgrp and streams
++// in the existing session. Return negative errno before effects to let guest exec continue; after
++// effects, return a real exit code and set term_signal only for an observed signal completion.
++typedef int (*native_task_handler_func)(struct task *task, const char *guest_file, size_t argc,
++                                        const char *argv, const char *envp,
++                                        int stdin_fd, int stdout_fd, int stderr_fd,
++                                        int *term_signal);
++typedef int (*native_task_preflight_func)(struct task *task, const char *guest_file,
++                                          size_t argc, const char *argv, const char *envp);
++typedef bool (*native_task_abort_func)(struct task *task, int sig);
++
+ // Register an in-process handler for a guest binary name.
+ // When guest execve() basename matches guest_name, handler is called
+ // instead of emulating the binary. Takes priority over host binary lookup.
+ // Returns 0 on success, -1 if registry is full.
+ int native_offload_add_handler(const char *guest_name, native_handler_func handler);
++int native_offload_add_task_handler(const char *guest_name,
++                                    native_task_preflight_func preflight,
++                                    native_task_handler_func handler);
+ 
+ // [T-ish-offload-signal-forward] Abort callback for an in-process handler.
+ //
+@@ -93,6 +108,8 @@
+ // Optional: a handler without one simply cannot be interrupted, which is the
+ // pre-existing behaviour for every offload.
+ int native_offload_set_abort_handler(const char *guest_name, native_abort_func abort_fn);
++int native_offload_set_task_abort_handler(const char *guest_name,
++                                          native_task_abort_func abort_fn);
+ 
+ // Register a host binary offload (macOS CLI only, uses posix_spawn).
+ // spec is "name" or "name=/host/path". Returns 0 on success.
+@@ -119,6 +136,11 @@
+                         const char *guest_file,
+                         size_t argc, const char *argv,
+                         const char *envp);
++
++// Dispatch a task-aware authority handler only when execve found no guest file at guest_file.
++// Returns -ENOENT when no task-aware entry matches; preflight failures remain errors.
++int native_offload_exec_missing(const char *guest_file, size_t argc,
++                                const char *argv, const char *envp);
+ 
+ // Forward a signal to the native work backing a task, covering BOTH offload
+ // shapes:
+--- a/kernel/native_offload.c
++++ b/kernel/native_offload.c
+@@ -56,10 +56,24 @@
+     (void)native_path; (void)guest_file; (void)argc; (void)argv; (void)envp;
+     return _ENOSYS;
+ }
++int native_offload_exec_missing(const char *guest_file, size_t argc,
++                                const char *argv, const char *envp) {
++    (void)guest_file; (void)argc; (void)argv; (void)envp;
++    return _ENOENT;
++}
+ bool native_offload_forward_signal(struct task *task, int sig) {
+     (void)task; (void)sig; return false;
+ }
+ int native_offload_set_abort_handler(const char *guest_name, native_abort_func abort_fn) {
++    (void)guest_name; (void)abort_fn; return -1;
++}
++int native_offload_add_task_handler(const char *guest_name,
++                                    native_task_preflight_func preflight,
++                                    native_task_handler_func handler) {
++    (void)guest_name; (void)preflight; (void)handler; return -1;
++}
++int native_offload_set_task_abort_handler(const char *guest_name,
++                                          native_task_abort_func abort_fn) {
+     (void)guest_name; (void)abort_fn; return -1;
+ }
+ #else
+@@ -70,9 +84,12 @@
+     char *guest_name;
+     char *native_path;           // NULL if using handler
+     native_handler_func handler; // non-NULL for in-process execution
++    native_task_handler_func task_handler;
++    native_task_preflight_func task_preflight;
+     // [T-ish-offload-signal-forward] Optional: lets a wedged in-process handler
+     // be asked to stop waiting when the guest task is signalled.
+     native_abort_func abort_fn;
++    native_task_abort_func task_abort_fn;
+ };
+ 
+ static struct offload_entry offload_entries[NATIVE_OFFLOAD_MAX];
+@@ -166,8 +183,25 @@
+     e->guest_name = strdup(guest_name);
+     e->native_path = NULL;
+     e->handler = handler;
++    e->task_handler = NULL;
++    e->task_preflight = NULL;
+     e->abort_fn = NULL;
++    e->task_abort_fn = NULL;
+     fprintf(stderr, "native_offload: %s → [builtin]\n", guest_name);
++    return 0;
++}
++
++int native_offload_add_task_handler(const char *guest_name,
++                                    native_task_preflight_func preflight,
++                                    native_task_handler_func handler) {
++    if (!guest_name || !preflight || !handler || offload_count >= NATIVE_OFFLOAD_MAX) return -1;
++    struct offload_entry *e = &offload_entries[offload_count++];
++    memset(e, 0, sizeof(*e));
++    e->guest_name = strdup(guest_name);
++    e->task_handler = handler;
++    e->task_preflight = preflight;
++    if (!e->guest_name) { offload_count--; return -1; }
++    fprintf(stderr, "native_offload: %s → [authority handler]\n", guest_name);
+     return 0;
+ }
+ 
+@@ -183,6 +217,17 @@
+             return -1;   // posix_spawn offload — signals already go via kill()
+         offload_entries[i].abort_fn = abort_fn;
+         fprintf(stderr, "native_offload: %s abort handler registered\n", guest_name);
++        return 0;
++    }
++    return -1;
++}
++
++int native_offload_set_task_abort_handler(const char *guest_name,
++                                          native_task_abort_func abort_fn) {
++    for (int i = 0; i < offload_count; i++) {
++        if (strcmp(offload_entries[i].guest_name, guest_name) != 0) continue;
++        if (offload_entries[i].task_handler == NULL) return -1;
++        offload_entries[i].task_abort_fn = abort_fn;
+         return 0;
+     }
+     return -1;
+@@ -369,24 +414,22 @@
+     // notifications into a killed transcode. SIGKILL/SIGTERM/SIGINT/SIGQUIT/
+     // SIGHUP are the ones whose whole meaning is "stop now"; everything else
+     // falls through to normal guest delivery (harmlessly queued, as today).
+-    struct offload_entry *entry = (struct offload_entry *) task->native_offload_entry;
+-    if (entry == NULL || entry->abort_fn == NULL)
++    struct offload_entry *entry = (struct offload_entry *)
++        __atomic_load_n(&task->native_offload_entry, __ATOMIC_ACQUIRE);
++    if (entry == NULL || (entry->abort_fn == NULL && entry->task_abort_fn == NULL))
+         return false;
+     if (sig != SIGKILL_ && sig != SIGTERM_ && sig != SIGINT_ &&
+         sig != SIGQUIT_ && sig != SIGHUP_)
+         return false;
+ 
+-    // Deliberately NOT consuming the signal (returns false after the callback):
+-    // the abort only asks the handler to unblock. The handler then returns
+-    // normally and exec_handler calls do_exit() — but do_exit() runs on the
+-    // task's own thread, and only the guest signal machinery knows the right
+-    // exit status for a killed task. Letting the signal continue to normal
+-    // delivery keeps `kill -9` reporting the usual killed-by-signal status
+-    // instead of the handler's own return code.
+-    bool aborting = entry->abort_fn(sig);
++    // Legacy callbacks only request an unblock and leave status to guest signal delivery. A
++    // task-aware callback routes the signal into its authority-owned child; on acceptance the task
++    // waits for that child to stop and exits with its observed signal status, so consume it here.
++    bool task_aware = entry->task_abort_fn != NULL;
++    bool aborting = task_aware ? entry->task_abort_fn(task, sig) : entry->abort_fn(sig);
+     printk("native_offload: signal %d → in-process handler %s abort (%s)\n",
+            sig, entry->guest_name, aborting ? "accepted" : "declined");
+-    return false;
++    return task_aware && aborting;
+ }
+ 
+ // --- Post-exec: scan for new files and register in fakefs DB ---
+@@ -630,37 +673,56 @@
+ 
+ // --- In-process handler execution (works on both macOS and iOS) ---
+ 
+-static int exec_handler(native_handler_func handler, const char *guest_file,
++static int exec_handler(native_handler_func handler, native_task_handler_func task_handler,
++                        native_task_preflight_func task_preflight, const char *guest_file,
+                         size_t argc, const char *argv, const char *envp) {
+-    (void)envp;
++    bool task_aware = task_handler != NULL;
++    if (task_aware) {
++        if (task_preflight == NULL)
++            return _ENOEXEC;
++        // Publish the task callback before preflight so signals during admission are queued. A
++        // refusal replays them to the unchanged guest task and falls back before touching stdio.
++        __atomic_store_n(&current->native_offload_session, 0, __ATOMIC_RELEASE);
++        __atomic_store_n(&current->native_offload_pending_signals, 0, __ATOMIC_RELEASE);
++        __atomic_store_n(&current->native_offload_entry, offload_find(guest_file), __ATOMIC_RELEASE);
++        int preflight = task_preflight(current, guest_file, argc, argv, envp);
++        if (preflight < 0) {
++            __atomic_store_n(&current->native_offload_entry, NULL, __ATOMIC_RELEASE);
++            uint32_t pending = __atomic_exchange_n(&current->native_offload_pending_signals, 0,
++                                                    __ATOMIC_ACQ_REL);
++            for (int sig = 1; sig < 32; sig++)
++                if ((pending & (1u << sig)) != 0)
++                    send_signal(current, sig, SIGINFO_NIL);
++            return preflight;
++        }
++    }
++
+     const char *root_source = get_root_source();
+-
+-    // Build argc/argv for the handler, translating guest paths to host paths.
+-    // Unlike posix_spawn path (which uses DYLD interpose for transparent
+-    // redirection), in-process handlers need explicit path translation.
+-    char **handler_argv = calloc(argc + 1, sizeof(char *));
+-    if (!handler_argv) return _ENOMEM;
+-
+-    const char *p = argv;
+-    for (size_t i = 0; i < argc; i++) {
+-        // Absolute guest path → host path, honoring bind mounts first.
+-        // Skip URLs (anything containing "://") which are not filesystem paths.
+-        if (root_source && p[0] == '/' && !strstr(p, "://")) {
+-            char host_path[PATH_MAX];
+-            if (build_host_path_for_guest(p, host_path, sizeof(host_path)))
+-                handler_argv[i] = strdup(host_path);
+-            else
++    char **handler_argv = NULL;
++    if (!task_aware) {
++        // Legacy handlers receive host-translated argv; authority handlers keep raw guest strings.
++        handler_argv = calloc(argc + 1, sizeof(char *));
++        if (!handler_argv) return _ENOMEM;
++        const char *p = argv;
++        for (size_t i = 0; i < argc; i++) {
++            if (root_source && p[0] == '/' && !strstr(p, "://")) {
++                char host_path[PATH_MAX];
++                if (build_host_path_for_guest(p, host_path, sizeof(host_path)))
++                    handler_argv[i] = strdup(host_path);
++                else
++                    handler_argv[i] = strdup(p);
++            } else {
+                 handler_argv[i] = strdup(p);
+-        } else {
+-            handler_argv[i] = strdup(p);
++            }
++            p += strlen(p) + 1;
+         }
+-        p += strlen(p) + 1;
+-    }
+-    handler_argv[argc] = NULL;
++        handler_argv[argc] = NULL;
++    }
+ 
+     printk("native_offload: [builtin] %s (pid %d)\n", guest_file, current->pid);
+ 
+-    // Get guest stdio fds (retain for forwarding threads)
++    // Retain the guest stream objects. Authority preflight has already completed, so no rejected
++    // native candidate can cause the offload bridge to read input or start forwarding threads.
+     struct fd *guest_stdin = NULL, *guest_stdout = NULL, *guest_stderr = NULL;
+     lock(&current->files->lock);
+     if (current->files->files[0]) guest_stdin  = fd_retain(current->files->files[0]);
+@@ -668,37 +730,29 @@
+     if (current->files->files[2]) guest_stderr = fd_retain(current->files->files[2]);
+     unlock(&current->files->lock);
+ 
+-    // Create pipes: handler writes to pipe write-end, forwarding thread reads
+-    // from pipe read-end and writes through guest fd ops (TTY driver on iOS).
+     int stdout_pipe[2] = {-1, -1}, stderr_pipe[2] = {-1, -1};
+     int handler_stdin = -1, handler_stdout = -1, handler_stderr = -1;
+-
+     if (guest_stdin && guest_stdin->real_fd >= 0)
+         handler_stdin = guest_stdin->real_fd;
+-
+     if (guest_stdout && pipe(stdout_pipe) == 0)
+         handler_stdout = stdout_pipe[1];
+     else
+         stdout_pipe[0] = stdout_pipe[1] = -1;
+-
+     if (guest_stderr && pipe(stderr_pipe) == 0)
+         handler_stderr = stderr_pipe[1];
+     else
+         stderr_pipe[0] = stderr_pipe[1] = -1;
+ 
++    // Exec state changes happen before the task-aware callback can start user code.
+     apply_exec_semantics(guest_file);
+ 
+-    // Start pipe forwarding threads — write through guest fd ops
+-    // so data reaches iOS Terminal UI (via TTY driver)
+     pthread_t stdout_tid = 0, stderr_tid = 0;
+     if (stdout_pipe[0] >= 0 && guest_stdout)
+         stdout_tid = start_pipe_forward_guest(stdout_pipe[0], guest_stdout);
+     if (stderr_pipe[0] >= 0 && guest_stderr)
+         stderr_tid = start_pipe_forward_guest(stderr_pipe[0], guest_stderr);
+ 
+-    // Resolve host paths for handler: it may need to read/write files
+-    // in the fakefs data directory. Set cwd to host CWD.
+-    char *host_cwd = get_host_cwd();
++    char *host_cwd = task_aware ? NULL : get_host_cwd();
+     char saved_cwd[PATH_MAX];
+     bool cwd_changed = false;
+     if (host_cwd) {
+@@ -707,40 +761,49 @@
+         free(host_cwd);
+     }
+ 
+-    // [T-ish-offload-signal-forward] Publish which offload this task is running
+-    // so native_offload_forward_signal can find its abort callback while the
+-    // handler is in flight. Set immediately before the call and cleared right
+-    // after, so a signal can only reach the callback during the window when the
+-    // handler is genuinely running. `entry` points into the static registry,
+-    // which outlives every task.
+-    current->native_offload_entry = offload_find(guest_file);
+-
+-    // Call the handler in-process
+-    int ret = handler((int)argc, handler_argv, handler_stdin, handler_stdout, handler_stderr);
+-
+-    current->native_offload_entry = NULL;
+-
+-    // Close write ends so forwarding threads see EOF
++    if (!task_aware) {
++        __atomic_store_n(&current->native_offload_session, 0, __ATOMIC_RELEASE);
++        __atomic_store_n(&current->native_offload_pending_signals, 0, __ATOMIC_RELEASE);
++        __atomic_store_n(&current->native_offload_entry, offload_find(guest_file), __ATOMIC_RELEASE);
++    }
++
++    int term_signal = 0;
++    int ret = task_aware
++        ? task_handler(current, guest_file, argc, argv, envp,
++                       handler_stdin, handler_stdout, handler_stderr, &term_signal)
++        : handler((int)argc, handler_argv, handler_stdin, handler_stdout, handler_stderr);
++
++    __atomic_store_n(&current->native_offload_entry, NULL, __ATOMIC_RELEASE);
++    __atomic_store_n(&current->native_offload_session, 0, __ATOMIC_RELEASE);
++
+     if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+     if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
+     if (stdout_tid) pthread_join(stdout_tid, NULL);
+     if (stderr_tid) pthread_join(stderr_tid, NULL);
+-
+-    // Restore cwd
+     if (cwd_changed)
+         (void)chdir(saved_cwd);
+-
+-    // Release guest fd references (forwarding threads already released theirs)
+     if (guest_stdin) fd_close(guest_stdin);
+     if (guest_stdout) fd_close(guest_stdout);
+     if (guest_stderr) fd_close(guest_stderr);
+-
+     native_free_string_array(handler_argv);
+ 
+-    int exit_code = ret << 8;
++    if (task_aware && ret < 0) {
++        // Preflight was accepted and exec semantics committed. Never fall back after commit; the
++        // NativeBackend.start contract guarantees a failed start ran no user code.
++        uint32_t pending = __atomic_exchange_n(&current->native_offload_pending_signals, 0,
++                                                __ATOMIC_ACQ_REL);
++        for (int sig = 1; sig < 32; sig++)
++            if ((pending & (1u << sig)) != 0)
++                send_signal(current, sig, SIGINFO_NIL);
++        printk("native_offload: authority start/wait failed for %s: %d\n", guest_file, ret);
++        do_exit(127 << 8);
++        __builtin_unreachable();
++    }
++
++    int exit_code = term_signal > 0 ? term_signal : ret << 8;
+     printk("native_offload: [builtin] %s exited with code %d\n", guest_file, ret);
+-
+-    register_new_files(argc, argv);
++    if (!task_aware)
++        register_new_files(argc, argv);
+     do_exit(exit_code);
+     __builtin_unreachable();
+ }
+@@ -886,8 +949,9 @@
+                         const char *envp) {
+     // Check for in-process handler first (works on iOS and macOS)
+     struct offload_entry *entry = offload_find(guest_file);
+-    if (entry && entry->handler)
+-        return exec_handler(entry->handler, guest_file, argc, argv, envp);
++    if (entry && (entry->handler || entry->task_handler))
++        return exec_handler(entry->handler, entry->task_handler, entry->task_preflight,
++                            guest_file, argc, argv, envp);
+ 
+ #ifdef HAS_POSIX_SPAWN
+     // posix_spawn path (macOS only, native_path must be valid)
+@@ -901,4 +965,17 @@
+ #endif
+ }
+ 
++int native_offload_exec_missing(const char *guest_file, size_t argc,
++                                const char *argv, const char *envp) {
++    struct offload_entry *entry = offload_find(guest_file);
++    if (entry == NULL || entry->task_handler == NULL || entry->task_preflight == NULL)
++        return _ENOENT;
++    if (!native_offload_path_allowed(entry->guest_name, guest_file) ||
++        native_offload_env_disabled(entry->guest_name, envp) ||
++        native_offload_name_is_generic(entry->guest_name))
++        return _ENOENT;
++    return exec_handler(NULL, entry->task_handler, entry->task_preflight,
++                        guest_file, argc, argv, envp);
++}
++
+ #endif // __APPLE__
+--- a/kernel/task.h
++++ b/kernel/task.h
+@@ -147,6 +147,10 @@
+     // Points into the static offload registry, which lives for the process
+     // lifetime, so it never dangles. NULL when not in a handler.
+     void *native_offload_entry;
++    // Process authority session ID backing a task-aware in-process offload. Accessed atomically by
++    // the guest execution thread and signal-delivery threads; zero outside the active callback.
++    uint64_t native_offload_session;
++    uint32_t native_offload_pending_signals;
+ 
+     // current condition/lock, so it can be notified in case of a signal
+     cond_t *waiting_cond;
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -671,8 +671,15 @@
+         current->group->v8_aborting = false;
+ 
+     struct fd *fd = generic_open(file, O_RDONLY, 0);
+-    if (IS_ERR(fd))
++    if (IS_ERR(fd)) {
++        int open_err = PTR_ERR(fd);
++        if (open_err == -ENOENT) {
++            int offload_err = native_offload_exec_missing(file, argv.count, argv.args, envp.args);
++            if (offload_err != -ENOENT)
++                return offload_err;
++        }
+         return PTR_ERR(fd);
++    }
+ 
+     // [T-ish-exec-fewer-meta-txns] generic_open just stat'ed this fd for its
+     // own access check; reuse that instead of a second fstat, which on fakefs

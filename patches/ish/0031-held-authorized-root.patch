@@ -1,0 +1,151 @@
+From: CodiPad
+Subject: Retain authorized realfs directory descriptors through mount publication
+
+--- a/fs/mount.c
++++ b/fs/mount.c
+@@ -95,22 +95,30 @@
+     unlock(&mounts_lock);
+ }
+
+-int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags) {
++static int do_mount_impl(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags, int borrowed_root_fd) {
+     struct mount *new_mount = malloc(sizeof(struct mount));
+     if (new_mount == NULL)
+         return _ENOMEM;
+     new_mount->point = strdup(point);
+     new_mount->source = strdup(source);
+     new_mount->info = strdup(info);
++    if (new_mount->point == NULL || new_mount->source == NULL || new_mount->info == NULL) {
++        free((void *) new_mount->point);
++        free((void *) new_mount->source);
++        free((void *) new_mount->info);
++        free(new_mount);
++        return _ENOMEM;
++    }
+     new_mount->flags = flags;
+     new_mount->fs = fs;
+     new_mount->data = NULL;
+     new_mount->refcount = 0;
+     if (fs->mount) {
+-        int err = fs->mount(new_mount);
++        int err = borrowed_root_fd >= 0 ? realfs_mount_fd(new_mount, borrowed_root_fd) : fs->mount(new_mount);
+         if (err < 0) {
+             free((void *) new_mount->point);
+             free((void *) new_mount->source);
++            free((void *) new_mount->info);
+             free(new_mount);
+             return err;
+         }
+@@ -129,6 +137,17 @@
+     global_mount_version++;
+
+     return 0;
++}
++
++int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags) {
++    return do_mount_impl(fs, source, point, info, flags, -1);
++}
++
++// Caller holds mounts_lock and keeps the borrowed descriptor live through this call.
++int do_mount_realfs_fd(const char *source, const char *point, int borrowed_root_fd) {
++    if (borrowed_root_fd < 0)
++        return _EBADF;
++    return do_mount_impl(&realfs, source, point, "", 0, borrowed_root_fd);
+ }
+
+ int mount_remove(struct mount *mount) {
+--- a/fs/real.c
++++ b/fs/real.c
+@@ -414,7 +414,36 @@
+     return size;
+ }
+
++// Map against the live held root, never the source label or global bind-mount substitutions.
++static int realfs_getpath_held(struct fd *fd, char *buf) {
++    struct stat root, current, reachable;
++    if (fstat(fd->mount->root_fd, &root) < 0 || fstat(fd->real_fd, &current) < 0)
++        return errno_map();
++    if (root.st_dev == current.st_dev && root.st_ino == current.st_ino) {
++        buf[0] = '\0';
++        return 0;
++    }
++    char root_path[MAX_PATH], current_path[MAX_PATH];
++    if (getpath(fd->mount->root_fd, root_path) < 0 || getpath(fd->real_fd, current_path) < 0)
++        return errno_map();
++    size_t length = strlen(root_path);
++    if (strncmp(current_path, root_path, length) != 0 ||
++        (length > 1 && current_path[length] != '/'))
++        return _EXDEV;
++    const char *relative = length == 1 ? current_path : current_path + length;
++    if (relative[0] != '/' || relative[1] == '\0')
++        return _EXDEV;
++    if (fstatat(fd->mount->root_fd, relative + 1, &reachable, AT_SYMLINK_NOFOLLOW) < 0)
++        return errno_map();
++    if (reachable.st_dev != current.st_dev || reachable.st_ino != current.st_ino)
++        return _EXDEV;
++    strlcpy(buf, relative, MAX_PATH);
++    return 0;
++}
++
+ int realfs_getpath(struct fd *fd, char *buf) {
++    if (fd->mount->fs == &realfs)
++        return realfs_getpath_held(fd, buf);
+     int err = getpath(fd->real_fd, buf);
+     if (err < 0)
+         return err;
+@@ -688,6 +717,25 @@
+     mount->root_fd = open(mount->source, O_DIRECTORY);
+     if (mount->root_fd < 0)
+         return errno_map();
++    return 0;
++}
++
++// The source string is display/guest identity only; never reopen it for authority.
++int realfs_mount_fd(struct mount *mount, int borrowed_root_fd) {
++    struct stat metadata;
++    if (fstat(borrowed_root_fd, &metadata) < 0)
++        return errno_map();
++    if (!S_ISDIR(metadata.st_mode))
++        return _ENOTDIR;
++    int owned = fcntl(borrowed_root_fd, F_DUPFD_CLOEXEC, 0);
++    if (owned < 0)
++        return errno_map();
++    mount->root_fd = owned;
++    return 0;
++}
++
++int realfs_umount(struct mount *mount) {
++    close(mount->root_fd);
+     return 0;
+ }
+
+@@ -799,7 +847,7 @@
+
+ const struct fs_ops realfs = {
+     .name = "real", .magic = 0x7265616c,
+-    .mount = realfs_mount,
++    .mount = realfs_mount, .umount = realfs_umount,
+     .statfs = realfs_statfs,
+
+     .open = realfs_open,
+--- a/fs/real.h
++++ b/fs/real.h
+@@ -5,6 +5,7 @@
+
+ extern const struct fd_ops realfs_fdops;
+ extern const struct fs_ops realfs;
++int realfs_mount_fd(struct mount *mount, int borrowed_root_fd);
+
+ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mode);
+
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -94,6 +94,8 @@
+
+ // must hold mounts_lock while calling these, or traversing mounts
+ int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags);
++// Borrowed host directory fd is duplicated; source is an explicitly validated canonical name.
++int do_mount_realfs_fd(const char *source, const char *point, int borrowed_root_fd);
+ int do_umount(const char *point);
+ int mount_remove(struct mount *mount);
+ extern struct list mounts;

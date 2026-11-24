@@ -1,0 +1,35 @@
+--- a/asbestos/guest-arm64/crypto_helpers.c
++++ b/asbestos/guest-arm64/crypto_helpers.c
+@@ -747,7 +747,7 @@
+ void pmull_helper(uint8_t *rd, uint8_t *rn, uint8_t *rm, uint32_t Q, uint32_t size) {
+     if (size == 0) {
+         // 8-bit polynomial multiply: 8 pairs of bytes -> 8 halfwords
+-        uint16_t *dst = (uint16_t *)rd;
++        uint16_t result_lanes[8];
+         uint8_t *src_n = Q ? &rn[8] : rn;
+         uint8_t *src_m = Q ? &rm[8] : rm;
+ 
+@@ -760,8 +760,10 @@
+                     result ^= a << j;
+                 }
+             }
+-            dst[i] = result;
+-        }
++            result_lanes[i] = result;
++        }
++        // Sources may alias Vd; consume all lanes before writing the result.
++        memcpy(rd, result_lanes, sizeof(result_lanes));
+     } else if (size == 3) {
+         // 64-bit polynomial multiply: 1 pair of 64-bit -> 128-bit
+         uint64_t *src_n = (uint64_t *)rn;
+@@ -898,6 +900,10 @@
+  * USHR immediate helper - unsigned shift right
+  */
+ void ushr_imm_helper(uint8_t *rd, uint8_t *rn, int shift, int esize, int Q) {
++    if (shift == (8 << esize)) {
++        memset(rd, 0, 16);
++        return;
++    }
+     if (esize == 0) {
+         // 8-bit elements
+         int count = Q ? 16 : 8;

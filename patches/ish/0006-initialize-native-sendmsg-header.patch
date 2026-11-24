@@ -1,0 +1,13 @@
+diff --git a/fs/sock.c b/fs/sock.c
+--- a/fs/sock.c
++++ b/fs/sock.c
+@@ -1430,7 +1430,7 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
+     if (fd_is_netlink_stub(sock))
+         return netlink_stub_sendmsg(sock, msghdr_addr);
+ 
+     // Read the guest msghdr struct into our internal 32-bit representation
+-    struct msghdr msg;
++    struct msghdr msg = {0};
+     struct msghdr_ msg_fake;
+ #ifdef GUEST_ARM64
+     struct msghdr64_ msg_fake64;

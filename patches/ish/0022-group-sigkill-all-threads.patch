@@ -1,0 +1,22 @@
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -164,7 +164,18 @@
+     }
+     struct tgroup *tgroup;
+     list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
+-        send_signal(tgroup->leader, sig, info);
++        if (sig == SIGKILL_) {
++            // The leader can be waiting for a memory writer lock while a
++            // sibling still owns a reader lock. It cannot enter group exit
++            // to interrupt that sibling until the reader leaves. Fatal group
++            // delivery must therefore reach every live thread directly.
++            // pids_lock keeps group membership and task lifetime stable.
++            struct task *thread;
++            list_for_each_entry(&tgroup->threads, thread, group_links)
++                send_signal(thread, sig, info);
++        } else {
++            send_signal(tgroup->leader, sig, info);
++        }
+     }
+     unlock(&pids_lock);
+     return 0;

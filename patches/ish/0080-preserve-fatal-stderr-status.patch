@@ -1,0 +1,207 @@
+diff --git a/kernel/fs.c b/kernel/fs.c
+index a929867..02e0226 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -264,84 +264,7 @@ dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
+     return res;
+ }
+ 
+-// Silently drop V8 fatal-abort chatter on stderr. V8 prints the fatal
+-// preamble ("# Fatal error...", stack dump) to stderr BEFORE executing
+-// BRK #0 — by the time our SIGTRAP handler fires in signal.c, the text
+-// is already on the host terminal. Catching the prefixes at sys_write
+-// lets us pretend the bytes went through while dropping them.
+-//
+-// IMPORTANT: Keep the prefix list VERY narrow — these are signatures
+-// that essentially only V8's internal abort path emits. Once any ONE
+-// is detected in a tgroup, every subsequent stderr write from that
+-// tgroup is dropped (see v8_aborting flag). A false positive means
+-// the rest of the program's stderr is lost, so we favor missing V8
+-// noise over swallowing legitimate user output.
+-static bool v8_abort_prefix(const char *buf, size_t size) {
+-    if (size == 0) return false;
+-    static const char *const prefixes[] = {
+-        "# Fatal error in ",              // V8_Fatal preamble
+-        "# Check failed:",                // V8 CHECK macro
+-        "#FailureMessage Object",         // V8 FailureMessage dump
+-        "----- Native stack trace -----", // V8 stack trace banner
+-        "----- JavaScript stack trace -----",
+-        "Attempt to print stack while printing stack",
+-        "<--- Last few GCs --->",          // V8 OOM dump
+-        // V8's FATAL() macro prints "FATAL ERROR: <reason>\n". Match on
+-        // the specific V8/Node prefixes after "FATAL ERROR: " to avoid
+-        // silencing user programs that happen to use the same banner.
+-        "FATAL ERROR: v8::",               // e.g. v8::HandleScope::Create...
+-        "FATAL ERROR: CALL_AND_RETRY_",    // V8 heap OOM
+-        "FATAL ERROR: MarkCompactCollector",
+-        "FATAL ERROR: Reached heap limit", // OOM
+-        "FATAL ERROR: Scavenger",
+-        "FATAL ERROR: NewSpace",
+-        // V8 Runtime_Abort prints "abort: <reason>\n" via OS::PrintError.
+-        // Known V8 abort reasons from src/runtime/runtime-internal.cc's
+-        // GetAbortReason enum. Match only these specific strings so
+-        // user programs that happen to print "abort: config not found"
+-        // (etc.) aren't silenced.
+-        "abort: Invalid bytecode",
+-        "abort: Unreachable",
+-        "abort: kOperandIsNotAFunction",
+-        "abort: kOperandIsNotACallable",
+-        "abort: kExpectedFeedbackVector",
+-        "abort: kInvalidJumpTableIndex",
+-        "abort: kStackFrameTypesMustMatch",
+-        "abort: kUnexpectedFunctionKind",
+-    };
+-    // V8 sometimes coalesces the fatal banner with a leading "#\n" (an
+-    // empty comment line) or surrounding preamble into a single write.
+-    // Scan the first 256 bytes of the buffer rather than strictly matching
+-    // from offset 0 so the multi-line banner is detected on whichever
+-    // write carries the signature string.
+-    size_t scan = size < 256 ? size : 256;
+-    for (size_t i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+-        size_t n = strlen(prefixes[i]);
+-        if (scan < n) continue;
+-        if (memmem(buf, scan, prefixes[i], n) != NULL)
+-            return true;
+-    }
+-    return false;
+-}
+-
+ static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
+-    // Filter V8 fatal-abort chatter on stderr (fd 2).
+-    // ISH_V8_NO_MUTE=1 bypasses the filter for debugging so we can see
+-    // the actual crash output V8/Node writes before aborting.
+-    static int mute_disabled = -1;
+-    if (mute_disabled < 0)
+-        mute_disabled = (getenv("ISH_V8_NO_MUTE") != NULL) ? 1 : 0;
+-    if (!mute_disabled && fd_no == 2 && current != NULL && current->group != NULL) {
+-        if (current->group->v8_aborting) {
+-            // Already in V8 abort mode — silently drop all stderr writes
+-            return size;
+-        }
+-        if (v8_abort_prefix((char *)buf, size)) {
+-            current->group->v8_aborting = true;
+-            return size;
+-        }
+-    }
+-
+     struct fd *fd __attribute__((cleanup(fd_cleanup))) = f_get_retained(fd_no);
+     if (fd == NULL)
+         return _EBADF;
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 3da8b1b..5e4265e 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -399,80 +399,6 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
+ 
+         case SIGNAL_KILL:
+             unlock(&sighand->lock); // do_exit must be called without this lock
+-#ifdef GUEST_ARM64
+-            // V8's IMMEDIATE_CRASH() uses BRK #0 on ARM64 (delivers SIGTRAP).
+-            // Generic recovery: unwind the current function frame and return 0
+-            // to the caller. This lets V8 continue past non-fatal CHECKs.
+-            if (sig == SIGTRAP_) {
+-                struct cpu_state *cpu = &current->cpu;
+-                if (ish_exec_trace())
+-                    fprintf(stderr, "V8_SIGTRAP: pc=0x%llx x0=0x%llx sp=%llx fp=%llx lr=%llx\n",
+-                            (unsigned long long)cpu->pc,
+-                            (unsigned long long)cpu->regs[0],
+-                            (unsigned long long)cpu->sp,
+-                            (unsigned long long)cpu->regs[29],
+-                            (unsigned long long)cpu->regs[30]);
+-                // Only treat as "clean exit 0" if this process has already
+-                // committed to V8 abort (printed the V8 fatal preamble to
+-                // stderr). Otherwise preserve normal SIGTRAP semantics so
+-                // legitimate errors / debugger traps aren't masked.
+-                //
+-                // Required for npx: npm's inner V8 throws non-fatal CHECKs
+-                // (e.g. Handle location_==nullptr during worker teardown)
+-                // AFTER all side-effects have landed on disk. Exit 0 lets
+-                // npx's outer shell pipeline continue to the actual install
+-                // step. Without this gate npx reports failure but the
+-                // install actually succeeded.
+-                if (current->group && current->group->v8_aborting) {
+-                    do_exit_group(0);
+-                } else {
+-                    do_exit_group(sig);
+-                }
+-                return;
+-            }
+-            if (sig == SIGABRT_) {
+-                struct cpu_state *cpu = &current->cpu;
+-                if (ish_exec_trace())
+-                    fprintf(stderr, "V8_SIGABRT: pc=0x%llx sp=%llx fp=%llx lr=%llx\n",
+-                            (unsigned long long)cpu->pc,
+-                            (unsigned long long)cpu->sp,
+-                            (unsigned long long)cpu->regs[29],
+-                            (unsigned long long)cpu->regs[30]);
+-                // Like SIGTRAP: v8_aborting → exit 0; otherwise preserve
+-                // abort() exit semantics.
+-                if (current->group && current->group->v8_aborting) {
+-                    do_exit_group(0);
+-                } else {
+-                    do_exit_group(sig);
+-                }
+-                return;
+-            }
+-            // V8 scope corruption GPF cascade: the deep frame unwind in
+-            // handle_interrupt may leave a background thread with a corrupt
+-            // PC pointing into the V8 heap. When that thread tries to
+-            // execute "code" at a heap address, it gets SIGILL.
+-            // Flush the host-side stdout/stderr pipes before killing the
+-            // process group, so buffered output (e.g. npm help) is visible.
+-            if (sig == SIGILL_ || sig == SIGBUS_) {
+-                struct cpu_state *cpu = &current->cpu;
+-                if (cpu->pc >= 0xb0000000 && cpu->pc < 0xf0000000) {
+-                    do_exit_group(1 << 8);
+-                    return;
+-                }
+-            }
+-            // If this process has already committed to a V8 fatal abort
+-            // (printed the V8 fatal preamble to stderr), treat any
+-            // subsequent fatal signal as a clean shutdown — the side
+-            // effects have already landed on disk and the abort preamble
+-            // is suppressed, so surfacing a non-zero exit just confuses
+-            // callers. Without v8_aborting set, fall through to normal
+-            // SIGSEGV semantics so legitimate user-program crashes still
+-            // surface as "Segmentation fault" / non-zero exit.
+-            if (sig == SIGSEGV_ && current->group && current->group->v8_aborting) {
+-                do_exit_group(0);
+-                return;
+-            }
+-#endif
+             do_exit_group(sig);
+     }
+ 
+diff --git a/kernel/task.h b/kernel/task.h
+index 4df48cd..f73e8b6 100644
+--- a/kernel/task.h
++++ b/kernel/task.h
+@@ -239,12 +239,6 @@ struct tgroup {
+     bool doing_group_exit;
+     dword_t group_exit_code;
+ 
+-    // Once V8 prints a fatal-abort prefix to stderr (e.g. "abort: " or
+-    // "# Fatal error"), suppress every subsequent stderr write from the
+-    // group. The process is about to BRK anyway — further output is noise.
+-    // Cleared on execve (new program state).
+-    bool v8_aborting;
+-
+     struct rusage_ children_rusage;
+     cond_t child_exit;
+ 
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 4a717ce..fce7d6d 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -1249,11 +1249,6 @@ static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv,
+ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) {
+     ISH_SIGNPOST_SCOPE_BEGIN(exec, "execve", _exec_spid);
+     ISH_SIGNPOST_EVENT(exec, "execve_path", "path=%{public}s", file);
+-    // New program starts fresh — clear V8 abort-in-progress flag so the
+-    // fresh process's stderr isn't permanently muted from a prior abort.
+-    if (current && current->group)
+-        current->group->v8_aborting = false;
+-
+     struct fd *fd = generic_open(file, O_RDONLY, 0);
+     if (IS_ERR(fd)) {
+         int open_err = PTR_ERR(fd);

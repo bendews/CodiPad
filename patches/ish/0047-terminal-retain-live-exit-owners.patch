@@ -1,0 +1,85 @@
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -386,7 +386,7 @@
+         if (last_remaining > 0) {
+             // Threads are stuck in blocking syscalls and won't exit.
+             if (ish_exec_trace())
+-                printk("SAFETY-VALVE[exit]: pid=%d do_exit_group waited %dms, %d threads still stuck → force kill\n",
++                printk("SAFETY-VALVE[exit]: pid=%d do_exit_group waited %dms, %d threads still active; retaining ownership\n",
+                        current->pid, waited_ms, last_remaining);
+ 
+             // Signal stuck threads with SIGUSR1 repeatedly.
+@@ -411,67 +411,12 @@
+                 nanosleep(&ts2, NULL);
+             }
+ 
+-            // If threads are truly stuck in uninterruptible host syscalls,
+-            // we accept the leak rather than risking heap corruption.
+-            // Mark them as exiting and remove from the thread group list so
+-            // that exit_tgroup() sees the group as dead and notifies the parent.
+-            lock(&pids_lock);
+-            lock(&group->lock);
+-            int leaked = 0;
+-            struct task *task_tmp;
+-            list_for_each_entry_safe(&group->threads, task, task_tmp, group_links) {
+-                // [T-ish-exit-valve-progress] Never orphan a thread that is
+-                // already inside do_exit unless it outlasted the cap: it is
+-                // about to touch its group and sighand, which must stay alive.
+-                if (task != current && !task->exiting &&
+-                        (!atomic_load(&task->exit_started) || waited_ms >= EXIT_PROGRESS_CAP_MS)) {
+-                    task->exiting = true;
+-                    list_remove(&task->group_links);
+-                    // Release resources so pipes get EOF and memory is freed.
+-                    if (task->sighand != NULL) {
+-                        sighand_release(task->sighand);
+-                        task->sighand = NULL;
+-                    }
+-                    // [T-ish-mem-uaf-user-write / T-ish-mm-leak-refcount-handoff]
+-                    // DO NOT mm_release() a stuck thread's mm HERE. This thread
+-                    // is, by definition, still running inside an uninterruptible
+-                    // host syscall (e.g. sys_read → user_write blocked on a
+-                    // pipe) and may still hold mem->lock and be about to
+-                    // dereference task->mem. Freeing the mm now is a
+-                    // use-after-free (EXC_BAD_ACCESS at 0x38 = offsetof(struct
+-                    // mem, lock)). So keep task->mm/task->mem intact for now, but
+-                    // DEFER the release to this thread's own pthread cleanup
+-                    // handler (task_run_current), which runs only after the
+-                    // thread has left the read_wrlock critical section — so it
+-                    // both avoids the UAF and, unlike the old "accept the leak"
+-                    // path, actually reclaims the whole guest address space once
+-                    // the host pthread finally terminates. If the thread instead
+-                    // unblocks and re-enters do_exit(), that mm_release()s and
+-                    // clears the flag, so cleanup won't double-free.
+-                    task->mm_release_deferred = true;
+-                    // [T-ish-mm-diag] Unconditional (not exec-trace gated): one
+-                    // line per leaked thread, once — the flag above is set once.
+-                    printk("[iSH][SAFETY-VALVE] tid=%d (group pid=%d) marked mm_release_deferred, mm=%p refcount=%u\n",
+-                           task->pid, current->pid, (void *) task->mm,
+-                           task->mm ? (unsigned) task->mm->refcount : 0u);
+-                    if (task->files != NULL) {
+-                        fdtable_release(task->files);
+-                        task->files = NULL;
+-                    }
+-                    if (task->fs != NULL) {
+-                        fs_info_release(task->fs);
+-                        task->fs = NULL;
+-                    }
+-                    leaked++;
+-                }
+-            }
+-            unlock(&group->lock);
+-            unlock(&pids_lock);
+-            // [T-ish-mm-diag] Unconditional: do_exit_group runs once per
+-            // process, so this is at most one line per exiting process.
+-            if (leaked > 0)
+-                printk("[iSH][SAFETY-VALVE] pid=%d leaked %d stuck threads, mm_release deferred\n",
+-                       current->pid, leaked);
++            // A timeout is not thread termination. Keep each live thread in the
++            // group with its task, fdtable, sighand and wake pipe intact. The
++            // final thread's own do_exit will publish group death; until then
++            // the native authority reports incomplete cleanup and retains it.
++            printk("[iSH][EXIT-PENDING] pid=%d retaining live thread owners after %dms\n",
++                   current->pid, waited_ms);
+         } else {
+ 
+             // Give extra time for pthread cleanup on host system

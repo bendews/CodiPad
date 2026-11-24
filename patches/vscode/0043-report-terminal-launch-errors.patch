@@ -1,0 +1,134 @@
+--- a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+@@ -13,7 +13,7 @@
+ import { AutoOpenBarrier, Promises, disposableTimeout, timeout } from '../../../../base/common/async.js';
+ import { Codicon } from '../../../../base/common/codicons.js';
+ import { debounce } from '../../../../base/common/decorators.js';
+-import { BugIndicatingError, onUnexpectedError } from '../../../../base/common/errors.js';
++import { BugIndicatingError, getErrorMessage, isCancellationError, onUnexpectedError } from '../../../../base/common/errors.js';
+ import { Emitter, Event } from '../../../../base/common/event.js';
+ import { KeyCode } from '../../../../base/common/keyCodes.js';
+ import { ISeparator, normalizeDriveLetter, template, tildify } from '../../../../base/common/labels.js';
+@@ -560,25 +560,32 @@
+ 			// Resolve the executable ahead of time if shell integration is enabled, this should not
+ 			// be done for custom PTYs as that would cause extension Pseudoterminal-based terminals
+ 			// to hang in resolver extensions
+-			let os: OperatingSystem | undefined;
+-			if (!this.shellLaunchConfig.customPtyImplementation && this._terminalConfigurationService.config.shellIntegration?.enabled && !this.shellLaunchConfig.executable) {
+-				os = await this._processManager.getBackendOS();
+-				const defaultProfile = (await this._terminalProfileResolverService.getDefaultProfile({ remoteAuthority: this.remoteAuthority, os }));
+-				this.shellLaunchConfig.executable = defaultProfile.path;
+-				this.shellLaunchConfig.args = defaultProfile.args;
+-				// Only use default icon and color and env if they are undefined in the SLC
+-				this.shellLaunchConfig.icon ??= defaultProfile.icon;
+-				this.shellLaunchConfig.color ??= defaultProfile.color;
+-				this.shellLaunchConfig.env ??= defaultProfile.env;
+-			}
+-
+-			// Resolve the shell type ahead of time to allow features that depend upon it to work
+-			// before the process is actually created (like terminal suggest manual request)
+-			if (os && this.shellLaunchConfig.executable) {
+-				this.setShellType(guessShellTypeFromExecutable(os, this.shellLaunchConfig.executable));
+-			}
+-
+-			await this._createProcess();
++			try {
++				let os: OperatingSystem | undefined;
++				if (!this.shellLaunchConfig.customPtyImplementation && this._terminalConfigurationService.config.shellIntegration?.enabled && !this.shellLaunchConfig.executable) {
++					os = await this._processManager.getBackendOS();
++					const defaultProfile = (await this._terminalProfileResolverService.getDefaultProfile({ remoteAuthority: this.remoteAuthority, os }));
++					this.shellLaunchConfig.executable = defaultProfile.path;
++					this.shellLaunchConfig.args = defaultProfile.args;
++					// Only use default icon and color and env if they are undefined in the SLC
++					this.shellLaunchConfig.icon ??= defaultProfile.icon;
++					this.shellLaunchConfig.color ??= defaultProfile.color;
++					this.shellLaunchConfig.env ??= defaultProfile.env;
++				}
++
++				// Resolve the shell type ahead of time to allow features that depend upon it to work
++				// before the process is actually created (like terminal suggest manual request)
++				if (os && this.shellLaunchConfig.executable) {
++					this.setShellType(guessShellTypeFromExecutable(os, this.shellLaunchConfig.executable));
++				}
++
++				await this._createProcess();
++			} catch (error) {
++				if (!this.isDisposed && !isCancellationError(error)) {
++					await this._onProcessExit({ message: getErrorMessage(error) }, false);
++				}
++				return;
++			}
+ 
+ 			// Re-establish the title after reconnect
+ 			if (this.shellLaunchConfig.attachPersistentProcess) {
+@@ -1719,14 +1726,14 @@
+ 	 * @param exitCode The exit code of the process, this is undefined when the terminal was exited
+ 	 * through user action.
+ 	 */
+-	private async _onProcessExit(exitCodeOrError?: number | ITerminalLaunchError): Promise<void> {
++	private async _onProcessExit(exitCodeOrError?: number | ITerminalLaunchError, allowRelaunch = true): Promise<void> {
+ 		// Prevent dispose functions being triggered multiple times
+ 		if (this._isExiting || this.isDisposed) {
+ 			return;
+ 		}
+ 		const parsedExitResult = parseExitResult(exitCodeOrError, this.shellLaunchConfig, this._processManager.processState, this._initialCwd);
+ 
+-		if (this._usedShellIntegrationInjection && this._processManager.processState === ProcessState.KilledDuringLaunch && parsedExitResult?.code !== 0) {
++		if (allowRelaunch && this._usedShellIntegrationInjection && this._processManager.processState === ProcessState.KilledDuringLaunch && parsedExitResult?.code !== 0) {
+ 			this._relaunchWithShellIntegrationDisabled(parsedExitResult?.message);
+ 			this._onExit.fire(exitCodeOrError);
+ 			return;
+@@ -1785,7 +1792,7 @@
+ 			});
+ 		} else {
+ 			if (exitMessage) {
+-				const failedDuringLaunch = this._processManager.processState === ProcessState.KilledDuringLaunch;
++				const failedDuringLaunch = typeof exitCodeOrError === 'object' || this._processManager.processState === ProcessState.KilledDuringLaunch;
+ 				if (failedDuringLaunch || (this._terminalConfigurationService.config.showExitAlert && this.xterm?.lastInputEvent !== /*Ctrl+D*/'\x04')) {
+ 					this._notificationService.notify({
+ 						message: exitMessage,
+@@ -1930,15 +1937,22 @@
+ 		// Set the new shell launch config
+ 		this._shellLaunchConfig = shell; // Must be done before calling _createProcess()
+ 		this._agentShellTypeFromSequence = undefined;
+-		await this._processManager.relaunch(this._shellLaunchConfig, this._cols || Constants.DefaultCols, this._rows || Constants.DefaultRows, reset).then(result => {
+-			if (result) {
+-				if (hasKey(result, { message: true })) {
+-					this._onProcessExit(result);
+-				} else if (hasKey(result, { injectedArgs: true })) {
+-					this._injectedArgs = result.injectedArgs;
+-				}
+-			}
+-		});
++		try {
++			await this._processManager.relaunch(this._shellLaunchConfig, this._cols || Constants.DefaultCols, this._rows || Constants.DefaultRows, reset).then(result => {
++				if (result) {
++					if (hasKey(result, { message: true })) {
++						this._onProcessExit(result);
++					} else if (hasKey(result, { injectedArgs: true })) {
++						this._injectedArgs = result.injectedArgs;
++					}
++				}
++			});
++		} catch (error) {
++			if (!this.isDisposed && !isCancellationError(error)) {
++				await this._onProcessExit({ message: getErrorMessage(error) }, false);
++			}
++			throw error;
++		}
+ 	}
+ 
+ 	@debounce(1000)
+@@ -1948,7 +1962,11 @@
+ 		const shellLaunchConfig = { ...this._shellLaunchConfig };
+ 		delete shellLaunchConfig.attachPersistentProcess;
+ 
+-		this.reuseTerminal(shellLaunchConfig, true);
++		void this.reuseTerminal(shellLaunchConfig, true).catch(error => {
++			if (!this.isDisposed && !isCancellationError(error)) {
++				void this._onProcessExit({ message: getErrorMessage(error) }, false);
++			}
++		});
+ 	}
+ 
+ 	private _onTitleChange(title: string): void {

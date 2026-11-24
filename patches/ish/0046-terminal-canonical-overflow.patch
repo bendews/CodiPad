@@ -1,0 +1,19 @@
+--- a/fs/tty.c
++++ b/fs/tty.c
+@@ -226,7 +226,15 @@
+ }
+ 
+ static int tty_push_char(struct tty *tty, char ch, bool flag, int blocking) {
+-    while (tty->bufsize >= sizeof(tty->buf)) {
++    for (;;) {
++        // With no readable line, truncate excess data but keep processing
++        // controls and reserve the final slot for a line delimiter (Linux N_TTY).
++        if (tty->bufsize >= sizeof(tty->buf) - 1 &&
++                memchr(tty->buf_flag, true, tty->bufsize) == NULL) {
++            if (!flag) return 0;
++            if (tty->bufsize == sizeof(tty->buf)) tty->bufsize--;
++        }
++        if (tty->bufsize < sizeof(tty->buf)) break;
+         if (!blocking)
+             return _EAGAIN;
+         if (wait_for(&tty->consumed, &tty->lock, NULL))

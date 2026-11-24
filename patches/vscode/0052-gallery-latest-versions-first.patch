@@ -1,0 +1,79 @@
+--- a/src/vs/platform/extensionManagement/common/extensionGalleryService.ts
++++ b/src/vs/platform/extensionManagement/common/extensionGalleryService.ts
+@@ -1349,10 +1349,58 @@
+ 				needAllVersions.set(rawGalleryExtension.extensionId, index);
+ 			} else {
+ 				result.push([index, extension]);
++			}
++		}
++
++		if (needAllVersions.size && extensionGalleryManifest.capabilities.extensionQuery.flags?.some(flag => flag.name === Flag.IncludeLatestPrereleaseAndStableVersionOnly)) {
++			if (token.isCancellationRequested) {
++				throw new CancellationError();
++			}
++			const query = new Query()
++				.withFlags(...flags.filter(flag => flag !== Flag.IncludeLatestVersionOnly && flag !== Flag.IncludeVersions), Flag.IncludeLatestPrereleaseAndStableVersionOnly, Flag.IncludeAssetUri, Flag.IncludeCategoryAndTags, Flag.IncludeFiles, Flag.IncludeStatistics, Flag.IncludeVersionProperties)
++				.withPage(1, needAllVersions.size)
++				.withFilter(FilterType.ExtensionId, ...needAllVersions.keys());
++			const { galleryExtensions, context } = await this.queryRawGalleryExtensions(query, extensionGalleryManifest, token);
++			for (const rawGalleryExtension of galleryExtensions) {
++				if (token.isCancellationRequested) {
++					throw new CancellationError();
++				}
++				const index = needAllVersions.get(rawGalleryExtension.extensionId);
++				if (index === undefined) {
++					continue;
++				}
++				const extensionIdentifier = { id: getGalleryExtensionId(rawGalleryExtension.publisher.publisherName, rawGalleryExtension.extensionName), uuid: rawGalleryExtension.extensionId };
++				const excludedRange = getExcludeVersionRangeForExtension(extensionIdentifier.id, this.productService);
++				if (rawGalleryExtension.versions.some(version => isBlocked(version.flags, version.blocking) || (excludedRange && semver.satisfies(version.version, excludedRange)))) {
++					continue;
++				}
++				const includePreRelease = isBoolean(criteria.includePreRelease) ? criteria.includePreRelease : !!criteria.includePreRelease.find(extensionIdentifierWithPreRelease => areSameExtensions(extensionIdentifierWithPreRelease, extensionIdentifier))?.includePreRelease;
++				const allTargetPlatforms = getAllTargetPlatforms(rawGalleryExtension);
++				// Preserve platforms already advertised by the initial query.
++				if (getAllTargetPlatforms(rawGalleryExtensions[index]).some(platform => !allTargetPlatforms.includes(platform))) {
++					continue;
++				}
++				const version = await this.getValidRawGalleryExtensionVersion(rawGalleryExtension, rawGalleryExtension.versions, {
++					compatible: criteria.compatible,
++					targetPlatform: criteria.targetPlatform,
++					productVersion: criteria.productVersion,
++					version: includePreRelease ? VersionKind.Latest : VersionKind.Release,
++					includeBlockedVersions: criteria.includeBlockedVersions
++				}, allTargetPlatforms, false);
++				if (token.isCancellationRequested) {
++					throw new CancellationError();
++				}
++				if (version) {
++					result.push([index, toExtension(rawGalleryExtension, version, allTargetPlatforms, extensionGalleryManifest, this.productService, context)]);
++					needAllVersions.delete(rawGalleryExtension.extensionId);
++				}
+ 			}
+ 		}
+ 
+ 		if (needAllVersions.size) {
++			if (token.isCancellationRequested) {
++				throw new CancellationError();
++			}
+ 			const stopWatch = new StopWatch();
+ 			const query = new Query()
+ 				.withFlags(...flags.filter(flag => flag !== Flag.IncludeLatestVersionOnly), Flag.IncludeVersions)
+@@ -1372,7 +1420,7 @@
+ 		return { extensions: result.sort((a, b) => a[0] - b[0]).map(([, extension]) => extension), total };
+ 	}
+ 
+-	private async getValidRawGalleryExtensionVersion(rawGalleryExtension: IRawGalleryExtension, versions: IRawGalleryExtensionVersion[], criteria: ExtensionVersionCriteria, allTargetPlatforms: TargetPlatform[]): Promise<IRawGalleryExtensionVersion | null> {
++	private async getValidRawGalleryExtensionVersion(rawGalleryExtension: IRawGalleryExtension, versions: IRawGalleryExtensionVersion[], criteria: ExtensionVersionCriteria, allTargetPlatforms: TargetPlatform[], allowFallback: boolean = true): Promise<IRawGalleryExtensionVersion | null> {
+ 		const extensionIdentifier = { id: getGalleryExtensionId(rawGalleryExtension.publisher.publisherName, rawGalleryExtension.extensionName), uuid: rawGalleryExtension.extensionId };
+ 		const rawGalleryExtensionVersions = sortExtensionVersions(versions, criteria.targetPlatform);
+ 
+@@ -1412,7 +1460,7 @@
+ 			}
+ 		}
+ 
+-		if (version || criteria.compatible) {
++		if (version || criteria.compatible || !allowFallback) {
+ 			return null;
+ 		}
+ 

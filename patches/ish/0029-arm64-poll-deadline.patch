@@ -1,0 +1,116 @@
+--- a/fs/poll.c
++++ b/fs/poll.c
+@@ -401,14 +401,10 @@
+         real_poll_update(&poll_->real, poll_->notify_pipe[0], POLL_READ, NULL);
+     }
+ 
+-    // TODO this is pretty broken with regards to timeouts
+     int res = 0;
+     // [T-ish-poll-spin-guard] Consecutive host wakeups that left nothing ready.
+     unsigned spurious = 0;
+-    // A finite wait ends when its time is up. The loop below only treats a
+-    // host wait that returned NO events as a timeout, so a host that keeps
+-    // reporting something the guest check then rejects never let a finite
+-    // wait end - with timeout 0 not even after the first pass.
++    // Notifications and internal socket restarts share the original deadline.
+     uint64_t deadline_ns = 0;
+     if (timeout != NULL) {
+         struct timespec now;
+@@ -417,6 +413,7 @@
+             + (uint64_t) timeout->tv_sec * 1000000000ULL + timeout->tv_nsec;
+     }
+     bool woke = false;
++    bool host_polled = false;
+     struct real_poll_event last_events[4];
+     int last_n = 0;
+     while (true) {
+@@ -485,13 +482,13 @@
+                 poll_stat_spins++;
+             if (spurious == POLL_SPIN_LOG_AT)
+                 poll_spin_report(poll_, spurious, last_events, last_n);
+-            if (timeout != NULL && poll_guard_deadline) {
+-                struct timespec now;
+-                clock_gettime(CLOCK_MONOTONIC, &now);
+-                if ((uint64_t) now.tv_sec * 1000000000ULL + now.tv_nsec >= deadline_ns) {
+-                    poll_stat_deadline++;
+-                    break; // res is 0: timed out
+-                }
++        }
++        if (timeout != NULL && host_polled) {
++            struct timespec now;
++            clock_gettime(CLOCK_MONOTONIC, &now);
++            if ((uint64_t) now.tv_sec * 1000000000ULL + now.tv_nsec >= deadline_ns) {
++                poll_stat_deadline++;
++                break; // res is 0: timed out
+             }
+         }
+ 
+@@ -513,19 +510,33 @@
+         // pthread_cond_timedwait_relative_np can block forever under
+         // thread contention. Short caps ensure we re-check periodically.
+         struct timespec bounded_timeout = {.tv_sec = 1, .tv_nsec = 0};
+-        struct timespec *wait_timeout;
+-        if (timeout == NULL) {
+-            wait_timeout = &bounded_timeout;
+-        } else if (timeout->tv_sec >= 1) {
+-            wait_timeout = &bounded_timeout; // Cap long timeouts
+-        } else {
+-            wait_timeout = timeout; // Short/zero timeouts pass through
+-        }
++        struct timespec remaining;
++        struct timespec *wait_timeout = &bounded_timeout;
+         current->blocking = true;
+         do {
++            // Recompute after backoff and every permitted socket restart.
++            if (timeout != NULL) {
++                struct timespec now;
++                clock_gettime(CLOCK_MONOTONIC, &now);
++                uint64_t now_ns = (uint64_t) now.tv_sec * 1000000000ULL + now.tv_nsec;
++                uint64_t left_ns = now_ns < deadline_ns ? deadline_ns - now_ns : 0;
++                if (left_ns < 1000000000ULL) {
++                    remaining = (struct timespec) {.tv_sec = 0, .tv_nsec = left_ns};
++                    wait_timeout = &remaining;
++                    // One host pass consumes queued edges even for timeout zero.
++                    if (left_ns == 0 && host_polled) {
++                        err = 0;
++                        saved_errno = 0;
++                        break;
++                    }
++                } else {
++                    wait_timeout = &bounded_timeout;
++                }
++            }
+             err = real_poll_wait(&poll_->real, e, sizeof(e)/sizeof(e[0]), wait_timeout);
+             saved_errno = errno;  // save immediately before anything clobbers it
+-        } while (saved_errno == EINTR && sockrestart_should_restart_listen_wait());
++            host_polled = true;
++        } while (err < 0 && saved_errno == EINTR && sockrestart_should_restart_listen_wait());
+         current->blocking = false;
+         // [T-ish-leaked-thread-poll] If do_exit_group's safety valve leaked
+         // this thread while it slept, its group is torn down (NULL, or freed
+@@ -569,14 +580,6 @@
+             }
+             // Idle sessions remain alive. A poll wait cannot infer that an
+             // otherwise valid service is hung; the process owner controls exit.
+-            if (timeout != NULL) {
+-                // Timed wait: subtract elapsed time
+-                timeout->tv_sec -= 1;
+-                if (timeout->tv_sec < 0) {
+-                    // Original timeout expired
+-                    break;
+-                }
+-            }
+             continue;
+         }
+         lock(&poll_->lock);
+@@ -590,8 +593,8 @@
+             break;
+         }
+         if (err == 0) {
+-            // timed out and still nobody is ready
+-            break;
++            // Recheck guest readiness and signals before reporting expiry.
++            continue;
+         }
+ 
+         // dead with any edge-triggered notifications

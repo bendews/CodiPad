@@ -1,0 +1,13 @@
+--- a/kernel/group.c
++++ b/kernel/group.c
+@@ -83,7 +83,9 @@
+     list_remove_safe(&group->session);
+     if (group->tty) {
+         lock(&ttys_lock);
+-        if (list_empty(&pid_get(group->sid)->session)) {
++        // The session leader can be reaped before its tty-holding descendants.
++        struct pid *session_leader = pid_get(group->sid);
++        if (session_leader == NULL || list_empty(&session_leader->session)) {
+             lock(&group->tty->lock);
+             group->tty->session = 0;
+             unlock(&group->tty->lock);

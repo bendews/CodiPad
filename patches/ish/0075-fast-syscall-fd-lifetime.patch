@@ -1,0 +1,66 @@
+--- a/kernel/calls.c
++++ b/kernel/calls.c
+@@ -2,2 +2,3 @@
+ #include <errno.h>
++#include <limits.h>
+ #include <unistd.h>
+@@ -41,2 +42,4 @@
+ #ifdef GUEST_ARM64
++// No valid fast-path success or Linux errno can equal this sentinel.
++#define FAST_SYSCALL_UNHANDLED INT_MIN
+ static inline int fast_fstat64(struct cpu_state *cpu);
+@@ -122,3 +125,3 @@
+         // === FAST PATH: Hot syscalls ===
+-        int fast_result = -1;  // -1 means fast path not taken
++        int fast_result = FAST_SYSCALL_UNHANDLED;
+         bool fast_path_taken = false;
+@@ -128,3 +131,3 @@
+             fast_result = fast_fstat64(cpu);
+-            if (fast_result != -1)
++            if (fast_result != FAST_SYSCALL_UNHANDLED)
+                 fast_path_taken = true;
+@@ -134,3 +137,3 @@
+             fast_result = fast_read(cpu);
+-            if (fast_result != -1)
++            if (fast_result != FAST_SYSCALL_UNHANDLED)
+                 fast_path_taken = true;
+@@ -140,3 +143,3 @@
+             fast_result = fast_write(cpu);
+-            if (fast_result != -1)
++            if (fast_result != FAST_SYSCALL_UNHANDLED)
+                 fast_path_taken = true;
+@@ -1322,5 +1325,5 @@
+     // Quick validation: fd must be valid
+-    struct fd *fd = f_get(fd_no);
++    struct fd *fd __attribute__((cleanup(fd_cleanup))) = f_get_retained(fd_no);
+     if (fd == NULL)
+-        return -1;  // Fall back to slow path
++        return FAST_SYSCALL_UNHANDLED;  // Fall back to slow path
+ 
+@@ -1328,3 +1331,3 @@
+     if (fd->ops != &realfs_fdops)
+-        return -1;  // Fall back to slow path
++        return FAST_SYSCALL_UNHANDLED;  // Fall back to slow path
+ 
+@@ -1398,7 +1401,7 @@
+     if (size > 4096)
+-        return -1;
++        return FAST_SYSCALL_UNHANDLED;
+ 
+-    struct fd *fd = f_get(fd_no);
++    struct fd *fd __attribute__((cleanup(fd_cleanup))) = f_get_retained(fd_no);
+     if (fd == NULL || fd->ops != &realfs_fdops)
+-        return -1;
++        return FAST_SYSCALL_UNHANDLED;
+ 
+@@ -1429,7 +1432,7 @@
+     if (size > 4096)
+-        return -1;
++        return FAST_SYSCALL_UNHANDLED;
+ 
+-    struct fd *fd = f_get(fd_no);
++    struct fd *fd __attribute__((cleanup(fd_cleanup))) = f_get_retained(fd_no);
+     if (fd == NULL || fd->ops != &realfs_fdops)
+-        return -1;
++        return FAST_SYSCALL_UNHANDLED;
+ 

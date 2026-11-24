@@ -1,0 +1,66 @@
+--- a/src/vs/workbench/services/extensions/common/abstractExtensionService.ts
++++ b/src/vs/workbench/services/extensions/common/abstractExtensionService.ts
+@@ -1319,6 +1319,7 @@
+ class ExtensionHostCollection extends Disposable {
+ 
+ 	private _extensionHostManagers: ExtensionHostManagerData[] = [];
++	private readonly _stopping = new Map<ExtensionHostManagerData, Promise<void>>();
+ 
+ 	public override dispose() {
+ 		for (let i = this._extensionHostManagers.length - 1; i >= 0; i--) {
+@@ -1336,23 +1337,39 @@
+ 
+ 	public async stopAllInReverse(): Promise<void> {
+ 		// See https://github.com/microsoft/vscode/issues/152204
+-		// Dispose extension hosts in reverse creation order because the local extension host
+-		// might be critical in sustaining a connection to the remote extension host
+-		for (let i = this._extensionHostManagers.length - 1; i >= 0; i--) {
+-			const manager = this._extensionHostManagers[i];
++		// Stop the captured hosts in reverse creation order; concurrent additions belong to
++		// the next generation and must not be cleared when this stop completes.
++		for (const manager of this._extensionHostManagers.slice().reverse()) {
++			await this._stop(manager);
++		}
++	}
++
++	public async stopOne(extensionHostManager: IExtensionHostManager): Promise<void> {
++		const manager = this._extensionHostManagers.find(el => el.extensionHost === extensionHostManager);
++		if (manager) {
++			await this._stop(manager);
++		}
++	}
++
++	private _stop(manager: ExtensionHostManagerData): Promise<void> {
++		const stopping = this._stopping.get(manager);
++		if (stopping) {
++			return stopping;
++		}
++		if (!this._extensionHostManagers.includes(manager)) {
++			return Promise.resolve();
++		}
++		// Publish ownership before disconnect can synchronously emit an exit event.
++		const result = Promise.resolve().then(async () => {
+ 			await manager.extensionHost.disconnect();
+-			manager.dispose();
+-		}
+-		this._extensionHostManagers = [];
+-	}
+-
+-	public async stopOne(extensionHostManager: IExtensionHostManager): Promise<void> {
+-		const index = this._extensionHostManagers.findIndex(el => el.extensionHost === extensionHostManager);
+-		if (index >= 0) {
+-			this._extensionHostManagers.splice(index, 1);
+-			await extensionHostManager.disconnect();
+-			extensionHostManager.dispose();
+-		}
++			const index = this._extensionHostManagers.indexOf(manager);
++			if (index >= 0) {
++				this._extensionHostManagers.splice(index, 1);
++				manager.dispose();
++			}
++		}).finally(() => this._stopping.delete(manager));
++		this._stopping.set(manager, result);
++		return result;
+ 	}
+ 
+ 	public getByKind(kind: ExtensionHostKind): IExtensionHostManager[] {

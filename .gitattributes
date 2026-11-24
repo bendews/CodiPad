@@ -1,0 +1,2 @@
+# Preserve upstream patch bytes, including whitespace on unified diff context lines.
+*.patch -text -whitespace

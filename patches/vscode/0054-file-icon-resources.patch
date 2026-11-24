@@ -1,0 +1,108 @@
+diff --git a/src/vs/workbench/services/themes/browser/fileIconThemeData.ts b/src/vs/workbench/services/themes/browser/fileIconThemeData.ts
+index 48811cc..63bbdfd 100644
+--- a/src/vs/workbench/services/themes/browser/fileIconThemeData.ts
++++ b/src/vs/workbench/services/themes/browser/fileIconThemeData.ts
+@@ -198,7 +198,8 @@ export class FileIconThemeLoader {
+ 
+ 	constructor(
+ 		private readonly fileService: IExtensionResourceLoaderService,
+-		private readonly languageService: ILanguageService
++		private readonly languageService: ILanguageService,
++		private readonly resolveBrowserResource?: (uri: URI) => Promise<URI | undefined>
+ 	) {
+ 	}
+ 
+@@ -206,8 +207,8 @@ export class FileIconThemeLoader {
+ 		if (!data.location) {
+ 			return Promise.resolve(data.styleSheetContent);
+ 		}
+-		return this.loadIconThemeDocument(data.location).then(iconThemeDocument => {
+-			const result = this.processIconThemeDocument(data.id, data.location!, iconThemeDocument);
++		return this.loadIconThemeDocument(data.location).then(async iconThemeDocument => {
++			const result = await this.processIconThemeDocument(data.id, data.location!, iconThemeDocument);
+ 			data.styleSheetContent = result.content;
+ 			data.hasFileIcons = result.hasFileIcons;
+ 			data.hasFolderIcons = result.hasFolderIcons;
+@@ -230,7 +231,7 @@ export class FileIconThemeLoader {
+ 		});
+ 	}
+ 
+-	private processIconThemeDocument(id: string, iconThemeDocumentLocation: URI, iconThemeDocument: IconThemeDocument): { content: string; hasFileIcons: boolean; hasFolderIcons: boolean; hidesExplorerArrows: boolean } {
++	private async processIconThemeDocument(id: string, iconThemeDocumentLocation: URI, iconThemeDocument: IconThemeDocument): Promise<{ content: string; hasFileIcons: boolean; hasFolderIcons: boolean; hidesExplorerArrows: boolean }> {
+ 
+ 		const result = { content: '', hasFileIcons: false, hasFolderIcons: false, hidesExplorerArrows: !!iconThemeDocument.hidesExplorerArrows };
+ 
+@@ -393,6 +394,31 @@ export class FileIconThemeLoader {
+ 
+ 		const showLanguageModeIcons = iconThemeDocument.showLanguageModeIcons === true || (hasSpecificFileIcons && iconThemeDocument.showLanguageModeIcons !== false);
+ 
++		const browserResources = new Map<string, URI>();
++		const resourcesToResolve = new Map<string, URI>();
++		const addResource = (uri: URI) => resourcesToResolve.set(uri.toString(), uri);
++		for (const font of Array.isArray(iconThemeDocument.fonts) ? iconThemeDocument.fonts : []) {
++			for (const source of font.src) { addResource(resolvePath(source.path)); }
++		}
++		for (const defId in selectorByDefinitionId) {
++			const iconPath = iconThemeDocument.iconDefinitions[defId]?.iconPath;
++			if (iconPath) { addResource(resolvePath(iconPath)); }
++		}
++		if (showLanguageModeIcons) {
++			for (const languageId of this.languageService.getRegisteredLanguageIds()) {
++				if (!coveredLanguages[languageId]) {
++					const icon = this.languageService.getIcon(languageId);
++					if (icon) { addResource(icon.dark); addResource(icon.light); }
++				}
++			}
++		}
++		if (this.resolveBrowserResource) {
++			await Promise.all([...resourcesToResolve].map(async ([key, uri]) => {
++				browserResources.set(key, await this.resolveBrowserResource!(uri) ?? uri);
++			}));
++		}
++		const browserResource = (uri: URI) => browserResources.get(uri.toString()) ?? uri;
++
+ 		const cssRules = new css.Builder();
+ 
+ 		const fonts = iconThemeDocument.fonts;
+@@ -401,7 +427,7 @@ export class FileIconThemeLoader {
+ 			const defaultFontSize = this.tryNormalizeFontSize(fonts[0].size) || '150%';
+ 			fonts.forEach(font => {
+ 				const fontSrcs = new css.Builder();
+-				fontSrcs.push(...font.src.map(l => css.inline`${css.asCSSUrl(resolvePath(l.path))} format(${css.stringValue(l.format)})`));
++				fontSrcs.push(...font.src.map(l => css.inline`${css.asCSSUrl(browserResource(resolvePath(l.path)))} format(${css.stringValue(l.format)})`));
+ 				cssRules.push(css.inline`@font-face { src: ${fontSrcs.join(', ')}; font-family: ${css.stringValue(font.id)}; font-weight: ${css.identValue(font.weight)}; font-style: ${css.identValue(font.style)}; font-display: block; }`);
+ 
+ 				const fontSize = this.tryNormalizeFontSize(font.size);
+@@ -425,7 +451,7 @@ export class FileIconThemeLoader {
+ 			const definition = iconThemeDocument.iconDefinitions[defId];
+ 			if (definition) {
+ 				if (definition.iconPath) {
+-					const iconPath = css.asCSSUrl(resolvePath(definition.iconPath));
++					const iconPath = css.asCSSUrl(browserResource(resolvePath(definition.iconPath)));
+ 					cssRules.push(css.inline`${selectors.join(', ')} { content: ${emQuad}; ${imageIconStyle(iconPath)} }`);
+ 				} else if (definition.fontCharacter || definition.fontColor) {
+ 					const body = new css.Builder();
+@@ -456,8 +482,8 @@ export class FileIconThemeLoader {
+ 					const icon = this.languageService.getIcon(languageId);
+ 					if (icon) {
+ 						const selector = css.inline`.show-file-icons .${classSelectorPart(languageId)}-lang-file-icon.file-icon::before`;
+-						cssRules.push(css.inline`${selector} { content: ${emQuad}; ${imageIconStyle(css.asCSSUrl(icon.dark))} }`);
+-						cssRules.push(css.inline`.vs ${selector} { content: ${emQuad}; ${imageIconStyle(css.asCSSUrl(icon.light))} }`);
++						cssRules.push(css.inline`${selector} { content: ${emQuad}; ${imageIconStyle(css.asCSSUrl(browserResource(icon.dark)))} }`);
++						cssRules.push(css.inline`.vs ${selector} { content: ${emQuad}; ${imageIconStyle(css.asCSSUrl(browserResource(icon.light)))} }`);
+ 					}
+ 				}
+ 			}
+diff --git a/src/vs/workbench/services/themes/browser/workbenchThemeService.ts b/src/vs/workbench/services/themes/browser/workbenchThemeService.ts
+index 28ab756..7458423 100644
+--- a/src/vs/workbench/services/themes/browser/workbenchThemeService.ts
++++ b/src/vs/workbench/services/themes/browser/workbenchThemeService.ts
+@@ -130,7 +130,7 @@ export class WorkbenchThemeService extends Disposable implements IWorkbenchTheme
+ 
+ 		this.fileIconThemeWatcher = this._register(new ThemeFileWatcher(fileService, environmentService, this.reloadCurrentFileIconTheme.bind(this)));
+ 		this.fileIconThemeRegistry = this._register(new ThemeRegistry(fileIconThemesExtPoint, FileIconThemeData.fromExtensionTheme, true, FileIconThemeData.noIconTheme));
+-		this.fileIconThemeLoader = new FileIconThemeLoader(extensionResourceLoaderService, languageService);
++		this.fileIconThemeLoader = new FileIconThemeLoader(extensionResourceLoaderService, languageService, uri => extensionService.resolveExtensionResourceUri?.(uri) ?? Promise.resolve(undefined));
+ 		this.onFileIconThemeChange = this._register(new Emitter<IWorkbenchFileIconTheme>({ leakWarningThreshold: 400, leakWarningName: 'ThemeService.onFileIconThemeChange' }));
+ 		this.currentFileIconTheme = FileIconThemeData.createUnloadedTheme('');
+ 		this.fileIconThemeSequencer = new Sequencer();

@@ -1,0 +1,114 @@
+--- a/src/vs/platform/terminal/common/terminal.ts
++++ b/src/vs/platform/terminal/common/terminal.ts
+@@ -190,6 +190,8 @@
+ }
+ 
+ export interface IPtyHostAttachTarget {
++	/** Opaque backend-owned identity; numeric IDs alone may be reused after restart. */
++	processIdentity?: string;
+ 	id: number;
+ 	pid: number;
+ 	title: string;
+@@ -572,6 +574,7 @@
+ 	attachPersistentProcess?: {
+ 		id: number;
+ 		findRevivedId?: boolean;
++		processIdentity?: string;
+ 		pid: number;
+ 		title: string;
+ 		titleSource: TitleEventSource;
+@@ -790,6 +793,8 @@
+  * child_process.ChildProcess node.js interface.
+  */
+ export interface ITerminalChildProcess {
++	/** Stable backend-owned identity for persisted attachments, when supported. */
++	readonly processIdentity?: string;
+ 	/**
+ 	 * A unique identifier for the terminal process. Note that the uniqueness only applies to a
+ 	 * given pty service connection, IDs will be duplicated for remote and local terminals for
+@@ -1174,7 +1179,7 @@
+ 	 * Attaches to the process revived for a restored terminal, otherwise to its original process. The
+ 	 * local backend refuses an original process whose pid differs from `pid`, unless `pid` is 0 (unknown).
+ 	 */
+-	attachToRevivedProcess(id: number, pid: number): Promise<ITerminalChildProcess | undefined>;
++	attachToRevivedProcess(id: number, pid: number, processIdentity?: string): Promise<ITerminalChildProcess | undefined>;
+ 	listProcesses(): Promise<IProcessDetails[]>;
+ 	getLatency(): Promise<IPtyHostLatencyMeasurement[]>;
+ 	getDefaultSystemShell(osOverride?: OperatingSystem): Promise<string>;
+--- a/src/vs/platform/terminal/common/terminalProcess.ts
++++ b/src/vs/platform/terminal/common/terminalProcess.ts
+@@ -40,6 +40,7 @@
+ }
+ 
+ export interface IProcessDetails {
++	processIdentity?: string;
+ 	id: number;
+ 	pid: number;
+ 	title: string;
+--- a/src/vs/workbench/contrib/terminal/browser/terminal.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminal.ts
+@@ -722,6 +722,7 @@
+ export const terminalEditorId = 'terminalEditor';
+ 
+ interface ITerminalEditorInputObject {
++	readonly processIdentity?: string;
+ 	readonly id: number;
+ 	readonly pid: number;
+ 	readonly title: string;
+@@ -965,6 +966,7 @@
+ 	 * that supports reconnection.
+ 	 */
+ 	readonly persistentProcessId: number | undefined;
++	readonly processIdentity?: string;
+ 
+ 	/**
+ 	 * Whether the process should be persisted across reloads.
+--- a/src/vs/workbench/contrib/terminal/browser/terminalProcessManager.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalProcessManager.ts
+@@ -130,6 +130,7 @@
+ 	private _cwdWorkspaceFolder: IWorkspaceFolder | undefined;
+ 
+ 	get persistentProcessId(): number | undefined { return this._process?.id; }
++	get processIdentity(): string | undefined { return this._process?.processIdentity; }
+ 	get shouldPersist(): boolean { return !!this.reconnectionProperties || (this._process ? this._process.shouldPersist : false); }
+ 	get hasWrittenData(): boolean { return this._hasWrittenData; }
+ 	get hasChildProcesses(): boolean { return this._hasChildProcesses; }
+@@ -337,8 +338,8 @@
+ 				}
+ 			} else {
+ 				if (shellLaunchConfig.attachPersistentProcess) {
+-					const { id, pid, findRevivedId } = shellLaunchConfig.attachPersistentProcess;
+-					const result = findRevivedId ? await backend.attachToRevivedProcess(id, pid) : await backend.attachToProcess(id);
++					const { id, pid, findRevivedId, processIdentity } = shellLaunchConfig.attachPersistentProcess;
++					const result = findRevivedId ? await backend.attachToRevivedProcess(id, pid, processIdentity) : await backend.attachToProcess(id);
+ 					if (result) {
+ 						newProcess = result;
+ 					} else {
+--- a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+@@ -791,6 +791,7 @@
+ 	}
+ 
+ 	get persistentProcessId(): number | undefined { return this._processManager.persistentProcessId; }
++	get processIdentity(): string | undefined { return this._processManager.processIdentity; }
+ 	get shouldPersist(): boolean { return this._processManager.shouldPersist && !this.shellLaunchConfig.isTransient && (!this.reconnectionProperties || this._configurationService.getValue('task.reconnection') === true); }
+ 
+ 	public static getXtermConstructor(keybindingService: IKeybindingService, contextKeyService: IContextKeyService) {
+--- a/src/vs/workbench/contrib/terminal/browser/terminalEditorSerializer.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalEditorSerializer.ts
+@@ -37,6 +37,7 @@
+ 	private _toJson(instance: ITerminalInstance): ISerializedTerminalEditorInput {
+ 		return {
+ 			id: instance.persistentProcessId!,
++			processIdentity: instance.processIdentity,
+ 			pid: instance.processId || 0,
+ 			title: instance.title,
+ 			titleSource: instance.titleSource,
+@@ -53,5 +54,6 @@
+ }
+ 
+ function isDeserializedTerminalEditorInput(obj: unknown): obj is IDeserializedTerminalEditorInput {
+-	return isObject(obj) && 'id' in obj && 'pid' in obj;
++	return isObject(obj) && 'id' in obj && 'pid' in obj &&
++		(!('processIdentity' in obj) || typeof obj.processIdentity === 'string' && obj.processIdentity.length > 0 && obj.processIdentity.length <= 1024);
+ }

@@ -1,0 +1,159 @@
+diff --git a/src/vs/workbench/contrib/tasks/browser/abstractTaskService.ts b/src/vs/workbench/contrib/tasks/browser/abstractTaskService.ts
+index 4d0edc3..3b036e4 100644
+--- a/src/vs/workbench/contrib/tasks/browser/abstractTaskService.ts
++++ b/src/vs/workbench/contrib/tasks/browser/abstractTaskService.ts
+@@ -480,7 +480,7 @@ export abstract class AbstractTaskService extends Disposable implements ITaskSer
+ 		// update tasks so an incomplete list isn't returned when getWorkspaceTasks is called
+ 		this._workspaceTasksPromise = undefined;
+ 		this._onDidRegisterSupportedExecutions.fire();
+-		if (ServerlessWebContext.getValue(this._contextKeyService) || (custom && shell && process)) {
++		if (ServerlessWebContext.getValue(this._contextKeyService) || (custom !== undefined && shell !== undefined && process !== undefined)) {
+ 			this._onDidRegisterAllSupportedExecutions.fire();
+ 		}
+ 	}
+@@ -2626,7 +2626,7 @@ export abstract class AbstractTaskService extends Disposable implements ITaskSer
+ 	}
+ 
+ 	private get _jsonTasksSupported(): boolean {
+-		return ShellExecutionSupportedContext.getValue(this._contextKeyService) === true && ProcessExecutionSupportedContext.getValue(this._contextKeyService) === true;
++		return ShellExecutionSupportedContext.getValue(this._contextKeyService) === true || ProcessExecutionSupportedContext.getValue(this._contextKeyService) === true;
+ 	}
+ 
+ 	private async _computeWorkspaceFolderTasks(workspaceFolder: IWorkspaceFolder, runSource: TaskRunSource = TaskRunSource.User): Promise<IWorkspaceFolderTaskResult> {
+diff --git a/src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts b/src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts
+index 935bd52..7c90341 100644
+--- a/src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts
++++ b/src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts
+@@ -88,10 +88,10 @@ class VariableResolver {
+ 	private static _regex = /\$\{(.*?)\}/g;
+ 	constructor(public workspaceFolder: IWorkspaceFolder | undefined, public taskSystemInfo: ITaskSystemInfo | undefined, public readonly values: Map<string, string>, private _service: IConfigurationResolverService | undefined) {
+ 	}
+-	async resolve(value: string): Promise<string> {
++	async resolve(value: string, mapTaskPaths = false): Promise<string> {
+ 		const replacers: Promise<string>[] = [];
+ 		value.replace(VariableResolver._regex, (match, ...args) => {
+-			replacers.push(this._replacer(match, args));
++			replacers.push(this._replacer(match, args, mapTaskPaths));
+ 			return match;
+ 		});
+ 		const resolvedReplacers = await Promise.all(replacers);
+@@ -99,16 +99,20 @@ class VariableResolver {
+ 
+ 	}
+ 
+-	private async _replacer(match: string, args: string[]): Promise<string> {
+-		// Strip out the ${} because the map contains them variables without those characters.
+-		const result = this.values.get(match.substring(2, match.length - 1));
+-		if ((result !== undefined) && (result !== null)) {
+-			return result;
++	private async _replacer(match: string, args: string[], mapTaskPaths: boolean): Promise<string> {
++		// Strip out the ${} because the map contains the variables without those characters.
++		const name = match.substring(2, match.length - 1);
++		let result = this.values.get(name);
++		if ((result === undefined || result === null) && this._service) {
++			result = await this._service.resolveAsync(this.workspaceFolder, match);
++		}
++		if (result === undefined || result === null) {
++			return match;
+ 		}
+-		if (this._service) {
+-			return this._service.resolveAsync(this.workspaceFolder, match);
++		if (mapTaskPaths && this.taskSystemInfo?.mapPathVariable) {
++			return this.taskSystemInfo.mapPathVariable(name, result, this.workspaceFolder);
+ 		}
+-		return match;
++		return result;
+ 	}
+ }
+ 
+@@ -1256,11 +1260,11 @@ export class TerminalTaskSystem extends Disposable implements ITaskSystem {
+ 					if (shellOptions.executable !== shellLaunchConfig.executable) {
+ 						shellLaunchConfig.args = undefined;
+ 					}
+-					shellLaunchConfig.executable = await this._resolveVariable(variableResolver, shellOptions.executable);
++					shellLaunchConfig.executable = await this._resolveVariable(variableResolver, shellOptions.executable, true);
+ 					shellSpecified = true;
+ 				}
+ 				if (shellOptions.args) {
+-					shellLaunchConfig.args = await this._resolveVariables(variableResolver, shellOptions.args.slice());
++					shellLaunchConfig.args = await this._resolveVariables(variableResolver, shellOptions.args.slice(), true);
+ 				}
+ 			}
+ 			if (shellLaunchConfig.args === undefined) {
+@@ -1844,15 +1848,15 @@ export class TerminalTaskSystem extends Disposable implements ITaskSystem {
+ 	private async _resolveCommandAndArgs(resolver: VariableResolver, commandConfig: ICommandConfiguration): Promise<{ command: CommandString; args: CommandString[] }> {
+ 		// First we need to use the command args:
+ 		let args: CommandString[] = commandConfig.args ? commandConfig.args.slice() : [];
+-		args = await this._resolveVariables(resolver, args);
+-		const command: CommandString = await this._resolveVariable(resolver, commandConfig.name);
++		args = await this._resolveVariables(resolver, args, true);
++		const command: CommandString = await this._resolveVariable(resolver, commandConfig.name, true);
+ 		return { command, args };
+ 	}
+ 
+-	private async _resolveVariables(resolver: VariableResolver, value: string[]): Promise<string[]>;
+-	private async _resolveVariables(resolver: VariableResolver, value: CommandString[]): Promise<CommandString[]>;
+-	private async _resolveVariables(resolver: VariableResolver, value: CommandString[]): Promise<CommandString[]> {
+-		return Promise.all(value.map(s => this._resolveVariable(resolver, s)));
++	private async _resolveVariables(resolver: VariableResolver, value: string[], mapTaskPaths?: boolean): Promise<string[]>;
++	private async _resolveVariables(resolver: VariableResolver, value: CommandString[], mapTaskPaths?: boolean): Promise<CommandString[]>;
++	private async _resolveVariables(resolver: VariableResolver, value: CommandString[], mapTaskPaths = false): Promise<CommandString[]> {
++		return Promise.all(value.map(s => this._resolveVariable(resolver, s, mapTaskPaths)));
+ 	}
+ 
+ 	private async _resolveMatchers(resolver: VariableResolver, values: Array<string | ProblemMatcher> | undefined): Promise<ProblemMatcher[]> {
+@@ -1908,15 +1912,15 @@ export class TerminalTaskSystem extends Disposable implements ITaskSystem {
+ 		return result;
+ 	}
+ 
+-	private async _resolveVariable(resolver: VariableResolver, value: string | undefined): Promise<string>;
+-	private async _resolveVariable(resolver: VariableResolver, value: CommandString | undefined): Promise<CommandString>;
+-	private async _resolveVariable(resolver: VariableResolver, value: CommandString | undefined): Promise<CommandString> {
++	private async _resolveVariable(resolver: VariableResolver, value: string | undefined, mapTaskPaths?: boolean): Promise<string>;
++	private async _resolveVariable(resolver: VariableResolver, value: CommandString | undefined, mapTaskPaths?: boolean): Promise<CommandString>;
++	private async _resolveVariable(resolver: VariableResolver, value: CommandString | undefined, mapTaskPaths = false): Promise<CommandString> {
+ 		// TODO@Dirk Task.getWorkspaceFolder should return a WorkspaceFolder that is defined in workspace.ts
+ 		if (Types.isString(value)) {
+-			return resolver.resolve(value);
++			return resolver.resolve(value, mapTaskPaths);
+ 		} else if (value !== undefined) {
+ 			return {
+-				value: await resolver.resolve(value.value),
++				value: await resolver.resolve(value.value, mapTaskPaths),
+ 				quoting: value.quoting
+ 			};
+ 		} else { // This should never happen
+@@ -1942,7 +1946,7 @@ export class TerminalTaskSystem extends Disposable implements ITaskSystem {
+ 			for (const key of Object.keys(options.env)) {
+ 				const value = options.env[key];
+ 				if (Types.isString(value)) {
+-					result.env![key] = await this._resolveVariable(resolver, value);
++					result.env![key] = await this._resolveVariable(resolver, value, true);
+ 				} else {
+ 					result.env![key] = String(value);
+ 				}
+diff --git a/src/vs/workbench/contrib/tasks/common/taskService.ts b/src/vs/workbench/contrib/tasks/common/taskService.ts
+index ec8414e..b7bfab7 100644
+--- a/src/vs/workbench/contrib/tasks/common/taskService.ts
++++ b/src/vs/workbench/contrib/tasks/common/taskService.ts
+@@ -23,7 +23,7 @@ export const TaskCommandsRegistered = new RawContextKey<boolean>('taskCommandsRe
+ export const ProcessExecutionSupportedContext = new RawContextKey<boolean>('processExecutionSupported', false, nls.localize('tasks.processExecutionSupported', "Whether ProcessExecution tasks are supported. Consider using in the when clause of a \'taskDefinition\' contribution."));
+ export const ServerlessWebContext = new RawContextKey<boolean>('serverlessWebContext', false, nls.localize('tasks.serverlessWebContext', "True when in the web with no remote authority."));
+ export const TasksAvailableContext = new RawContextKey<boolean>('tasksAvailable', false, nls.localize('tasks.tasksAvailable', "Whether any tasks are available in the workspace."));
+-export const TaskExecutionSupportedContext = ContextKeyExpr.or(ContextKeyExpr.and(ShellExecutionSupportedContext, ProcessExecutionSupportedContext), CustomExecutionSupportedContext);
++export const TaskExecutionSupportedContext = ContextKeyExpr.or(ShellExecutionSupportedContext, ProcessExecutionSupportedContext, CustomExecutionSupportedContext);
+ 
+ export const ITaskService = createDecorator<ITaskService>('taskService');
+ 
+diff --git a/src/vs/workbench/contrib/tasks/common/taskSystem.ts b/src/vs/workbench/contrib/tasks/common/taskSystem.ts
+index ec05fe3..2a94ad7 100644
+--- a/src/vs/workbench/contrib/tasks/common/taskSystem.ts
++++ b/src/vs/workbench/contrib/tasks/common/taskSystem.ts
+@@ -129,6 +129,7 @@ export interface ITaskSystemInfo {
+ 	context: unknown;
+ 	uriProvider: (this: void, path: string) => URI;
+ 	resolveVariables(workspaceFolder: IWorkspaceFolder, toResolve: IResolveSet, target: ConfigurationTarget): Promise<IResolvedVariables | undefined>;
++	mapPathVariable?(name: string, value: string, workspaceFolder: IWorkspaceFolder | undefined): string;
+ 	findExecutable(command: string, cwd?: string, paths?: string[]): Promise<string | undefined>;
+ }
+ 

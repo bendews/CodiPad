@@ -1,0 +1,64 @@
+diff --git a/src/vs/base/browser/cssValue.ts b/src/vs/base/browser/cssValue.ts
+index 84cee852..90abb32b 100644
+--- a/src/vs/base/browser/cssValue.ts
++++ b/src/vs/base/browser/cssValue.ts
+@@ -62,7 +62,7 @@ export function asCSSUrl(uri: URI | null | undefined): CssFragment {
+ 	if (!uri) {
+ 		return asFragment(`url('')`);
+ 	}
+-	return inline`url('${asFragment(CSS.escape(FileAccess.uriToBrowserUri(uri).toString(true)))}')`;
++	return inline`url('${asFragment(CSS.escape(FileAccess.uriToBrowserUri(uri).toString()))}')`;
+ }
+ 
+ export function className(value: string, escapingExpected = false): CssFragment {
+diff --git a/src/vs/base/common/network.ts b/src/vs/base/common/network.ts
+index 5163aaae..3a0a4049 100644
+--- a/src/vs/base/common/network.ts
++++ b/src/vs/base/common/network.ts
+@@ -291,6 +291,12 @@ class FileAccessImpl {
+ 
+ 	private static readonly FALLBACK_AUTHORITY = VSCODE_AUTHORITY;
+ 
++	private scopedFileBrowserUriMapper: ((uri: URI) => URI | undefined) | undefined;
++
++	setScopedFileBrowserUriMapper(mapper: ((uri: URI) => URI | undefined) | undefined): void {
++		this.scopedFileBrowserUriMapper = mapper;
++	}
++
+ 	/**
+ 	 * Returns a URI to use in contexts where the browser is responsible
+ 	 * for loading (e.g. fetch()) or when used within the DOM.
+@@ -309,6 +315,11 @@ class FileAccessImpl {
+ 	 * **Note:** use `dom.ts#asCSSUrl` whenever the URL is to be used in CSS context.
+ 	 */
+ 	uriToBrowserUri(uri: URI): URI {
++		if (uri.scheme === Schemas.file) {
++			const mapped = this.scopedFileBrowserUriMapper?.(uri);
++			if (mapped) { return mapped; }
++		}
++
+ 		// Handle remote URIs via `RemoteAuthorities`
+ 		if (uri.scheme === Schemas.vscodeRemote) {
+ 			return RemoteAuthorities.rewrite(uri);
+diff --git a/src/vs/workbench/services/themes/browser/cssExtensionPoint.ts b/src/vs/workbench/services/themes/browser/cssExtensionPoint.ts
+index 69b74111..13329ed4 100644
+--- a/src/vs/workbench/services/themes/browser/cssExtensionPoint.ts
++++ b/src/vs/workbench/services/themes/browser/cssExtensionPoint.ts
+@@ -311,7 +311,7 @@ export class CSSExtensionPoint {
+ 		element.rel = 'stylesheet';
+ 		element.type = 'text/css';
+ 		element.className = `extension-contributed-css ${extensionId}`;
+-		element.href = FileAccess.uriToBrowserUri(uri).toString(true);
++		element.href = FileAccess.uriToBrowserUri(uri).toString();
+ 		disposables.add(toDisposable(() => element.remove()));
+ 		return element;
+ 	}
+@@ -323,7 +323,7 @@ export class CSSExtensionPoint {
+ 				if (entry.uri.toString() === uriString) {
+ 					// Cache-bust by adding a timestamp query parameter
+ 					const browserUri = FileAccess.uriToBrowserUri(uri);
+-					entry.element.href = browserUri.with({ query: `v=${Date.now()}` }).toString(true);
++					entry.element.href = browserUri.with({ query: `v=${Date.now()}` }).toString();
+ 				}
+ 			}
+ 		}

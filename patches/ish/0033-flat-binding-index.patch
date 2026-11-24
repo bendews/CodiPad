@@ -1,0 +1,134 @@
+--- a/kernel/memory.c
++++ b/kernel/memory.c
+@@ -41,7 +41,7 @@
+ struct flat_memory_binding {
+     page_t group;
+     struct data *data;
+-    struct flat_memory_binding *next;
++    size_t offset;
+ };
+ 
+ // Experimental and default-off. The ordinary page table remains the source
+@@ -53,7 +53,7 @@
+ 
+ static void flat_binding_drop(struct flat_memory_binding **link) {
+     struct flat_memory_binding *binding = *link;
+-    *link = binding->next;
++    *link = NULL;
+     struct data *data = binding->data;
+     if (--data->refcount == 0) {
+         if (data->data != vdso_data) munmap(data->data, data->size);
+@@ -63,26 +63,43 @@
+     free(binding);
+ }
+ 
++// Two-level sparse index: one slot per 4 KiB guest page, allocated on demand.
++// Entries are indexed by group start, so larger host pages leave holes.
++#define FLAT_INDEX_BITS 10
++#define FLAT_INDEX_SIZE (1u << FLAT_INDEX_BITS)
++
++static struct flat_memory_binding **flat_binding_link(struct mem *mem, page_t group, bool create) {
++    size_t high = group >> FLAT_INDEX_BITS, low = group & (FLAT_INDEX_SIZE - 1);
++    if (high >= FLAT_INDEX_SIZE) return NULL;
++    if (mem->flat_bindings == NULL && create)
++        mem->flat_bindings = calloc(FLAT_INDEX_SIZE, sizeof(*mem->flat_bindings));
++    if (mem->flat_bindings == NULL) return NULL;
++    if (mem->flat_bindings[high] == NULL && create)
++        mem->flat_bindings[high] = calloc(FLAT_INDEX_SIZE, sizeof(**mem->flat_bindings));
++    return mem->flat_bindings[high] ? &mem->flat_bindings[high][low] : NULL;
++}
++
+ static void flat_bindings_drop_range(struct mem *mem, page_t first, page_t last) {
+-    struct flat_memory_binding **link = &mem->flat_bindings;
+-    while (*link != NULL) {
+-        if ((*link)->group >= first && (*link)->group < last)
+-            flat_binding_drop(link);
+-        else
+-            link = &(*link)->next;
+-    }
+-}
+-
+-static struct flat_memory_binding **flat_binding_link(struct mem *mem, page_t group) {
+-    struct flat_memory_binding **link = &mem->flat_bindings;
+-    while (*link != NULL && (*link)->group != group)
+-        link = &(*link)->next;
+-    return link;
++    if (mem->flat_bindings == NULL) return;
++    while (first < last) {
++        size_t high = first >> FLAT_INDEX_BITS;
++        page_t end = ((page_t) high + 1) << FLAT_INDEX_BITS;
++        if (end > last) end = last;
++        if (mem->flat_bindings[high] != NULL) {
++            for (; first < end; first++) {
++                struct flat_memory_binding **slot = &mem->flat_bindings[high][first & (FLAT_INDEX_SIZE - 1)];
++                if (*slot) flat_binding_drop(slot);
++            }
++        } else first = end;
++    }
+ }
+ 
+ static void flat_bindings_drop_all(struct mem *mem) {
+-    while (mem->flat_bindings != NULL)
+-        flat_binding_drop(&mem->flat_bindings);
++    if (mem->flat_bindings == NULL) return;
++    flat_bindings_drop_range(mem, 0, 1ULL << 20);
++    for (size_t i = 0; i < FLAT_INDEX_SIZE; i++) free(mem->flat_bindings[i]);
++    free(mem->flat_bindings);
++    mem->flat_bindings = NULL;
+ }
+ 
+ static void flat_window_disable(struct mem *mem) {
+@@ -138,10 +155,17 @@
+         if (eligible) {
+             int host_error = 0;
+             void *backing = (char *) data->data + first_offset;
+-            // A repeated sync can encounter an existing alias. Revoke that
+-            // exact group before attempting to replace it, retaining its pin
+-            // if revocation fails.
+-            struct flat_memory_binding **existing = flat_binding_link(mem, group);
++            struct flat_memory_binding **existing = flat_binding_link(mem, group, true);
++            if (existing == NULL) {
++                group += group_pages;
++                continue;
++            }
++            // Eligible groups use a read-only alias. Keep it if its pinned
++            // source and offset are unchanged.
++            if (*existing && (*existing)->data == data && (*existing)->offset == first_offset) {
++                group += group_pages;
++                continue;
++            }
+             if (*existing != NULL) {
+                 CodiPadGuestMemoryResult unbind = CodiPadGuestMemoryWindowUnbind(
+                     mem->flat_window, group << PAGE_BITS, host_bytes, &host_error);
+@@ -158,8 +182,8 @@
+             }
+             binding->group = group;
+             binding->data = data;
+-            binding->next = mem->flat_bindings;
+-            mem->flat_bindings = binding;
++            binding->offset = first_offset;
++            *existing = binding;
+             ++data->refcount; // pin backing until its alias is successfully revoked
+             CodiPadGuestMemoryResult result = CodiPadGuestMemoryWindowBind(
+                 mem->flat_window, group << PAGE_BITS, host_bytes, backing,
+@@ -170,8 +194,7 @@
+             } else if (result != CodiPadGuestMemoryOK) {
+                 // Only this attempted binding is ours to release. Never drop
+                 // another live alias's source pin on a conflict response.
+-                struct flat_memory_binding **link = flat_binding_link(mem, group);
+-                if (*link == binding) flat_binding_drop(link);
++                if (*existing == binding) flat_binding_drop(existing);
+             }
+             // Alignment, conflict, and unsupported mappings remain indirect.
+         }
+--- a/kernel/memory.h
++++ b/kernel/memory.h
+@@ -45,7 +45,7 @@
+     struct mmu mmu;
+ #ifdef GUEST_ARM64
+     struct CodiPadGuestMemoryWindow *flat_window;
+-    struct flat_memory_binding *flat_bindings;
++    struct flat_memory_binding ***flat_bindings;
+     bool flat_failed;
+ #endif
+ 

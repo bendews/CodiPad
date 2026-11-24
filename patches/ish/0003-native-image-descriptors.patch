@@ -1,0 +1,33 @@
+--- a/kernel/native_offload.c
++++ b/kernel/native_offload.c
+@@ -78,6 +78,9 @@
+ }
+ #else
+ 
++// The process authority validates the exact descriptor bytes at this visible guest path.
++extern int codipad_kernel_native_image_validate(const char *guest_path);
++
+ // --- Dynamic registry ---
+ 
+ struct offload_entry {
+@@ -261,6 +264,10 @@
+                 guest_path);
+         return NULL;
+     }
++    // Task-aware tools require a real, exact-version descriptor inode. A matching basename alone
++    // never claims a guest ELF, script, or missing PATH candidate.
++    if (e->task_handler != NULL && codipad_kernel_native_image_validate(guest_path) < 0)
++        return NULL;
+     if (native_offload_env_disabled(e->guest_name, envp)) {
+         fprintf(stderr, "native_offload: %s: disabled by environment, running the guest's own file\n",
+                 guest_path);
+@@ -972,7 +979,8 @@
+         return _ENOENT;
+     if (!native_offload_path_allowed(entry->guest_name, guest_file) ||
+         native_offload_env_disabled(entry->guest_name, envp) ||
+-        native_offload_name_is_generic(entry->guest_name))
++        native_offload_name_is_generic(entry->guest_name) ||
++        codipad_kernel_native_image_validate(guest_file) < 0)
+         return _ENOENT;
+     return exec_handler(NULL, entry->task_handler, entry->task_preflight,
+                         guest_file, argc, argv, envp);

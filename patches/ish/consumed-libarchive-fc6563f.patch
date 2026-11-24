@@ -1,0 +1,67 @@
+diff --git a/libarchive/archive_read_support_format_tar.c b/libarchive/archive_read_support_format_tar.c
+index 96d8101..693e3fe 100644
+--- a/libarchive/archive_read_support_format_tar.c
++++ b/libarchive/archive_read_support_format_tar.c
+@@ -1672,25 +1672,13 @@ pax_header(struct archive_read *a, struct tar *tar,
+ 	}
+ 
+ 	/*
+-	 * PAX format uses UTF-8 as default charset for its metadata
+-	 * unless hdrcharset=BINARY is present in its header.
+-	 * We apply the charset specified by the hdrcharset option only
+-	 * when the hdrcharset attribute(in PAX header) is BINARY because
+-	 * we respect the charset described in PAX header and BINARY also
+-	 * means that metadata(filename,uname and gname) character-set
+-	 * is unknown.
++	 * Linux fakefs keeps the archive's path bytes: a guest filename is a
++	 * byte string. Converting PAX metadata through the host locale cannot
++	 * express it on a host whose charset is not UTF-8 (an iOS app runs in
++	 * the C locale) and rewrites it on macOS. A NULL converter copies the
++	 * bytes unchanged, exactly as the ustar path above already does.
+ 	 */
+-	if (tar->pax_hdrcharset_binary)
+-		sconv = tar->opt_sconv;
+-	else {
+-		sconv = archive_string_conversion_from_charset(
+-		    &(a->archive), "UTF-8", 1);
+-		if (sconv == NULL)
+-			return (ARCHIVE_FATAL);
+-		if (tar->compat_2x)
+-			archive_string_conversion_set_opt(sconv,
+-			    SCONV_SET_OPT_UTF8_LIBARCHIVE2X);
+-	}
++	sconv = NULL;
+ 
+ 	if (archive_strlen(&(tar->entry_gname)) > 0) {
+ 		if (archive_entry_copy_gname_l(entry, tar->entry_gname.s,
+diff --git a/libarchive/archive_string.c b/libarchive/archive_string.c
+index c77dcf5..c314ef2 100644
+--- a/libarchive/archive_string.c
++++ b/libarchive/archive_string.c
+@@ -1222,11 +1222,9 @@ create_sconv_object(const char *fc, const char *tc,
+ 	 */
+ 	if ((flag & SCONV_FROM_CHARSET) &&
+ 	    (flag & (SCONV_FROM_UTF16 | SCONV_FROM_UTF8))) {
+-#if defined(__APPLE__)
+-		if (flag & SCONV_TO_UTF8)
+-			flag |= SCONV_NORMALIZATION_D;
+-		else
+-#endif
++		/* Linux fakefs stores guest path bytes in SQLite, not host filenames.
++		 * Preserve UTF-8 byte spelling, including symlink targets. */
++		if (!(flag & SCONV_TO_UTF8))
+ 			flag |= SCONV_NORMALIZATION_C;
+ 	}
+ #if defined(__APPLE__)
+@@ -1247,10 +1245,7 @@ create_sconv_object(const char *fc, const char *tc,
+ 	 * correctly compare the filename with other one which comes
+ 	 * from HFS Plus filesystem.
+ 	 */
+-	if ((flag & SCONV_FROM_CHARSET) &&
+-	   !(flag & (SCONV_FROM_UTF16 | SCONV_FROM_UTF8)) &&
+-	    (flag & SCONV_TO_UTF8))
+-		flag |= SCONV_NORMALIZATION_D;
++	/* No host-filesystem Unicode normalization for Linux fakefs imports. */
+ #endif
+ 
+ #if defined(HAVE_ICONV)

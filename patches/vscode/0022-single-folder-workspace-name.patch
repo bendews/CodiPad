@@ -1,0 +1,63 @@
+--- a/src/vs/workbench/services/configuration/browser/configurationService.ts
++++ b/src/vs/workbench/services/configuration/browser/configurationService.ts
+@@ -554,12 +554,12 @@
+ 	private async updateWorkspaceAndInitializeConfiguration(workspace: Workspace, trigger: boolean): Promise<void> {
+ 		const hasWorkspaceBefore = !!this.workspace;
+ 		let previousState: WorkbenchState | undefined;
+-		let previousWorkspacePath: string | undefined;
++		let previousWorkspaceResource: string | undefined;
+ 		let previousFolders: WorkspaceFolder[] = [];
+ 
+ 		if (hasWorkspaceBefore) {
+ 			previousState = this.getWorkbenchState();
+-			previousWorkspacePath = this.workspace.configuration ? this.workspace.configuration.fsPath : undefined;
++			previousWorkspaceResource = (this.workspace.configuration ?? this.workspace.folders[0]?.uri)?.toString();
+ 			previousFolders = this.workspace.folders;
+ 			this.workspace.update(workspace);
+ 		} else {
+@@ -575,8 +575,8 @@
+ 				this._onDidChangeWorkbenchState.fire(newState);
+ 			}
+ 
+-			const newWorkspacePath = this.workspace.configuration ? this.workspace.configuration.fsPath : undefined;
+-			if (previousWorkspacePath && newWorkspacePath !== previousWorkspacePath || newState !== previousState) {
++			const newWorkspaceResource = (this.workspace.configuration ?? this.workspace.folders[0]?.uri)?.toString();
++			if (newWorkspaceResource !== previousWorkspaceResource || newState !== previousState) {
+ 				this._onDidChangeWorkspaceName.fire();
+ 			}
+ 
+--- a/src/vs/workbench/services/configuration/test/browser/configurationService.test.ts
++++ b/src/vs/workbench/services/configuration/test/browser/configurationService.test.ts
+@@ -1384,10 +1384,11 @@
+ 		await testObject.initialize(convertToWorkspacePayload(joinPath(ROOT, 'b')));
+ 
+ 		assert.strictEqual(testObject.getValue('initialization.testSetting1'), 'userValue');
+-		assert.strictEqual(target.callCount, 2);
+-		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[1][0]).added.map(folder_1 => folder_1.uri.toString()), [joinPath(ROOT, 'b').toString()]);
+-		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[1][0]).removed.map(folder_2 => folder_2.uri.toString()), [joinPath(ROOT, 'a').toString()]);
+-		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[1][0]).changed, []);
++		assert.strictEqual(target.callCount, 3);
++		assert.deepStrictEqual(target.args[0], [undefined]);
++		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[2][0]).added.map(folder_1 => folder_1.uri.toString()), [joinPath(ROOT, 'b').toString()]);
++		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[2][0]).removed.map(folder_2 => folder_2.uri.toString()), [joinPath(ROOT, 'a').toString()]);
++		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[2][0]).changed, []);
+ 
+ 	}));
+ 
+@@ -1405,11 +1406,12 @@
+ 		await testObject.initialize(convertToWorkspacePayload(joinPath(ROOT, 'b')));
+ 
+ 		assert.strictEqual(testObject.getValue('initialization.testSetting1'), 'workspaceValue2');
+-		assert.strictEqual(target.callCount, 3);
++		assert.strictEqual(target.callCount, 4);
++		assert.deepStrictEqual(target.args[1], [undefined]);
+ 		assert.deepStrictEqual([...(<IConfigurationChangeEvent>target.args[0][0]).affectedKeys], ['initialization.testSetting1']);
+-		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[2][0]).added.map(folder_1 => folder_1.uri.toString()), [joinPath(ROOT, 'b').toString()]);
+-		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[2][0]).removed.map(folder_2 => folder_2.uri.toString()), [joinPath(ROOT, 'a').toString()]);
+-		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[2][0]).changed, []);
++		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[3][0]).added.map(folder_1 => folder_1.uri.toString()), [joinPath(ROOT, 'b').toString()]);
++		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[3][0]).removed.map(folder_2 => folder_2.uri.toString()), [joinPath(ROOT, 'a').toString()]);
++		assert.deepStrictEqual((<IWorkspaceFoldersChangeEvent>target.args[3][0]).changed, []);
+ 
+ 	}));
+ 

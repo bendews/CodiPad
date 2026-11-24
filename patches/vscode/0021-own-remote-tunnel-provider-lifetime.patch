@@ -1,0 +1,34 @@
+diff --git a/src/vs/workbench/api/browser/mainThreadTunnelService.ts b/src/vs/workbench/api/browser/mainThreadTunnelService.ts
+--- a/src/vs/workbench/api/browser/mainThreadTunnelService.ts
++++ b/src/vs/workbench/api/browser/mainThreadTunnelService.ts
+@@ -10,5 +10,5 @@
+ import { IRemoteExplorerService, PORT_AUTO_FORWARD_SETTING, PORT_AUTO_SOURCE_SETTING, PORT_AUTO_SOURCE_SETTING_HYBRID, PORT_AUTO_SOURCE_SETTING_OUTPUT, PortsEnablement } from '../../services/remote/common/remoteExplorerService.js';
+ import { ITunnelProvider, ITunnelService, TunnelCreationOptions, TunnelProviderFeatures, TunnelOptions, RemoteTunnel, ProvidedPortAttributes, PortAttributesProvider, TunnelProtocol } from '../../../platform/tunnel/common/tunnel.js';
+-import { Disposable } from '../../../base/common/lifecycle.js';
++import { Disposable, IDisposable, MutableDisposable } from '../../../base/common/lifecycle.js';
+ import type { TunnelDescription } from '../../../platform/remote/common/remoteAuthorityResolver.js';
+ import { INotificationService, Severity } from '../../../platform/notification/common/notification.js';
+@@ -25,4 +25,5 @@
+ export class MainThreadTunnelService extends Disposable implements MainThreadTunnelServiceShape, PortAttributesProvider {
+ 	private readonly _proxy: ExtHostTunnelServiceShape;
++	private readonly _provider = this._register(new MutableDisposable<IDisposable>());
+ 	private elevateionRetry: boolean = false;
+ 	private portsAttributesProviders: Map<number, PortAttributesSelector> = new Map();
+@@ -201,5 +202,5 @@
+ 			this.tunnelService.setTunnelFeatures(features);
+ 		}
+-		this.tunnelService.setTunnelProvider(tunnelProvider);
++		this._provider.value = this.tunnelService.setTunnelProvider(tunnelProvider);
+ 		// At this point we clearly want the ports view/features since we have a tunnel factory
+ 		if (isResolver) {
+diff --git a/src/vs/platform/tunnel/common/tunnel.ts b/src/vs/platform/tunnel/common/tunnel.ts
+--- a/src/vs/platform/tunnel/common/tunnel.ts
++++ b/src/vs/platform/tunnel/common/tunnel.ts
+@@ -267,4 +267,7 @@
+ 		return {
+ 			dispose: () => {
++				if (this._tunnelProvider !== provider) {
++					return;
++				}
+ 				this._tunnelProvider = undefined;
+ 				this._canElevate = false;

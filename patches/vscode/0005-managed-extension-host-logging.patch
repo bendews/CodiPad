@@ -1,0 +1,13 @@
+--- a/src/vs/workbench/api/node/extHostLoggerService.ts
++++ b/src/vs/workbench/api/node/extHostLoggerService.ts
+@@ -13,7 +13,9 @@
+ export class ExtHostLoggerService extends BaseExtHostLoggerService {
+ 
+ 	protected override doCreateLogger(resource: URI, logLevel: LogLevel, options?: ILoggerOptions): ILogger {
+-		if (resource.scheme === Schemas.file) {
++		// Managed iPad hosts use the renderer's native-backed file logger over the normal RPC.
++		// The spdlog native addon is not part of the embedded runtime.
++		if (resource.scheme === Schemas.file && process.env['CODIPAD_MANAGED_EXTENSION_HOST'] !== '1') {
+ 			/* Create the logger in the Extension Host process to prevent loggers (log, output channels...) traffic  over IPC */
+ 			return new SpdLogLogger(options?.name || generateUuid(), resource.fsPath, !options?.donotRotate, !!options?.donotUseFormatters, logLevel);
+ 		}

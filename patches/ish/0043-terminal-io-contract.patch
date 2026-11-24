@@ -1,0 +1,263 @@
+--- a/fs/tty.c
++++ b/fs/tty.c
+@@ -1,6 +1,7 @@
+ #define DEFAULT_CHANNEL debug
+ #include "debug.h"
+ #include <string.h>
++#include <time.h>
+ #include "kernel/calls.h"
+ #include "fs/poll.h"
+ #include "fs/tty.h"
+@@ -47,6 +48,7 @@
+     cond_init(&tty->consumed);
+     memset(tty->buf_flag, false, sizeof(tty->buf_flag));
+     tty->bufsize = 0;
++    tty->input_sequence = 0;
+     tty->packet_flags = 0;
+ 
+     return tty;
+@@ -211,6 +213,13 @@
+     return 0;
+ }
+ 
++// All callers hold tty->lock; notification and rearming observe the same input state.
++static void tty_notify_consumed(struct tty *tty) {
++    notify(&tty->consumed);
++    if (tty->bufsize < sizeof(tty->buf) && tty->driver->ops->input_ready)
++        tty->driver->ops->input_ready(tty);
++}
++
+ static void tty_input_wakeup(struct tty *tty) {
+     notify(&tty->produced);
+     tty_poll_wakeup(tty, POLL_READ);
+@@ -225,6 +234,7 @@
+     }
+     tty->buf[tty->bufsize] = ch;
+     tty->buf_flag[tty->bufsize++] = flag;
++    tty->input_sequence++;
+     return 0;
+ }
+ 
+@@ -369,11 +379,13 @@
+             }
+             assert(tty->bufsize < sizeof(tty->buf));
+             tty->buf[tty->bufsize++] = input[i];
++            tty->input_sequence++;
+         }
+         if (tty->bufsize > 0)
+             tty_input_wakeup(tty);
+     }
+ 
++    tty_notify_consumed(tty);
+     pid_t_ fg_group = tty->fg_group;
+     assert(tty->bufsize <= sizeof(tty->buf));
+     unlock(&tty->lock);
+@@ -397,7 +409,7 @@
+     tty->bufsize -= bufsize;
+     memmove(tty->buf, tty->buf + bufsize, tty->bufsize); // magic!
+     memmove(tty->buf_flag, tty->buf_flag + bufsize, tty->bufsize);
+-    notify(&tty->consumed);
++    tty_notify_consumed(tty);
+ }
+ 
+ static size_t tty_canon_size(struct tty *tty) {
+@@ -439,6 +451,45 @@
+         return _EIO;
+     else
+         return _EINTR;
++}
++
++// tty->lock held. VTIME is a read deadline when VMIN=0, and an
++// inter-byte deadline otherwise. Spurious wakes never extend either deadline.
++static int tty_wait_noncanonical(struct tty *tty, size_t requested, bool nonblocking) {
++    size_t minimum = tty->termios.cc[VMIN_];
++    unsigned deciseconds = tty->termios.cc[VTIME_];
++    if (minimum > requested) minimum = requested;
++    if (nonblocking) return tty->bufsize ? 0 : _EAGAIN;
++    if (!minimum && !deciseconds) return 0;
++    size_t target = minimum ? minimum : 1;
++    uint64_t sequence = tty->input_sequence;
++    bool timer_started = false;
++    struct timespec deadline = {0};
++    for (;;) {
++        if (tty->bufsize >= target) return 0;
++        if (tty->hung_up || pty_is_half_closed_master(tty)) return tty->bufsize ? 0 : _EIO;
++        struct timespec remaining, *timeout = NULL;
++        if (deciseconds && (!minimum || tty->bufsize)) {
++            struct timespec now;
++            clock_gettime(CLOCK_MONOTONIC, &now);
++            if (!timer_started || (minimum && sequence != tty->input_sequence)) {
++                deadline = now;
++                deadline.tv_sec += deciseconds / 10;
++                deadline.tv_nsec += (deciseconds % 10) * 100000000L;
++                if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
++                timer_started = true;
++            }
++            sequence = tty->input_sequence;
++            remaining.tv_sec = deadline.tv_sec - now.tv_sec;
++            remaining.tv_nsec = deadline.tv_nsec - now.tv_nsec;
++            if (remaining.tv_nsec < 0) { remaining.tv_sec--; remaining.tv_nsec += 1000000000L; }
++            if (remaining.tv_sec < 0 || (!remaining.tv_sec && !remaining.tv_nsec)) return 0;
++            timeout = &remaining;
++        }
++        int error = wait_for(&tty->produced, &tty->lock, timeout);
++        if (error == _ETIMEDOUT) return 0;
++        if (error < 0) return tty->bufsize ? 0 : error;
++    }
+ }
+ 
+ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
+@@ -499,31 +550,8 @@
+         if (bufsize > canon_size)
+             bufsize = canon_size;
+     } else {
+-        dword_t min = tty->termios.cc[VMIN_];
+-        dword_t time = tty->termios.cc[VTIME_];
+-
+-        struct timespec timeout;
+-        // time is in tenths of a second
+-        timeout.tv_sec = time / 10;
+-        timeout.tv_nsec = (time % 10) * 100000000;
+-        struct timespec *timeout_ptr = &timeout;
+-        if (time == 0)
+-            timeout_ptr = NULL;
+-
+-        while (tty->bufsize < min) {
+-            err = _EIO;
+-            if (pty_is_half_closed_master(tty))
+-                goto error;
+-            err = _EAGAIN;
+-            if (fd->flags & O_NONBLOCK_)
+-                goto error;
+-            // there should be no timeout for the first character read
+-            err = wait_for(&tty->produced, &tty->lock, tty->bufsize == 0 ? NULL : timeout_ptr);
+-            if (err == _ETIMEDOUT)
+-                break;
+-            if (err == _EINTR)
+-                goto error;
+-        }
++        err = tty_wait_noncanonical(tty, bufsize, (fd->flags & O_NONBLOCK_) != 0);
++        if (err < 0) goto error;
+     }
+ 
+     if (bufsize > tty->bufsize)
+@@ -701,7 +729,7 @@
+             break;
+         case TCSETSF_:
+             tty->bufsize = 0;
+-            notify(&tty->consumed);
++            tty_notify_consumed(tty);
+             fallthrough;
+         case TCSETSW_:
+             // we have no output buffer currently
+@@ -744,7 +772,7 @@
+                 case TCIFLUSH_:
+                 case TCIOFLUSH_:
+                     tty->bufsize = 0;
+-                    notify(&tty->consumed);
++                    tty_notify_consumed(tty);
+                     break;
+                 case TCOFLUSH_:
+                     break;
+--- a/fs/tty.h
++++ b/fs/tty.h
+@@ -97,6 +97,8 @@
+     int (*write)(struct tty *tty, const void *buf, size_t len, bool blocking);
+     int (*ioctl)(struct tty *tty, int cmd, void *arg);
+     void (*cleanup)(struct tty *tty);
++    // Called with tty->lock held. May enqueue work, but must not re-enter the kernel.
++    void (*input_ready)(struct tty *tty);
+ };
+ 
+ // indexed by major number
+@@ -115,6 +117,7 @@
+     // are created by EOL and EOF characters. You can't backspace past a flag.
+     bool buf_flag[TTY_BUF_SIZE];
+     size_t bufsize;
++    uint64_t input_sequence; // distinguishes new input from spurious wakeups
+     uint8_t packet_flags;
+     cond_t produced;
+     cond_t consumed;
+--- a/kernel/task.h
++++ b/kernel/task.h
+@@ -56,6 +56,7 @@
+     bool blocking;
+     // Per-thread pipe for futex_wait wakeup (reused across calls to avoid
+     // pipe creation overhead in Go runtime spin loops)
++    int host_io_pipe[2]; // owned host-IO wakeup pipe; sighand lock protects publication/close
+     int futex_pipe[2]; // [0]=read, [1]=write; -1 if not yet created
+     // Timestamp (CLOCK_MONOTONIC ns) of last time blocking became false.
+     // Used by deadlock detector to check how long ALL threads have been stuck.
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -111,6 +111,7 @@
+     list_init(&task->queue);
+     task->clear_tid = 0;
+     task->robust_list = 0;
++    task->host_io_pipe[0] = task->host_io_pipe[1] = -1;
+     task->futex_pipe[0] = -1;
+     task->futex_pipe[1] = -1;
+     task->did_exec = false;
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2,6 +2,8 @@
+ #include <string.h>
+ #include <signal.h>
+ #include <stdio.h>
++#include <unistd.h>
++#include <errno.h>
+ #include "kernel/calls.h"
+ #include "kernel/signal.h"
+ #include "kernel/task.h"
+@@ -12,7 +14,6 @@
+ #if is_gcc(9)
+ #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
+ #endif
+-
+ 
+ int xsave_extra = 0;
+ int fxsave_extra = 0;
+@@ -70,6 +71,16 @@
+ 
+     if (sigset_has(task->blocked & ~task->waiting, sig) && signal_is_blockable(sig))
+         return;
++
++    // The nonblocking pipe records a wake even if the reader has not entered
++    // poll yet. A full pipe is already readable. Publication/close use this lock.
++    if (task->host_io_pipe[1] >= 0) {
++        int saved_errno = errno;
++        const char wake = 1;
++        ssize_t result;
++        do { result = write(task->host_io_pipe[1], &wake, 1); } while (result < 0 && errno == EINTR);
++        errno = saved_errno;
++    }
+ 
+     if (task != current) {
+         pthread_kill(task->thread, SIGUSR1);
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -18,6 +18,10 @@
+ #endif
+ 
+ static void halt_system(void);
++#if defined(__APPLE__)
++// Optional debug-only host hook; never touches guest locks.
++#else
++#endif
+ 
+ // Weak default: overridden by main.c in CLI builds.
+ // In iOS/Xcode builds where main.c is not linked into libish.a,
+@@ -123,6 +127,13 @@
+         fdtable_release(files);
+     if (fs != NULL)
+         fs_info_release(fs);
++    // Signal delivery holds this lock while writing the wake pipe.
++    lock(&current->sighand->lock);
++    for (unsigned i = 0; i < 2; i++) {
++        if (current->host_io_pipe[i] >= 0) close(current->host_io_pipe[i]);
++        current->host_io_pipe[i] = -1;
++    }
++    unlock(&current->sighand->lock);
+     // Close per-thread futex wakeup pipe
+     if (current->futex_pipe[0] != -1) {
+         close(current->futex_pipe[0]);

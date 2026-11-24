@@ -1,0 +1,20 @@
+--- a/src/vs/workbench/contrib/terminal/browser/terminalProfileResolverService.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalProfileResolverService.ts
+@@ -408,7 +408,7 @@
+ 			{
+ 				getDefaultSystemShell: async (remoteAuthority, os) => {
+ 					const backend = await terminalInstanceService.getBackend(remoteAuthority);
+-					if (!remoteAuthority || !backend) {
++					if (!backend) {
+ 						// Just return basic values, this is only for serverless web and wouldn't be used
+ 						return os === OperatingSystem.Windows ? 'pwsh' : 'bash';
+ 					}
+@@ -416,7 +416,7 @@
+ 				},
+ 				getEnvironment: async (remoteAuthority) => {
+ 					const backend = await terminalInstanceService.getBackend(remoteAuthority);
+-					if (!remoteAuthority || !backend) {
++					if (!backend) {
+ 						return env;
+ 					}
+ 					return backend.getEnvironment();

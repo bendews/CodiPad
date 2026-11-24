@@ -1,0 +1,110 @@
+--- a/emu/mmu.h
++++ b/emu/mmu.h
+@@ -52,6 +52,11 @@
+ struct mmu_ops {
+     // type is MEM_READ or MEM_WRITE
+     void *(*translate)(struct mmu *mmu, addr_t addr, int type);
++#ifdef GUEST_ARM64
++    // A returned pointer remains valid for one access while the caller's
++    // address-space read lock is held, even if the generation changed.
++    bool translate_pointer_borrowed;
++#endif
+     // Like translate(MEM_WRITE) but returns NULL instead of triggering CoW/GROWSDOWN.
+     // Used by TLB to speculatively populate write permission on read miss.
+     void *(*translate_write_nofault)(struct mmu *mmu, addr_t addr);
+@@ -64,4 +69,4 @@
+     return mmu->ops->translate(mmu, addr, type);
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+--- a/kernel/memory.c
++++ b/kernel/memory.c
+@@ -1951,6 +1951,9 @@
+ 
+ static struct mmu_ops mem_mmu_ops = {
+     .translate = mem_mmu_translate,
++#ifdef GUEST_ARM64
++    .translate_pointer_borrowed = true,
++#endif
+     .translate_write_nofault = mem_mmu_translate_write_nofault,
+ #ifdef GUEST_ARM64
+     .get_flat_view = mem_mmu_get_flat_view,
+@@ -1960,6 +1963,7 @@
+ #ifdef GUEST_ARM64
+ static struct mmu_ops mem_flat_mmu_ops = {
+     .translate = mem_mmu_translate,
++    .translate_pointer_borrowed = true,
+     .translate_write_nofault = mem_mmu_translate_write_nofault,
+     .get_flat_view = mem_mmu_get_flat_view,
+ };
+--- a/emu/tlb.c
++++ b/emu/tlb.c
+@@ -87,6 +87,7 @@
+ 
+ #ifdef GUEST_ARM64
+ void tlb_attach(struct tlb *tlb, struct mmu *mmu) {
++    // The caller holds this MMU's address-space read lock until detach.
+     lock(&mmu->tlbs_lock);
+     list_add(&mmu->tlbs, &tlb->tlbs_link);
+     unlock(&mmu->tlbs_lock);
+@@ -221,11 +222,10 @@
+     char *ptr;
+     // A write miss on a CoW page performs the copy inside mmu_translate, which
+     // itself bumps mmu->changes; the retry then sees a stable generation once
+-    // the page is resolved. Bound the loop so a thread continuously remapping
+-    // can't livelock us — after the cap we accept the latest consistent-enough
+-    // translation (the per-block coherence check will still catch a later
+-    // change).
+-    for (int attempt = 0; ; attempt++) {
++    // the page is resolved. Never publish a translation under a generation
++    // observed only after its backing was looked up.
++    bool uncached = false;
++    for (unsigned attempt = 0; ; attempt++) {
+ #ifdef GUEST_ARM64
+         // Clear the stale mark before reading the generation: a change this
+         // read misses marks the TLB stale again (mmu_tlbs_stale()).
+@@ -240,11 +240,20 @@
+         if (__atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE) == gen)
+             break;
+         if (attempt >= 8) {
+-            // Refresh gen to the post-translate value so the entry we stamp is
+-            // at least self-consistent with this last translation.
+-            gen = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
+-            tlb->mem_changes = gen;
++#ifdef GUEST_ARM64
++          if (tlb->attached == tlb->mmu && tlb->mmu->ops->translate_pointer_borrowed) {
++            // The caller holds the memory read lock. This pointer is valid for
++            // this access, but a newer generation must never be attached to it.
++            uncached = true;
++            __atomic_store_n(&tlb->stale, TLB_STALE, __ATOMIC_SEQ_CST);
+             break;
++          }
++#endif
++          // Other MMUs retain their prior bounded behavior until they expose
++          // an equivalent pointer-lifetime contract.
++          gen = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
++          tlb->mem_changes = gen;
++          break;
+         }
+         // Raced with a concurrent remap — retry with the fresh generation.
+     }
+@@ -261,6 +270,17 @@
+     }
+ 
+     tlb->dirty_page = TLB_PAGE(addr);
++
++    if (uncached) {
++        unsigned index = TLB_INDEX(addr);
++        struct tlb_entry *entry = &tlb->entries[index];
++        entry->page = TLB_PAGE_EMPTY;
++        entry->page_if_writable = TLB_PAGE_EMPTY;
++#ifdef GUEST_ARM64
++        tlb->occupied[index / 64] &= ~(1ull << (index % 64));
++#endif
++        return ptr + PGOFFSET(addr);
++    }
+ 
+     struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
+ #ifdef GUEST_ARM64

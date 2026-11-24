@@ -1,0 +1,28 @@
+diff --git a/src/vs/base/node/pfs.ts b/src/vs/base/node/pfs.ts
+index b88098b..8e2512a 100644
+--- a/src/vs/base/node/pfs.ts
++++ b/src/vs/base/node/pfs.ts
+@@ -4,6 +4,7 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import * as fs from 'fs';
++import { resolve as resolveNodePath } from 'path';
+ import { tmpdir } from 'os';
+ import { promisify } from 'util';
+ import { ResourceQueue, timeout } from '../common/async.js';
+@@ -751,6 +752,15 @@ async function realpath(path: string): Promise<string> {
+  */
+ export function realpathSync(path: string): string {
+ 	try {
++		if (isLinux) {
++			try {
++				const normalized = resolveNodePath(path);
++				const nativePath = fs.realpathSync.native(normalized);
++				// A changed path can contain symlinks whose targets Node's JS
++				// implementation normalizes differently from libc realpath.
++				if (nativePath === normalized) { return nativePath; }
++			} catch { /* Preserve the original resolver and its fallback. */ }
++		}
+ 		return fs.realpathSync(path);
+ 	} catch {
+ 

@@ -1,0 +1,232 @@
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -54,27 +54,7 @@
+     return pid_get_task(1);
+ }
+ 
+-noreturn void do_exit(int status) {
+-    /* pid 1 dumps to stderr (the original behaviour). With ISH_PC_HIST_DIR set,
+-     * EVERY exiting process also dumps its own per-pid histogram file, so a
+-     * fork'd chain (pip wheel-build subprocesses) is captured whole. */
+-    extern void dump_pc_hist(void);
+-    extern void dump_pc_trace(void);
+-    extern char *getenv(const char *);
+-    if (current && (current->pid == 1 || getenv("ISH_PC_HIST_DIR"))) {
+-        dump_pc_hist();
+-        if (current->pid == 1) dump_pc_trace();
+-    }
+-    { extern void dump_wx_stats(void);
+-      static int wx_dumped = 0;
+-      if (!wx_dumped && current && current->pid == 1) { wx_dumped = 1; dump_wx_stats(); } }
+-    // If this thread was already marked as leaked by the safety valve,
+-    // the group leader has finished exiting and the group struct may be
+-    // freed. Don't touch any shared state — just kill the host thread.
+-    if (current->exiting) {
+-        current = NULL;
+-        pthread_exit(NULL);
+-    }
++static void finish_exit(int status) {
+     // [T-ish-exit-valve-progress] From here on this thread is leaving; tell
+     // do_exit_group's safety valve not to give up on it while it waits for
+     // pids_lock below.
+@@ -225,13 +205,38 @@
+     }
+ 
+     vfork_notify(current);
+-    if (current != leader) {
+-        struct task *self = current;
+-        current = NULL;  // Clear before destroy to prevent dangling access
++    struct task *self = current;
++    current = NULL; // No pthread cleanup may dereference a task after its real teardown.
++    if (self != leader)
+         task_destroy(self);
+-    }
+     unlock(&pids_lock);
+ 
++}
++
++void task_finish_orphaned(void) {
++    assert(current != NULL && current->exiting && current->mm_release_deferred);
++    finish_exit(current->group->group_exit_code);
++}
++
++noreturn void do_exit(int status) {
++    /* pid 1 dumps to stderr (the original behaviour). With ISH_PC_HIST_DIR set,
++     * EVERY exiting process also dumps its own per-pid histogram file, so a
++     * fork'd chain (pip wheel-build subprocesses) is captured whole. */
++    extern void dump_pc_hist(void);
++    extern void dump_pc_trace(void);
++    extern char *getenv(const char *);
++    if (current && (current->pid == 1 || getenv("ISH_PC_HIST_DIR"))) {
++        dump_pc_hist();
++        if (current->pid == 1) dump_pc_trace();
++    }
++    { extern void dump_wx_stats(void);
++      static int wx_dumped = 0;
++      if (!wx_dumped && current && current->pid == 1) { wx_dumped = 1; dump_wx_stats(); } }
++    // Keep TLS intact: this orphan still owns its deferred teardown, which
++    // runs from task_run_current's pthread cleanup after leaving guest code.
++    if (current->exiting)
++        pthread_exit(NULL);
++    finish_exit(status);
+     pthread_exit(NULL);
+ }
+ 
+@@ -259,11 +264,9 @@
+     { static int jit_reported = 0;
+       if (!jit_reported && current && current->pid == 1) { jit_reported = 1; jit_report(); } }
+ #endif
+-    // Leaked thread woke up after group already exited — bail silently.
+-    if (current->exiting) {
+-        current = NULL;
++    // Its own pthread cleanup must complete the retained orphan teardown.
++    if (current->exiting)
+         pthread_exit(NULL);
+-    }
+     struct tgroup *group = current->group;
+     lock(&pids_lock);
+     lock(&group->lock);
+@@ -386,57 +389,22 @@
+                 nanosleep(&ts2, NULL);
+             }
+ 
+-            // If threads are truly stuck in uninterruptible host syscalls,
+-            // we accept the leak rather than risking heap corruption.
+-            // Mark them as exiting and remove from the thread group list so
+-            // that exit_tgroup() sees the group as dead and notifies the parent.
++            // A blocked thread still owns its task, group membership and resources.
++            // Defer its normal teardown to its own pthread cleanup; never publish
++            // group death while it can still use those resources.
+             lock(&pids_lock);
+             lock(&group->lock);
+             int leaked = 0;
+-            struct task *task_tmp;
+-            list_for_each_entry_safe(&group->threads, task, task_tmp, group_links) {
+-                // [T-ish-exit-valve-progress] Never orphan a thread that is
+-                // already inside do_exit unless it outlasted the cap: it is
+-                // about to touch its group and sighand, which must stay alive.
++            list_for_each_entry(&group->threads, task, group_links) {
++                // A thread already in do_exit owns that teardown even beyond
++                // the wait budget. It must not be force-released a second time.
+                 if (task != current && !task->exiting &&
+-                        (!atomic_load(&task->exit_started) || waited_ms >= EXIT_PROGRESS_CAP_MS)) {
++                        !atomic_load(&task->exit_started)) {
+                     task->exiting = true;
+-                    list_remove(&task->group_links);
+-                    // Release resources so pipes get EOF and memory is freed.
+-                    if (task->sighand != NULL) {
+-                        sighand_release(task->sighand);
+-                        task->sighand = NULL;
+-                    }
+-                    // [T-ish-mem-uaf-user-write / T-ish-mm-leak-refcount-handoff]
+-                    // DO NOT mm_release() a stuck thread's mm HERE. This thread
+-                    // is, by definition, still running inside an uninterruptible
+-                    // host syscall (e.g. sys_read → user_write blocked on a
+-                    // pipe) and may still hold mem->lock and be about to
+-                    // dereference task->mem. Freeing the mm now is a
+-                    // use-after-free (EXC_BAD_ACCESS at 0x38 = offsetof(struct
+-                    // mem, lock)). So keep task->mm/task->mem intact for now, but
+-                    // DEFER the release to this thread's own pthread cleanup
+-                    // handler (task_run_current), which runs only after the
+-                    // thread has left the read_wrlock critical section — so it
+-                    // both avoids the UAF and, unlike the old "accept the leak"
+-                    // path, actually reclaims the whole guest address space once
+-                    // the host pthread finally terminates. If the thread instead
+-                    // unblocks and re-enters do_exit(), that mm_release()s and
+-                    // clears the flag, so cleanup won't double-free.
+                     task->mm_release_deferred = true;
+-                    // [T-ish-mm-diag] Unconditional (not exec-trace gated): one
+-                    // line per leaked thread, once — the flag above is set once.
+-                    printk("[iSH][SAFETY-VALVE] tid=%d (group pid=%d) marked mm_release_deferred, mm=%p refcount=%u\n",
++                    printk("[iSH][SAFETY-VALVE] tid=%d (group pid=%d) deferred exit, mm=%p refcount=%u\n",
+                            task->pid, current->pid, (void *) task->mm,
+                            task->mm ? (unsigned) task->mm->refcount : 0u);
+-                    if (task->files != NULL) {
+-                        fdtable_release(task->files);
+-                        task->files = NULL;
+-                    }
+-                    if (task->fs != NULL) {
+-                        fs_info_release(task->fs);
+-                        task->fs = NULL;
+-                    }
+                     leaked++;
+                 }
+             }
+@@ -445,7 +413,7 @@
+             // [T-ish-mm-diag] Unconditional: do_exit_group runs once per
+             // process, so this is at most one line per exiting process.
+             if (leaked > 0)
+-                printk("[iSH][SAFETY-VALVE] pid=%d leaked %d stuck threads, mm_release deferred\n",
++                printk("[iSH][SAFETY-VALVE] pid=%d retained %d stuck threads until pthread cleanup\n",
+                        current->pid, leaked);
+         } else {
+ 
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -176,31 +176,13 @@
+     tlb_detach((struct tlb *) arg);   // exited while running guest code
+ #endif
+     tlb_free((struct tlb *)arg);
+-    // [T-ish-mm-leak-refcount-handoff] If the do_exit_group safety valve
+-    // orphaned this thread (stuck in an uninterruptible host syscall) it
+-    // deferred the mm_release to here — this runs only when the host pthread
+-    // actually terminates, i.e. AFTER the thread has left the read_wrlock
+-    // critical section, so releasing now can't UAF the mem lock. This reclaims
+-    // the whole guest address space instead of leaking it forever. `current`
+-    // is a __thread TLS pointer, still valid inside pthread cleanup.
++    // The safety valve keeps this orphan linked and its resources owned until
++    // its own pthread leaves guest execution. Finish the same real teardown as
++    // do_exit only now, after detaching/freeing its TLB. The helper clears TLS
++    // before PID destruction; nothing in this cleanup accesses the task again.
+     struct task *self = current;
+-    if (self != NULL && self->mm_release_deferred && self->mm != NULL) {
+-        self->mm_release_deferred = false;
+-        // [T-ish-exit-mm-general-lock] Same handoff as do_exit: unpublish the
+-        // mm under general_lock so a procfs reader cannot lock it after we
+-        // destroy it, then release outside the lock.
+-        lock(&self->general_lock);
+-        struct mm *mm = self->mm;
+-        self->mm = NULL;
+-        self->mem = NULL;
+-        unlock(&self->general_lock);
+-        // [T-ish-mm-diag] The other half of the SAFETY-VALVE line: when the
+-        // leaked thread finally unwinds and releases, and what refcount it
+-        // finds — a value other than 1 here means a second holder.
+-        printk("[iSH][DEFERRED-RELEASE] pid=%d mm_release from cleanup handler, mm=%p refcount_before=%u\n",
+-               self->pid, (void *) mm, (unsigned) mm->refcount);
+-        mm_release_from(mm, "cleanup_handler");
+-    }
++    if (self != NULL && self->mm_release_deferred)
++        task_finish_orphaned();
+ }
+ 
+ void task_run_current() {
+--- a/kernel/task.h
++++ b/kernel/task.h
+@@ -100,14 +100,9 @@
+     dword_t exit_code;
+     bool zombie;
+     bool exiting;
+-    // [T-ish-mm-leak-refcount-handoff] Set by the do_exit_group safety valve
+-    // when it orphans a thread stuck in an uninterruptible host syscall: the
+-    // valve can't mm_release() now (the thread may still hold mem->lock inside
+-    // user_write → UAF, see T-ish-mem-uaf-user-write), so it hands the release
+-    // off to this thread's own pthread cleanup handler, which runs only after
+-    // the thread has left the read_wrlock critical section. Prevents the mm
+-    // (whole guest address space) from leaking forever when the thread never
+-    // re-enters do_exit(). Cleared once released so it never double-frees.
++    // Set by the group-exit safety valve for a thread still blocked in host
++    // code. Its group membership and resources stay owned until that thread's
++    // own pthread cleanup completes normal exit. Cleared by its mm teardown.
+     bool mm_release_deferred;
+     // [T-ish-exit-valve-progress] Set by the thread itself on entering
+     // do_exit, before it queues for pids_lock. do_exit_group's safety valve
+@@ -177,6 +172,8 @@
+ struct task *task_create_(struct task *parent);
+ // Removes the process from the process table and frees it. Must be called with pids_lock.
+ void task_destroy(struct task *task);
++// Finish a safety-valve orphan from its own pthread cleanup, after leaving guest code.
++void task_finish_orphaned(void);
+ 
+ // misc
+ void vfork_notify(struct task *task);

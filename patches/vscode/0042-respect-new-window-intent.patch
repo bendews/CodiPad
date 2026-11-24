@@ -1,0 +1,11 @@
+--- a/src/vs/workbench/services/host/browser/browserHostService.ts
++++ b/src/vs/workbench/services/host/browser/browserHostService.ts
+@@ -490,7 +490,7 @@
+ 		// we swap that folder into the workspace to avoid a window reload. Access
+ 		// to local resources is only possible without a window reload because it
+ 		// needs user activation.
+-		if (workspace && isFolderToOpen(workspace) && workspace.folderUri.scheme === Schemas.file && isTemporaryWorkspace(this.contextService.getWorkspace())) {
++		if (options?.reuse !== false && workspace && isFolderToOpen(workspace) && workspace.folderUri.scheme === Schemas.file && isTemporaryWorkspace(this.contextService.getWorkspace())) {
+ 			this.withServices(async accessor => {
+ 				const workspaceEditingService: IWorkspaceEditingService = accessor.get(IWorkspaceEditingService);
+ 

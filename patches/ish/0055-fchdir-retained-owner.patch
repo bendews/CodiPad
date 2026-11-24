@@ -1,0 +1,14 @@
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -892,10 +892,9 @@
+ 
+ dword_t sys_fchdir(fd_t f) {
+     STRACE("fchdir(%d)", f);
+-    struct fd *dir = f_get(f);
++    struct fd *dir = f_get_retained(f);
+     if (dir == NULL)
+         return _EBADF;
+-    dir->refcount++;
+     fs_chdir(current->fs, dir);
+     return 0;
+ }

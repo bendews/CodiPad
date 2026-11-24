@@ -1,0 +1,131 @@
+--- a/src/vs/workbench/contrib/chat/browser/widgetHosts/viewPane/chatViewPane.ts
++++ b/src/vs/workbench/contrib/chat/browser/widgetHosts/viewPane/chatViewPane.ts
+@@ -1905,6 +1905,10 @@
+ 	}
+ 
+ 	override shouldShowWelcome(): boolean {
++		// Public participants can run independently of the default provider setup.
++		if (!this.chatEntitlementService.sentiment.hidden && this.chatAgentService.getAgents().some(agent => !agent.isCore && !agent.isDefault && agent.locations.includes(ChatAgentLocation.Chat))) {
++			return false;
++		}
+ 		const noPersistedSessions = !this.chatService.hasSessions();
+ 		const hasCoreAgent = this.chatAgentService.getAgents().some(agent => agent.isCore && agent.locations.includes(ChatAgentLocation.Chat));
+ 		const hasDefaultAgent = this.chatAgentService.getDefaultAgent(ChatAgentLocation.Chat) !== undefined; // only false when Hide AI Features has run and unregistered the setup agents
+--- a/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts
++++ b/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts
+@@ -418,7 +418,7 @@
+ 	}
+ 
+ 	isEnabled(location: ChatAgentLocation): boolean {
+-		return this.chatAgentService.getContributedDefaultAgent(location) !== undefined;
++		return this.chatAgentService.getAgents().some(agent => agent.locations.includes(location));
+ 	}
+ 
+ 	private migrateData(): ISerializableChatsData | undefined {
+@@ -714,7 +714,9 @@
+ 		if (isLocalChatSessionSubjectToManagedPolicy(model.sessionResource, model.initialLocation) && !this.policyInitialized) {
+ 			await whenAccountPolicySettled(this.accountPolicyGateService);
+ 		}
+-		if (!isLocalChatSessionSubjectToManagedPolicy(model.sessionResource, model.initialLocation) || !this.managedPolicy.get()) {
++		await this.extensionService.whenInstalledExtensionsRegistered();
++		if ((!isLocalChatSessionSubjectToManagedPolicy(model.sessionResource, model.initialLocation) || !this.managedPolicy.get())
++			&& (this.chatAgentService.getContributedDefaultAgent(model.initialLocation) || this.chatAgentService.getContributedDefaultAgent(ChatAgentLocation.Chat))) {
+ 			await this.activateDefaultAgent(model.initialLocation);
+ 		}
+ 	}
+@@ -1455,7 +1457,11 @@
+ 		if (requestedAgentId && !requestedAgent) {
+ 			throw new Error('Unknown agent: ' + requestedAgentId);
+ 		}
+-		const defaultAgent = requestedAgent ?? this.chatAgentService.getDefaultAgent(location, options?.modeInfo?.kind)!;
++		const defaultAgent = requestedAgent ?? this.chatAgentService.getDefaultAgent(location, options?.modeInfo?.kind)
++			?? request.message.parts.find((r): r is ChatRequestAgentPart => r instanceof ChatRequestAgentPart)?.agent;
++		if (!defaultAgent) {
++			throw new ErrorNoTelemetry('No participant selected and no default agent available');
++		}
+ 
+ 		const preservedRequest = preserveRequestId && request instanceof ChatRequestModel ? request : undefined;
+ 		if (!preservedRequest) {
+@@ -1631,14 +1637,15 @@
+ 
+ 		const location = options?.location ?? model.initialLocation;
+ 		const attempt = options?.attempt ?? 0;
+-		const defaultAgent = this.chatAgentService.getDefaultAgent(location, options?.modeInfo?.kind);
+-		if (!defaultAgent) {
+-			this.logService.warn('sendRequest', `No default agent for location ${location}`);
+-			return { kind: 'rejected', reason: 'No default agent available' };
+-		}
+-
+ 		const parsedRequest = this.parseChatRequest(sessionResource, request, location, options);
+ 		const silentAgent = options?.agentIdSilent ? this.chatAgentService.getAgent(options.agentIdSilent) : undefined;
++		// An explicitly addressed public participant does not require a default provider.
++		const defaultAgent = this.chatAgentService.getDefaultAgent(location, options?.modeInfo?.kind)
++			?? silentAgent ?? parsedRequest.parts.find((r): r is ChatRequestAgentPart => r instanceof ChatRequestAgentPart)?.agent;
++		if (!defaultAgent) {
++			this.logService.warn('sendRequest', `No participant selected for location ${location}`);
++			return { kind: 'rejected', reason: 'No participant selected and no default agent available' };
++		}
+ 		const agent = silentAgent ?? parsedRequest.parts.find((r): r is ChatRequestAgentPart => r instanceof ChatRequestAgentPart)?.agent ?? defaultAgent;
+ 		const agentSlashCommandPart = parsedRequest.parts.find((r): r is ChatRequestAgentSubcommandPart => r instanceof ChatRequestAgentSubcommandPart);
+ 
+@@ -2401,14 +2408,6 @@
+ 		};
+ 
+ 		const location = sendOptions.location ?? sendOptions.locationData?.type ?? model.initialLocation;
+-		const defaultAgent = this.chatAgentService.getDefaultAgent(location, sendOptions.modeInfo?.kind);
+-		if (!defaultAgent) {
+-			this.logService.warn('processNextPendingRequest', `No default agent for location ${location}`);
+-			for (const deferred of deferreds) {
+-				deferred.complete({ kind: 'rejected', reason: 'No default agent available' });
+-			}
+-			return;
+-		}
+ 
+ 		// For multiple steering requests, combine texts and re-parse; otherwise use as-is
+ 		let parsedRequest: IParsedChatRequest;
+@@ -2435,6 +2434,14 @@
+ 		}
+ 
+ 		const silentAgent = sendOptions.agentIdSilent ? this.chatAgentService.getAgent(sendOptions.agentIdSilent) : undefined;
++		const defaultAgent = this.chatAgentService.getDefaultAgent(location, sendOptions.modeInfo?.kind)
++			?? silentAgent ?? parsedRequest.parts.find((r): r is ChatRequestAgentPart => r instanceof ChatRequestAgentPart)?.agent;
++		if (!defaultAgent) {
++			for (const deferred of deferreds) {
++				deferred.complete({ kind: 'rejected', reason: 'No participant selected and no default agent available' });
++			}
++			return;
++		}
+ 		const agent = silentAgent ?? parsedRequest.parts.find((r): r is ChatRequestAgentPart => r instanceof ChatRequestAgentPart)?.agent ?? defaultAgent;
+ 		const agentSlashCommandPart = parsedRequest.parts.find((r): r is ChatRequestAgentSubcommandPart => r instanceof ChatRequestAgentSubcommandPart);
+ 
+--- a/src/vs/workbench/contrib/chat/common/participants/chatAgents.ts
++++ b/src/vs/workbench/contrib/chat/common/participants/chatAgents.ts
+@@ -371,6 +371,7 @@
+ 	}
+ 
+ 	private _updateContextKeys(): void {
++		this._hasDefaultAgent.set(this.getAgents().some(agent => agent.locations.includes(ChatAgentLocation.Chat)));
+ 		let extensionAgentRegistered = false;
+ 		let defaultAgentRegistered = false;
+ 		let toolsAgentRegistered = false;
+@@ -405,10 +406,6 @@
+ 			throw new Error(`Agent already has implementation: ${JSON.stringify(id)}`);
+ 		}
+ 
+-		if (entry.data.isDefault) {
+-			this._hasDefaultAgent.set(true);
+-		}
+-
+ 		entry.impl = agentImpl;
+ 		this._onDidChangeAgents.fire(new MergedChatAgent(entry.data, agentImpl));
+ 
+@@ -416,9 +413,6 @@
+ 			entry.impl = undefined;
+ 			this._onDidChangeAgents.fire(undefined);
+ 
+-			if (entry.data.isDefault) {
+-				this._hasDefaultAgent.set(Iterable.some(this._agents.values(), agent => agent.data.isDefault && !!agent.impl));
+-			}
+ 		});
+ 	}
+ 

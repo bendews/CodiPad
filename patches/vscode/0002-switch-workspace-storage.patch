@@ -1,0 +1,110 @@
+--- a/src/vs/workbench/services/storage/browser/storageService.ts
++++ b/src/vs/workbench/services/storage/browser/storageService.ts
+@@ -37,7 +37,12 @@
+ 
+ 	private workspaceStorage: IStorage | undefined;
+ 	private workspaceStorageDatabase: IIndexedDBStorageDatabase | undefined;
++	private readonly workspaceStorageDisposables = this._register(new DisposableStore());
+ 
++	// No longer readonly: switching workspace scope updates the identity that `hasScope()` and the
++	// log details report. It only changes once a switch has committed.
++	private workspace: IAnyWorkspaceIdentifier;
++
+ 	get hasPendingUpdate(): boolean {
+ 		return Boolean(
+ 			this.applicationStorageDatabase?.hasPendingUpdate ||
+@@ -67,12 +72,13 @@
+ 	}
+ 
+ 	constructor(
+-		private readonly workspace: IAnyWorkspaceIdentifier,
++		workspace: IAnyWorkspaceIdentifier,
+ 		private readonly userDataProfileService: IUserDataProfileService,
+ 		@ILogService private readonly logService: ILogService,
+ 	) {
+ 		super({ flushInterval: BrowserStorageService.BROWSER_DEFAULT_FLUSH_INTERVAL });
+ 
++		this.workspace = workspace;
+ 		this.profileStorageProfile = this.userDataProfileService.currentProfile;
+ 
+ 		this.registerListeners();
+@@ -156,13 +162,13 @@
+ 		}
+ 	}
+ 
+-	private async createWorkspaceStorage(): Promise<void> {
+-		const workspaceStorageIndexedDB = await IndexedDBStorageDatabase.createWorkspaceStorage(this.workspace.id, this.logService);
++	private async createWorkspaceStorage(workspace: IAnyWorkspaceIdentifier = this.workspace): Promise<void> {
++		const workspaceStorageIndexedDB = await IndexedDBStorageDatabase.createWorkspaceStorage(workspace.id, this.logService);
+ 
+-		this.workspaceStorageDatabase = this._register(workspaceStorageIndexedDB);
+-		this.workspaceStorage = this._register(new Storage(this.workspaceStorageDatabase));
++		this.workspaceStorageDatabase = this.workspaceStorageDisposables.add(workspaceStorageIndexedDB);
++		this.workspaceStorage = this.workspaceStorageDisposables.add(new Storage(this.workspaceStorageDatabase));
+ 
+-		this._register(this.workspaceStorage.onDidChangeStorage(e => this.emitDidChangeValue(StorageScope.WORKSPACE, e)));
++		this.workspaceStorageDisposables.add(this.workspaceStorage.onDidChangeStorage(e => this.emitDidChangeValue(StorageScope.WORKSPACE, e)));
+ 
+ 		await this.workspaceStorage.init();
+ 
+@@ -226,7 +232,59 @@
+ 	}
+ 
+ 	protected async switchToWorkspace(toWorkspace: IAnyWorkspaceIdentifier, preserveData: boolean): Promise<void> {
+-		throw new Error('Migrating storage is currently unsupported in Web');
++		if (this.hasScope(toWorkspace)) {
++			return; // same workspace: nothing to switch
++		}
++
++		const oldWorkspaceStorage = this.workspaceStorage;
++		const oldItems = oldWorkspaceStorage?.items ?? new Map<string, string>();
++
++		// Stage the new scope first: open and initialise its database without touching the current
++		// one, so a failure here leaves the old storage fully usable and only the switch rejects.
++		let stagedDatabase: IIndexedDBStorageDatabase | undefined;
++		let stagedStorage: Storage | undefined;
++		try {
++			stagedDatabase = await IndexedDBStorageDatabase.createWorkspaceStorage(toWorkspace.id, this.logService);
++			stagedStorage = new Storage(stagedDatabase);
++			await stagedStorage.init();
++		} catch (error) {
++			stagedStorage?.dispose();
++			stagedDatabase?.dispose();
++			throw error;
++		}
++
++		// Close the old scope. `Storage.close()` marks itself closed *before* the database closes, so a
++		// rejection can leave the previous storage unusable: discard the staged resources, rebuild the
++		// previous scope and re-signal its values, then surface the original error.
++		try {
++			await oldWorkspaceStorage?.close();
++		} catch (closeError) {
++			stagedStorage?.dispose();
++			stagedDatabase?.dispose();
++			this.workspaceStorageDisposables.clear();
++			this.workspaceStorage = undefined;
++			this.workspaceStorageDatabase = undefined;
++			try {
++				await this.createWorkspaceStorage();	// identity is still the previous workspace here
++				this.switchData(oldItems, assertReturnsDefined(this.workspaceStorage), StorageScope.WORKSPACE);
++			} catch (restoreError) {
++				throw new AggregateError([closeError, restoreError], 'Failed to close the previous workspace storage and to restore it: workspace storage is unrecoverable');
++			}
++			throw closeError;
++		}
++
++		// Commit: from here on the staged storage is the workspace scope.
++		this.workspaceStorageDisposables.clear();
++		this.workspace = toWorkspace;
++		this.workspaceStorageDatabase = this.workspaceStorageDisposables.add(stagedDatabase);
++		this.workspaceStorage = this.workspaceStorageDisposables.add(stagedStorage);
++		this.workspaceStorageDisposables.add(stagedStorage.onDidChangeStorage(e => this.emitDidChangeValue(StorageScope.WORKSPACE, e)));
++		this.updateIsNew(stagedStorage);
++
++		// Always signal the diff: `switchData` only emits change events (platform/storage/common/storage.ts),
++		// it never copies values, so skipping it would leave clients on the previous scope's cached
++		// values. `preserveData` stays unused here, as in the platform base implementation.
++		this.switchData(oldItems, stagedStorage, StorageScope.WORKSPACE);
+ 	}
+ 
+ 	protected override shouldFlushWhenIdle(): boolean {

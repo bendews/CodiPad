@@ -1,0 +1,582 @@
+--- a/kernel/memory.c
++++ b/kernel/memory.c
+@@ -33,6 +33,36 @@
+ #include "kernel/mm.h"
+ #include "emu/tlb.h"
+ 
++// PTEs keep borrowed buffers alive under the address-space lock. Flat aliases
++// add an explicit reference until revocation succeeds. Counts span forked spaces.
++static void data_retain(struct data *data, size_t offset) {
++    atomic_fetch_add_explicit(&data->refcount, 1, memory_order_relaxed);
++    if (data->host_refs)
++        atomic_fetch_add_explicit(&data->host_refs[offset / real_page_size], 1, memory_order_relaxed);
++}
++
++static void data_release(struct data *data, size_t offset) {
++    if (data->host_refs) {
++        size_t group = offset / real_page_size;
++        unsigned previous = atomic_fetch_sub_explicit(&data->host_refs[group], 1, memory_order_acq_rel);
++        assert(previous != 0);
++        if (previous == 1 && atomic_load_explicit(&data->refcount, memory_order_relaxed) != 1) {
++            // No mapping or alias reaches this host page. Drop its physical
++            // backing but reserve its address until the allocation is freed.
++            // Failure only retains unused memory; it cannot fail guest unmap.
++            void *address = (char *) data->data + group * real_page_size;
++            (void) mmap(address, real_page_size, PROT_NONE,
++                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 0, 0);
++        }
++    }
++    if (atomic_fetch_sub_explicit(&data->refcount, 1, memory_order_acq_rel) != 1)
++        return;
++    if (data->data != vdso_data) munmap(data->data, data->size);
++    if (data->fd != NULL) fd_close(data->fd);
++    free(data->host_refs);
++    free(data);
++}
++
+ #ifdef GUEST_ARM64
+ // ============================================================
+ // ARM64: 4-level page table for 48-bit address space
+@@ -54,12 +84,7 @@
+ static void flat_binding_drop(struct flat_memory_binding **link) {
+     struct flat_memory_binding *binding = *link;
+     *link = NULL;
+-    struct data *data = binding->data;
+-    if (--data->refcount == 0) {
+-        if (data->data != vdso_data) munmap(data->data, data->size);
+-        if (data->fd != NULL) fd_close(data->fd);
+-        free(data);
+-    }
++    data_release(binding->data, binding->offset);
+     free(binding);
+ }
+ 
+@@ -184,7 +209,7 @@
+             binding->data = data;
+             binding->offset = first_offset;
+             *existing = binding;
+-            ++data->refcount; // pin backing until its alias is successfully revoked
++            data_retain(data, first_offset); // pin until alias revocation succeeds
+             CodiPadGuestMemoryResult result = CodiPadGuestMemoryWindowBind(
+                 mem->flat_window, group << PAGE_BITS, host_bytes, backing,
+                 CodiPadGuestMemoryRead, &host_error);
+@@ -798,11 +823,20 @@
+         .dest = start << PAGE_BITS,
+ #endif
+     };
++    // Tracking is optional under allocation pressure. Only private anonymous
++    // allocations own disposable backing; shared/file mappings stay unchanged.
++    if (memory != vdso_data && data->size > real_page_size &&
++            (flags & (P_ANONYMOUS | P_SHARED)) == P_ANONYMOUS) {
++        size_t groups = data->size / real_page_size + (data->size % real_page_size != 0);
++        data->host_refs = calloc(groups, sizeof(*data->host_refs));
++        if (data->host_refs)
++            for (size_t group = 0; group < groups; group++) atomic_init(&data->host_refs[group], 0);
++    }
+ 
+     for (page_t page = start; page < start + pages; page++) {
+         if (mem_pt(mem, page) != NULL)
+             pt_unmap(mem, page, 1);
+-        data->refcount++;
++        data_retain(data, ((page - start) << PAGE_BITS) + offset);
+         struct pt_entry *pt = mem_pt_new(mem, page);
+         pt->data = data;
+         pt->offset = ((page - start) << PAGE_BITS) + offset;
+@@ -822,6 +856,22 @@
+     return pt_unmap_always(mem, start, pages);
+ }
+ 
++// Whole-allocation unmap already releases backing in one munmap. Avoid
++// splitting it into host-page reservations first. The writer lock excludes
++// new local PTE/alias references; the exact count rules out other address spaces.
++static void data_unmap_whole(struct mem *mem, page_t start, pages_t remaining,
++                             struct data *data) {
++    if (!data->host_refs || data->size % PAGE_SIZE) return;
++    pages_t pages = data->size / PAGE_SIZE;
++    if (pages > remaining || atomic_load_explicit(&data->refcount, memory_order_acquire) != pages) return;
++    for (pages_t i = 0; i < pages; i++) {
++        struct pt_entry *pt = mem_pt(mem, start + i);
++        if (!pt || pt->data != data || pt->offset != i * PAGE_SIZE) return;
++    }
++    free(data->host_refs);
++    data->host_refs = NULL;
++}
++
+ static int pt_unmap_internal(struct mem *mem, page_t start, pages_t pages, bool remove_reservations) {
+ #ifdef GUEST_ARM64
+     // Revoke aliases before any page can drop the final struct data reference.
+@@ -841,6 +891,7 @@
+ 
+         asbestos_invalidate_page(mem->mmu.asbestos, page);
+         struct data *data = pt->data;
++        if (pt->offset == 0) data_unmap_whole(mem, page, start + pages - page, data);
+ #if ANON_MMAP_LIMIT_PAGES > 0
+         // Decrement per-page for anonymous mappings. This correctly handles
+         // partial unmaps (munmap of subset of original mmap region) where the
+@@ -854,17 +905,9 @@
+         if ((pt->flags & P_ANONYMOUS) && anon_page_is_charged(pt->flags))
+             atomic_fetch_sub(&anon_page_count, 1);
+ #endif
++        size_t offset = pt->offset;
+         mem_pt_del(mem, page);
+-        if (--data->refcount == 0) {
+-            // vdso wasn't allocated with mmap, it's just in our data segment
+-            if (data->data != vdso_data) {
+-                munmap(data->data, data->size);
+-            }
+-            if (data->fd != NULL) {
+-                fd_close(data->fd);
+-            }
+-            free(data);
+-        }
++        data_release(data, offset);
+     }
+     mem_changed(mem);
+     return 0;
+@@ -1275,7 +1318,7 @@
+             return -1;
+         if (!(entry->flags & P_SHARED))
+             entry->flags |= P_COW;
+-        entry->data->refcount++;
++        data_retain(entry->data, entry->offset);
+         struct pt_entry *dst_entry = mem_pt_new(dst, page);
+         dst_entry->data = entry->data;
+         dst_entry->offset = entry->offset;
+@@ -1631,6 +1674,8 @@
+         if (entry->flags & P_COW) {
+             void *copy = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
++            if (copy == MAP_FAILED)
++                return NULL;
+ 
+             read_wrunlock(&mem->lock);
+ #ifndef NDEBUG
+@@ -1681,14 +1726,19 @@
+     return ptr;
+ }
+ 
+-// Diagnostic: racy unlocked peek of a guest u32 for the write watchpoint.
++// Diagnostic peek for JIT/TLB watchpoints; caller holds the mem read lock.
+ uint32_t mem_watch_peek32_mem(struct mem *mem, uint64_t addr) {
+     if (mem == NULL)
+         return 0xdead0001;
+-    struct pt_entry *entry = mem_pt(mem, PAGE(addr));
+-    if (entry == NULL || entry->data == NULL)
+-        return 0xdead0002;
+-    return *(uint32_t *)((char *)entry->data->data + entry->offset + PGOFFSET(addr));
++    uint32_t value;
++    for (size_t i = 0; i < sizeof(value); i++) {
++        struct pt_entry *entry = mem_pt(mem, PAGE(addr + i));
++        if (entry == NULL || entry->data == NULL)
++            return 0xdead0002;
++        ((unsigned char *) &value)[i] = *((unsigned char *) entry->data->data +
++                entry->offset + PGOFFSET(addr + i));
++    }
++    return value;
+ }
+ uint32_t mem_watch_peek32(uint64_t addr) {
+     if (current == NULL)
+--- a/kernel/memory.h
++++ b/kernel/memory.h
+@@ -118,6 +118,8 @@
+     void *data; // immutable
+     size_t size; // also immutable
+     atomic_uint refcount;
++    // Private anonymous backing: PTE and flat-alias references per host page.
++    atomic_uint *host_refs;
+ 
+     // for display in /proc/pid/maps
+     struct fd *fd;
+@@ -212,7 +214,7 @@
+ // Copy pages from src memory to dst memory using copy-on-write
+ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t pages);
+ 
+-// Must call with mem read-locked.
++// Hold the mem read lock until the returned borrowed pointer is no longer used.
+ void *mem_ptr(struct mem *mem, addr_t addr, int type);
+ int mem_segv_reason(struct mem *mem, addr_t addr);
+ 
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -107,11 +107,10 @@
+     assert(futex->mem == current->mem);
+     read_wrlock(&current->mem->lock);
+     dword_t *ptr = mem_ptr(current->mem, futex->addr, MEM_READ);
++    if (ptr != NULL)
++        *out = *ptr;
+     read_wrunlock(&current->mem->lock);
+-    if (ptr == NULL)
+-        return 1;
+-    *out = *ptr;
+-    return 0;
++    return ptr == NULL;
+ }
+ 
+ // Debug: per-thread record of the futex address currently being waited on
+@@ -154,7 +153,10 @@
+     struct futex *futex = futex_get(uaddr);
+     if (uaddr == futex_watch_addr()) {
+         dword_t rv = 0xdeadbeef; void *hp = NULL;
+-        { dword_t *vp = mem_ptr(current->mem, uaddr, MEM_READ); if (vp) { rv = *vp; hp = vp; } }
++        read_wrlock(&current->mem->lock);
++        dword_t *vp = mem_ptr(current->mem, uaddr, MEM_READ);
++        if (vp) { rv = *vp; hp = vp; }
++        read_wrunlock(&current->mem->lock);
+         fprintf(stderr, "[fw] pid=%d WAIT uaddr=0x%llx expect_val=0x%x actual_mem=0x%x hostptr=%p %s\n",
+                 current->pid, (unsigned long long)uaddr, val, rv, hp,
+                 rv != val ? "(MISMATCH→EAGAIN)" : "(match→sleep)");
+@@ -258,11 +260,9 @@
+                 if (sig_pending) { err = _EINTR; break; }
+             }
+             // Check value periodically (every ~100ms instead of every 10ms)
+-            read_wrlock(&current->mem->lock);
+-            dword_t *ptr = mem_ptr(current->mem, uaddr, MEM_READ);
+-            read_wrunlock(&current->mem->lock);
+-            if (ptr == NULL) { err = _EFAULT; break; }
+-            if (*ptr != val) { err = 0; break; }
++            dword_t observed;
++            if (futex_load(futex, &observed)) { err = _EFAULT; break; }
++            if (observed != val) { err = 0; break; }
+             // Debug: dump all threads' state once when stalled past a short
+             // gated threshold (ISH_FUTEX_DBG=<seconds>). Helps diagnose which
+             // thread holds the lock the stalled thread is waiting on.
+@@ -276,7 +276,7 @@
+                 if (dbg_secs > 0 && stall_count == dbg_secs * 10 &&
+                         __atomic_exchange_n(&dumped, 1, __ATOMIC_SEQ_CST) == 0) {
+                     dword_t curval = 0xffffffff;
+-                    { dword_t *vp = mem_ptr(current->mem, uaddr, MEM_READ); if (vp) curval = *vp; }
++                    (void) user_read(uaddr, &curval, sizeof(curval));
+                     printk("FUTEX-DBG: pid=%d stalled %ds on uaddr=0x%x (curval=0x%x, waited-for val=%d)\n",
+                            current->pid, stall_count/10, uaddr, curval, val);
+                     lock(&pids_lock);
+@@ -284,7 +284,11 @@
+                     list_for_each_entry(&current->group->threads, t, group_links) {
+                         addr_t waddr = futex_dbg_get(t->pid);
+                         dword_t wv = 0xffffffff;
+-                        if (waddr) { dword_t *vp = mem_ptr(t->mem, waddr, MEM_READ); if (vp) wv = *vp; }
++                        if (waddr) {
++                            lock(&t->general_lock);
++                            (void) user_read_task(t, waddr, &wv, sizeof(wv));
++                            unlock(&t->general_lock);
++                        }
+                         printk("  thread pid=%d blocking=%d x8=%lld futex_uaddr=0x%llx curval=0x%x pc=0x%llx lr=0x%llx x0=0x%llx x1=0x%llx\n",
+                                t->pid, t->blocking, (long long)t->cpu.regs[8],
+                                (unsigned long long)waddr, wv,
+@@ -371,7 +375,10 @@
+     unsigned woken = futex_wake_queue(futex, wake_max);
+     if (uaddr == futex_watch_addr()) {
+         dword_t mv = 0xdead; void *hp = NULL;
+-        { dword_t *vp = mem_ptr(current->mem, uaddr, MEM_READ); if (vp) { mv = *vp; hp = vp; } }
++        read_wrlock(&current->mem->lock);
++        dword_t *vp = mem_ptr(current->mem, uaddr, MEM_READ);
++        if (vp) { mv = *vp; hp = vp; }
++        read_wrunlock(&current->mem->lock);
+         fprintf(stderr, "[fw] pid=%d WAKE 0x%llx woken=%u mem_after_wake=0x%x hostptr=%p\n",
+                 current->pid, (unsigned long long)uaddr, woken, mv, hp);
+     }
+--- a/kernel/epoll.c
++++ b/kernel/epoll.c
+@@ -138,7 +138,7 @@
+       static addr_t wa = 1;
+       if (wa == 1) { const char *e = getenv("ISH_EPOLL_WATCH_MUTEX"); wa = e ? strtoull(e,NULL,16) : 0; }
+       if (wa) {
+-          dword_t mv = 0; dword_t *vp = mem_ptr(current->mem, wa, MEM_READ); if (vp) mv = *vp;
++          dword_t mv = 0; (void) user_read(wa, &mv, sizeof(mv));
+           if (mv != 0) {  // only log when the watched mutex is held
+               fprintf(stderr, "[epoll] pid=%d enters epoll_wait timeout=%d while mutex 0x%llx = 0x%x; members:\n",
+                       current->pid, timeout, (unsigned long long)wa, mv);
+--- a/main.c
++++ b/main.c
+@@ -302,11 +302,19 @@
+     clock_gettime(CLOCK_MONOTONIC, &t0);
+     for (;;) {
+         uint32_t v = 0xdead0003;
++        lock(&pids_lock);
+         struct task *t = pid_get_task(1);
+-        if (t && t->mem) {
+-            extern uint32_t mem_watch_peek32_mem(struct mem *mem, uint64_t addr);
+-            v = mem_watch_peek32_mem(t->mem, addr);
+-        }
++        if (t) {
++            lock(&t->general_lock);
++            if (t->mem) {
++                extern uint32_t mem_watch_peek32_mem(struct mem *mem, uint64_t addr);
++                read_wrlock(&t->mem->lock);
++                v = mem_watch_peek32_mem(t->mem, addr);
++                read_wrunlock(&t->mem->lock);
++            }
++            unlock(&t->general_lock);
++        }
++        unlock(&pids_lock);
+         if (v != last) {
+             struct timespec now;
+             clock_gettime(CLOCK_MONOTONIC, &now);
+--- a/emu/tlb.c
++++ b/emu/tlb.c
+@@ -138,12 +138,20 @@
+ }
+ 
+ bool __tlb_read_cross_page(struct tlb *tlb, addr_t addr, char *value, unsigned size) {
+-    char *ptr1 = __tlb_read_ptr(tlb, addr);
+-    if (ptr1 == NULL)
+-        return false;
+-    char *ptr2 = __tlb_read_ptr(tlb, (PAGE(addr) + 1) << PAGE_BITS);
+-    if (ptr2 == NULL)
+-        return false;
++    char *ptr1, *ptr2;
++    for (;;) {
++        ptr1 = __tlb_read_ptr(tlb, addr);
++        if (ptr1 == NULL)
++            return false;
++        uint64_t generation = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
++        ptr2 = __tlb_read_ptr(tlb, (PAGE(addr) + 1) << PAGE_BITS);
++        if (ptr2 == NULL)
++            return false;
++        // Resolving page 2 can drop mem->lock and invalidate page 1. Both
++        // pointers and copies stay under the reacquired read lock from here.
++        if (__atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE) == generation)
++            break;
++    }
+     size_t part1 = PAGE_SIZE - PGOFFSET(addr);
+     assert(part1 < size);
+     memcpy(value, ptr1, part1);
+@@ -152,12 +160,20 @@
+ }
+ 
+ bool __tlb_write_cross_page(struct tlb *tlb, addr_t addr, const char *value, unsigned size) {
+-    char *ptr1 = __tlb_write_ptr(tlb, addr);
+-    if (ptr1 == NULL)
+-        return false;
+-    char *ptr2 = __tlb_write_ptr(tlb, (PAGE(addr) + 1) << PAGE_BITS);
+-    if (ptr2 == NULL)
+-        return false;
++    char *ptr1, *ptr2;
++    for (;;) {
++        ptr1 = __tlb_write_ptr(tlb, addr);
++        if (ptr1 == NULL)
++            return false;
++        uint64_t generation = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
++        ptr2 = __tlb_write_ptr(tlb, (PAGE(addr) + 1) << PAGE_BITS);
++        if (ptr2 == NULL)
++            return false;
++        // Resolving page 2 can drop mem->lock and invalidate page 1. Both
++        // pointers and copies stay under the reacquired read lock from here.
++        if (__atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE) == generation)
++            break;
++    }
+     size_t part1 = PAGE_SIZE - PGOFFSET(addr);
+     assert(part1 < size);
+     memcpy(ptr1, value, part1);
+@@ -288,21 +304,11 @@
+ }
+ 
+ __no_instrument int c_load32(struct tlb *tlb, addr_t addr, uint32_t *out) {
+-    void *ptr = __tlb_read_ptr(tlb, addr);
+-    if (ptr == NULL) {
+-        return -1;
+-    }
+-    *out = *(uint32_t *)ptr;
+-    return 0;
++    return tlb_read(tlb, addr, out, sizeof(*out)) ? 0 : -1;
+ }
+ 
+ __no_instrument int c_load16(struct tlb *tlb, addr_t addr, uint16_t *out) {
+-    void *ptr = __tlb_read_ptr(tlb, addr);
+-    if (ptr == NULL) {
+-        return -1;
+-    }
+-    *out = *(uint16_t *)ptr;
+-    return 0;
++    return tlb_read(tlb, addr, out, sizeof(*out)) ? 0 : -1;
+ }
+ 
+ __no_instrument int c_load8(struct tlb *tlb, addr_t addr, uint8_t *out) {
+@@ -316,29 +322,26 @@
+ 
+ // Sign-extending load functions
+ __no_instrument int c_load32_sx(struct tlb *tlb, addr_t addr, int64_t *out) {
+-    void *ptr = __tlb_read_ptr(tlb, addr);
+-    if (ptr == NULL) {
+-        return -1;
+-    }
+-    *out = (int64_t)(int32_t)*(uint32_t *)ptr;
++    int32_t value;
++    if (!tlb_read(tlb, addr, &value, sizeof(value)))
++        return -1;
++    *out = value;
+     return 0;
+ }
+ 
+ __no_instrument int c_load16_sx64(struct tlb *tlb, addr_t addr, int64_t *out) {
+-    void *ptr = __tlb_read_ptr(tlb, addr);
+-    if (ptr == NULL) {
+-        return -1;
+-    }
+-    *out = (int64_t)(int16_t)*(uint16_t *)ptr;
++    int16_t value;
++    if (!tlb_read(tlb, addr, &value, sizeof(value)))
++        return -1;
++    *out = value;
+     return 0;
+ }
+ 
+ __no_instrument int c_load16_sx32(struct tlb *tlb, addr_t addr, int32_t *out) {
+-    void *ptr = __tlb_read_ptr(tlb, addr);
+-    if (ptr == NULL) {
+-        return -1;
+-    }
+-    *out = (int32_t)(int16_t)*(uint16_t *)ptr;
++    int16_t value;
++    if (!tlb_read(tlb, addr, &value, sizeof(value)))
++        return -1;
++    *out = value;
+     return 0;
+ }
+ 
+@@ -384,21 +387,11 @@
+ }
+ 
+ __no_instrument int c_store32(struct tlb *tlb, addr_t addr, uint32_t value) {
+-    void *ptr = __tlb_write_ptr(tlb, addr);
+-    if (ptr == NULL) {
+-        return -1;
+-    }
+-    *(uint32_t *)ptr = value;
+-    return 0;
++    return tlb_write(tlb, addr, &value, sizeof(value)) ? 0 : -1;
+ }
+ 
+ __no_instrument int c_store16(struct tlb *tlb, addr_t addr, uint16_t value) {
+-    void *ptr = __tlb_write_ptr(tlb, addr);
+-    if (ptr == NULL) {
+-        return -1;
+-    }
+-    *(uint16_t *)ptr = value;
+-    return 0;
++    return tlb_write(tlb, addr, &value, sizeof(value)) ? 0 : -1;
+ }
+ 
+ __no_instrument int c_store8(struct tlb *tlb, addr_t addr, uint8_t value) {
+@@ -435,6 +428,11 @@
+ 
+ __no_instrument int c_atomic_rmw(struct tlb *tlb, addr_t addr, uint64_t value,
+                                  uint32_t size, uint32_t op, uint64_t *old_out) {
++    if (size > 3 || (addr & ((1u << size) - 1))) {
++        tlb->segfault_addr = addr;
++        return -1;
++    }
++
+     if (old_out == NULL)
+         return -1;
+ 
+@@ -515,6 +513,11 @@
+ // Return: 0 on success, -1 on segfault or unsupported size
+ __no_instrument int c_atomic_cas(struct tlb *tlb, addr_t addr, uint64_t expected,
+                                  uint64_t desired, uint32_t size, uint64_t *old_out) {
++    if (size > 3 || (addr & ((1u << size) - 1))) {
++        tlb->segfault_addr = addr;
++        return -1;
++    }
++
+     if (old_out == NULL)
+         return -1;
+ 
+@@ -608,6 +611,11 @@
+ __no_instrument int c_stxr_cas(struct tlb *tlb, addr_t addr,
+                                uint64_t expected_val, uint64_t new_val,
+                                uint32_t size) {
++    if (size > 3 || (addr & ((1u << size) - 1))) {
++        tlb->segfault_addr = addr;
++        return -1;
++    }
++
+     void *ptr = __tlb_write_ptr(tlb, addr);
+     if (ptr == NULL)
+         return -1;
+@@ -652,6 +660,11 @@
+ __no_instrument int c_stxp_cas(struct tlb *tlb, addr_t addr,
+                                uint64_t exp1, uint64_t exp2,
+                                uint64_t new1, uint64_t new2, uint32_t size) {
++    if (size == 2 && (addr & 7)) {
++        tlb->segfault_addr = addr;
++        return -1;
++    }
++
+     if (size == 2) {
+         uint64_t exp = (uint32_t)exp1 | ((uint64_t)(uint32_t)exp2 << 32);
+         uint64_t des = (uint32_t)new1 | ((uint64_t)(uint32_t)new2 << 32);
+@@ -684,60 +697,31 @@
+ // LDP/STP helper functions for pair loads/stores
+ // Return: 0 on success, -1 on segfault
+ __no_instrument int c_ldp64(struct tlb *tlb, addr_t addr, uint64_t *val1, uint64_t *val2) {
+-    void *ptr1 = __tlb_read_ptr(tlb, addr);
+-    if (ptr1 == NULL) {
+-        return -1;
+-    }
+-    void *ptr2 = __tlb_read_ptr(tlb, addr + 8);
+-    if (ptr2 == NULL) {
+-        return -1;
+-    }
+-    *val1 = *(uint64_t *)ptr1;
+-    *val2 = *(uint64_t *)ptr2;
+-    (void)0;
++    uint64_t values[2];
++    if (!tlb_read(tlb, addr, values, sizeof(values)))
++        return -1;
++    *val1 = values[0];
++    *val2 = values[1];
+     return 0;
+ }
+ 
+ __no_instrument int c_ldp32(struct tlb *tlb, addr_t addr, uint32_t *val1, uint32_t *val2) {
+-    void *ptr1 = __tlb_read_ptr(tlb, addr);
+-    if (ptr1 == NULL) {
+-        return -1;
+-    }
+-    void *ptr2 = __tlb_read_ptr(tlb, addr + 4);
+-    if (ptr2 == NULL) {
+-        return -1;
+-    }
+-    *val1 = *(uint32_t *)ptr1;
+-    *val2 = *(uint32_t *)ptr2;
++    uint32_t values[2];
++    if (!tlb_read(tlb, addr, values, sizeof(values)))
++        return -1;
++    *val1 = values[0];
++    *val2 = values[1];
+     return 0;
+ }
+ 
+ __no_instrument int c_stp64(struct tlb *tlb, addr_t addr, uint64_t val1, uint64_t val2) {
+-    void *ptr1 = __tlb_write_ptr(tlb, addr);
+-    if (ptr1 == NULL) {
+-        return -1;
+-    }
+-    void *ptr2 = __tlb_write_ptr(tlb, addr + 8);
+-    if (ptr2 == NULL) {
+-        return -1;
+-    }
+-    *(uint64_t *)ptr1 = val1;
+-    *(uint64_t *)ptr2 = val2;
+-    return 0;
++    uint64_t values[2] = {val1, val2};
++    return tlb_write(tlb, addr, values, sizeof(values)) ? 0 : -1;
+ }
+ 
+ __no_instrument int c_stp32(struct tlb *tlb, addr_t addr, uint32_t val1, uint32_t val2) {
+-    void *ptr1 = __tlb_write_ptr(tlb, addr);
+-    if (ptr1 == NULL) {
+-        return -1;
+-    }
+-    void *ptr2 = __tlb_write_ptr(tlb, addr + 4);
+-    if (ptr2 == NULL) {
+-        return -1;
+-    }
+-    *(uint32_t *)ptr1 = val1;
+-    *(uint32_t *)ptr2 = val2;
+-    return 0;
++    uint32_t values[2] = {val1, val2};
++    return tlb_write(tlb, addr, values, sizeof(values)) ? 0 : -1;
+ }
+ 
+ // Interleaved SIMD load (LD2/LD3/LD4)

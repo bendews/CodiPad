@@ -1,0 +1,19 @@
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -3754,8 +3754,16 @@
+ static void jit_init(void) {
+     if (env_off("ISH_JIT")) {
+         jit_note("jit: fallback (ISH_JIT=0)");
++        return;
++    }
++#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++    // TXM devices may execute only from the debugger-prepared region. If none
++    // was installed before boot, leave JIT disabled and use guest gadgets.
++    if (jit_txm_present() && region == NULL) {
++        jit_note("jit: fallback (no debugger-prepared executable region)");
+         return;
+     }
++#endif
+     // Without a code region (-Djit_emit=false, or no executable memory at
+     // run time) only AOT images run: PIC conventions, nothing translated.
+     bool have_region = false;

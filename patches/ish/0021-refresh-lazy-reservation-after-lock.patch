@@ -1,0 +1,14 @@
+diff --git a/kernel/memory.c b/kernel/memory.c
+--- a/kernel/memory.c
++++ b/kernel/memory.c
+@@ -1656,7 +1656,9 @@
+         // acquire spins instead of blocking.
+         write_wrlock(&mem->lock);
+         entry = mem_pt(mem, page);
+-        if (entry == NULL) {
++        // The reservation may have been replaced or removed while the read lock was dropped.
++        res = mem_find_reservation(mem, page);
++        if (entry == NULL && res != NULL) {
+             // [T-ish-anon-cap-dynamic] This lazy commit-on-fault is the path
+             // large NORESERVE reservations actually materialize through, one
+             // page per TLB miss — during the 2026-08-25 jsonnet compile it

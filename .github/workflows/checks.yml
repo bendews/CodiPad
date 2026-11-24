@@ -1,0 +1,29 @@
+name: Source checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Test optional component setup
+        run: python3 -m unittest discover -s tests
+      - name: Prepare pinned upstream sources
+        run: python3 scripts/build.py --prepare-sources
+      - name: Bundle the release workbench
+        working-directory: scripts
+        run: python3 -c 'import workbench; workbench.build(minify=True)'
+      - name: Test the native workspace package
+        run: swift test --configuration release --package-path native/CodiPadWorkspace

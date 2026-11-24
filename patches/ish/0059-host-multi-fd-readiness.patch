@@ -1,0 +1,79 @@
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -190,7 +190,8 @@
+     return (int64_t) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+ }
+ 
+-int task_wait_host_fd(int real_fd, short events, int timeout_ms) {
++// descriptors has one private slot after the caller-owned target entries.
++static int task_poll_host(struct pollfd *descriptors, unsigned count, int timeout_ms) {
+     bool nonblocking = timeout_ms == 0;
+     int64_t deadline = timeout_ms > 0 ? task_host_now_ms() + timeout_ms : 0;
+     int error = nonblocking ? 0 : task_open_host_io();
+@@ -220,14 +221,11 @@
+                 return 0;
+             remaining = (int) left;
+         }
+-        struct pollfd descriptors[2] = {
+-            {.fd = real_fd, .events = events},
+-            {.fd = wake_fd, .events = POLLIN},
+-        };
++        descriptors[count] = (struct pollfd) {.fd = wake_fd, .events = POLLIN};
+         // Live guest threads retain their task and wake pipe through host return.
+         bool was_blocking = current->blocking;
+         current->blocking = !nonblocking;
+-        int ready = poll(descriptors, nonblocking ? 1 : 2, remaining);
++        int ready = poll(descriptors, (nfds_t) count + (nonblocking ? 0 : 1), remaining);
+         int saved_errno = errno;
+         current->blocking = was_blocking;
+         if (ready < 0) {
+@@ -238,10 +236,35 @@
+         }
+         if (ready == 0)
+             return 0;
+-        if (!nonblocking && descriptors[1].revents)
++        if (!nonblocking && descriptors[count].revents)
+             continue;
+         return ready;
+     }
++}
++
++int task_wait_host_fd(int real_fd, short events, int timeout_ms) {
++    struct pollfd descriptors[2] = {{.fd = real_fd, .events = events}};
++    return task_poll_host(descriptors, 1, timeout_ms);
++}
++
++int task_wait_host_fds(struct pollfd *fds, unsigned count, int timeout_ms) {
++    for (unsigned i = 0; i < count; i++)
++        fds[i].revents = 0;
++    size_t slots = (size_t) count + 1;
++    if (slots <= count)
++        return _ENOMEM;
++    struct pollfd *descriptors = calloc(slots, sizeof(*descriptors));
++    if (descriptors == NULL)
++        return _ENOMEM;
++    for (unsigned i = 0; i < count; i++)
++        descriptors[i] = fds[i];
++    int ready = task_poll_host(descriptors, count, timeout_ms);
++    if (ready > 0) {
++        for (unsigned i = 0; i < count; i++)
++            fds[i].revents = descriptors[i].revents;
++    }
++    free(descriptors);
++    return ready;
+ }
+ 
+ // pids_lock pins sighand against the group-exit safety valve.
+--- a/kernel/task.h
++++ b/kernel/task.h
+@@ -182,6 +182,10 @@
+ // nor sighand->lock may be held. Poll-style result: >0 ready, 0 timeout, negative guest errno.
+ // timeout_ms: -1 indefinite, 0 probe, positive overall monotonic deadline.
+ int task_wait_host_fd(int real_fd, short events, int timeout_ms);
++// Same contract for several retained targets; revents is zero on timeout/error.
++// The task's signal pipe remains private and never appears in caller results.
++struct pollfd;
++int task_wait_host_fds(struct pollfd *fds, unsigned count, int timeout_ms);
+ // Removes the process from the process table and frees it. Must be called with pids_lock.
+ void task_destroy(struct task *task);
+ // Close owned wake descriptors; caller holds pids_lock. Safe after sighand detach.

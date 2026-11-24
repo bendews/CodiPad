@@ -1,0 +1,282 @@
+diff --git a/deps/v8/src/base/memory.h b/deps/v8/src/base/memory.h
+--- a/deps/v8/src/base/memory.h
++++ b/deps/v8/src/base/memory.h
+@@ -7,8 +7,27 @@
+ 
+ #include "src/base/macros.h"
+ 
++#if defined(V8_OS_IOS)
++extern "C" {
++extern uintptr_t codipad_v8_rx_begin;
++extern uintptr_t codipad_v8_rx_end;
++extern uintptr_t codipad_v8_rw_begin;
++}
++#endif
++
+ namespace v8 {
+ namespace base {
++
++// RX addresses remain canonical for PCs, relocations and object identity.
++// Only write destinations use the debugger-backed writable alias.
++V8_INLINE uintptr_t JitWriteAddress(uintptr_t address) {
++#if defined(V8_OS_IOS)
++  if (address >= codipad_v8_rx_begin && address < codipad_v8_rx_end)
++    return codipad_v8_rw_begin + (address - codipad_v8_rx_begin);
++#endif
++  return address;
++}
++
+ 
+ using Address = uintptr_t;
+ 
+@@ -17,7 +36,9 @@
+ template <class T>
+ inline T& Memory(Address addr) {
+   DCHECK(IsAligned(addr, alignof(T)));
+-  return *reinterpret_cast<T*>(addr);
++  // Code pages are executable-only; reads and writes both use the writable
++  // alias, which maps the same physical pages.
++  return *reinterpret_cast<T*>(JitWriteAddress(addr));
+ }
+ template <class T>
+ inline T& Memory(uint8_t* addr) {
+@@ -40,7 +61,7 @@
+ template <typename V>
+ static inline void WriteUnalignedValue(Address p, V value) {
+   ASSERT_TRIVIALLY_COPYABLE(V);
+-  memcpy(reinterpret_cast<void*>(p), &value, sizeof(V));
++  memcpy(reinterpret_cast<void*>(JitWriteAddress(p)), &value, sizeof(V));
+ }
+ 
+ template <typename V>
+diff --git a/deps/v8/src/codegen/arm64/assembler-arm64.cc b/deps/v8/src/codegen/arm64/assembler-arm64.cc
+--- a/deps/v8/src/codegen/arm64/assembler-arm64.cc
++++ b/deps/v8/src/codegen/arm64/assembler-arm64.cc
+@@ -673,7 +673,7 @@
+       // Internal references do not get patched to an instruction but directly
+       // to an address.
+       internal_reference_positions_.push_back(linkoffset);
+-      memcpy(link, &pc_, kSystemPointerSize);
++      memcpy(reinterpret_cast<void*>(base::JitWriteAddress(reinterpret_cast<Address>(link))), &pc_, kSystemPointerSize);
+     } else {
+       link->SetImmPCOffsetTarget(zone(), options(),
+                                  reinterpret_cast<Instruction*>(pc_));
+diff --git a/deps/v8/src/codegen/arm64/assembler-arm64.h b/deps/v8/src/codegen/arm64/assembler-arm64.h
+--- a/deps/v8/src/codegen/arm64/assembler-arm64.h
++++ b/deps/v8/src/codegen/arm64/assembler-arm64.h
+@@ -3295,7 +3295,7 @@
+     static_assert(sizeof(instruction) == kInstrSize);
+     DCHECK_LE(pc_ + sizeof(instruction), buffer_start_ + buffer_->size());
+ 
+-    memcpy(pc_, &instruction, sizeof(instruction));
++    memcpy(reinterpret_cast<void*>(base::JitWriteAddress(reinterpret_cast<Address>(pc_))), &instruction, sizeof(instruction));
+     pc_ += sizeof(instruction);
+     CheckBuffer();
+   }
+@@ -3307,7 +3307,7 @@
+ 
+     // TODO(all): Somehow register we have some data here. Then we can
+     // disassemble it correctly.
+-    memcpy(pc_, data, size);
++    memcpy(reinterpret_cast<void*>(base::JitWriteAddress(reinterpret_cast<Address>(pc_))), data, size);
+     pc_ += size;
+     CheckBuffer();
+   }
+diff --git a/deps/v8/src/common/code-memory-access-inl.h b/deps/v8/src/common/code-memory-access-inl.h
+--- a/deps/v8/src/common/code-memory-access-inl.h
++++ b/deps/v8/src/common/code-memory-access-inl.h
+@@ -139,9 +139,9 @@
+ 
+   if constexpr (offset == HeapObject::kMapOffset) {
+     TaggedField<T, offset>::Relaxed_Store_Map_Word(
+-        HeapObject::FromAddress(address_), value);
++        HeapObject::FromAddress(base::JitWriteAddress(address_)), value);
+   } else {
+-    WriteMaybeUnalignedValue<T>(address_ + offset, value);
++    WriteMaybeUnalignedValue<T>(base::JitWriteAddress(address_ + offset), value);
+   }
+ }
+ 
+@@ -153,7 +153,7 @@
+   // non-implemented functionality.
+   static_assert(offset != HeapObject::kMapOffset);
+ 
+-  TaggedField<T, offset>::Release_Store(HeapObject::FromAddress(address_),
++  TaggedField<T, offset>::Release_Store(HeapObject::FromAddress(base::JitWriteAddress(address_)),
+                                         value);
+ }
+ 
+@@ -163,9 +163,9 @@
+       WriteScopeForApiEnforcement();
+   if constexpr (offset == HeapObject::kMapOffset) {
+     TaggedField<T, offset>::Relaxed_Store_Map_Word(
+-        HeapObject::FromAddress(address_), value);
++        HeapObject::FromAddress(base::JitWriteAddress(address_)), value);
+   } else {
+-    TaggedField<T, offset>::Relaxed_Store(HeapObject::FromAddress(address_),
++    TaggedField<T, offset>::Relaxed_Store(HeapObject::FromAddress(base::JitWriteAddress(address_)),
+                                           value);
+   }
+ }
+@@ -177,7 +177,7 @@
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
+   TaggedField<T, offset, TrustedSpaceCompressionScheme>::Relaxed_Store(
+-      HeapObject::FromAddress(address_), value);
++      HeapObject::FromAddress(base::JitWriteAddress(address_)), value);
+ }
+ 
+ template <typename T, size_t offset>
+@@ -187,7 +187,7 @@
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
+   TaggedField<T, offset, TrustedSpaceCompressionScheme>::Release_Store(
+-      HeapObject::FromAddress(address_), value);
++      HeapObject::FromAddress(base::JitWriteAddress(address_)), value);
+ }
+ 
+ template <typename T>
+@@ -228,7 +228,7 @@
+       WriteScopeForApiEnforcement();
+   DCHECK_GE(address, address_);
+   DCHECK_LT(address - address_, size());
+-  base::Memory<T>(address) = value;
++  base::Memory<T>(base::JitWriteAddress(address)) = value;
+ }
+ 
+ template <typename T>
+@@ -238,7 +238,7 @@
+       WriteScopeForApiEnforcement();
+   DCHECK_GE(address, address_);
+   DCHECK_LT(address - address_, size());
+-  reinterpret_cast<std::atomic<T>*>(address)->store(value,
++  reinterpret_cast<std::atomic<T>*>(base::JitWriteAddress(address))->store(value,
+                                                     std::memory_order_relaxed);
+ }
+ 
+@@ -246,20 +246,20 @@
+                                      size_t num_bytes) {
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
+-  CopyBytes(reinterpret_cast<uint8_t*>(address_ + dst_offset), src, num_bytes);
++  CopyBytes(reinterpret_cast<uint8_t*>(base::JitWriteAddress(address_ + dst_offset)), src, num_bytes);
+ }
+ 
+ void WritableJitAllocation::CopyData(size_t dst_offset, const uint8_t* src,
+                                      size_t num_bytes) {
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
+-  CopyBytes(reinterpret_cast<uint8_t*>(address_ + dst_offset), src, num_bytes);
++  CopyBytes(reinterpret_cast<uint8_t*>(base::JitWriteAddress(address_ + dst_offset)), src, num_bytes);
+ }
+ 
+ void WritableJitAllocation::ClearBytes(size_t offset, size_t len) {
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
+-  memset(reinterpret_cast<void*>(address_ + offset), 0, len);
++  memset(reinterpret_cast<void*>(base::JitWriteAddress(address_ + offset)), 0, len);
+ }
+ 
+ WritableJitPage::~WritableJitPage() = default;
+@@ -296,7 +296,7 @@
+ template <typename T, size_t offset>
+ void WritableFreeSpace::WriteHeaderSlot(Tagged<T> value,
+                                         RelaxedStoreTag) const {
+-  Tagged<HeapObject> object = HeapObject::FromAddress(address_);
++  Tagged<HeapObject> object = HeapObject::FromAddress(base::JitWriteAddress(address_));
+   // TODO(v8:13355): add validation before the write.
+   if constexpr (offset == HeapObject::kMapOffset) {
+     TaggedField<T, offset>::Relaxed_Store_Map_Word(object, value);
+diff --git a/deps/v8/src/heap/code-range.cc b/deps/v8/src/heap/code-range.cc
+--- a/deps/v8/src/heap/code-range.cc
++++ b/deps/v8/src/heap/code-range.cc
+@@ -439,7 +439,7 @@
+ #endif  // defined(V8_TARGET_OS_IOS)
+     RwxMemoryWriteScope rwx_write_scope(
+         "Enable write access to copy the blob code into the code range");
+-    memcpy(embedded_blob_code_copy, embedded_blob_code,
++    memcpy(reinterpret_cast<void*>(base::JitWriteAddress(reinterpret_cast<Address>(embedded_blob_code_copy))), embedded_blob_code,
+            embedded_blob_code_size);
+   } else {
+     if (!page_allocator()->SetPermissions(embedded_blob_code_copy, code_size,
+@@ -447,7 +447,7 @@
+       V8::FatalProcessOutOfMemory(isolate,
+                                   "Re-embedded builtins: set permissions");
+     }
+-    memcpy(embedded_blob_code_copy, embedded_blob_code,
++    memcpy(reinterpret_cast<void*>(base::JitWriteAddress(reinterpret_cast<Address>(embedded_blob_code_copy))), embedded_blob_code,
+            embedded_blob_code_size);
+ 
+     if (!page_allocator()->SetPermissions(embedded_blob_code_copy, code_size,
+diff --git a/deps/v8/src/heap/memory-allocator.cc b/deps/v8/src/heap/memory-allocator.cc
+--- a/deps/v8/src/heap/memory-allocator.cc
++++ b/deps/v8/src/heap/memory-allocator.cc
+@@ -427,7 +427,12 @@
+   }
+   if (executable) {
+     RwxMemoryWriteScope scope("Initialize a new MemoryChunk.");
+-    chunk = new (chunk_info->chunk) MemoryChunk(flags, metadata);
++    // The executable mapping is never writable; the header must be written
++    // through the debugger-backed alias while the chunk keeps its RX address.
++    new (reinterpret_cast<void*>(
++        base::JitWriteAddress(reinterpret_cast<Address>(chunk_info->chunk))))
++        MemoryChunk(flags, metadata);
++    chunk = static_cast<MemoryChunk*>(chunk_info->chunk);
+   } else {
+     chunk = new (chunk_info->chunk) MemoryChunk(flags, metadata);
+   }
+@@ -493,7 +498,12 @@
+   MemoryChunk::MainThreadFlags flags = metadata->InitialFlags(executable);
+   if (executable) {
+     RwxMemoryWriteScope scope("Initialize a new MemoryChunk.");
+-    chunk = new (chunk_info->chunk) MemoryChunk(flags, metadata);
++    // The executable mapping is never writable; the header must be written
++    // through the debugger-backed alias while the chunk keeps its RX address.
++    new (reinterpret_cast<void*>(
++        base::JitWriteAddress(reinterpret_cast<Address>(chunk_info->chunk))))
++        MemoryChunk(flags, metadata);
++    chunk = static_cast<MemoryChunk*>(chunk_info->chunk);
+   } else {
+     chunk = new (chunk_info->chunk) MemoryChunk(flags, metadata);
+   }
+diff --git a/deps/v8/src/heap/memory-chunk.h b/deps/v8/src/heap/memory-chunk.h
+--- a/deps/v8/src/heap/memory-chunk.h
++++ b/deps/v8/src/heap/memory-chunk.h
+@@ -7,6 +7,7 @@
+ 
+ #include "src/base/build_config.h"
+ #include "src/base/hashing.h"
++#include "src/base/memory.h"
+ #include "src/flags/flags.h"
+ #include "src/heap/memory-chunk-constants.h"
+ #include "src/init/isolate-group.h"
+@@ -216,18 +217,25 @@
+ 
+   V8_INLINE MainThreadFlags GetFlags() const { return main_thread_flags_; }
+ 
+-  V8_INLINE void SetFlagUnlocked(Flag flag) { main_thread_flags_ |= flag; }
++  // Code pages are executable-only; the header is written through the
++  // debugger-backed writable alias.
++  V8_INLINE MainThreadFlags& writable_flags() {
++    return *reinterpret_cast<MainThreadFlags*>(
++        base::JitWriteAddress(reinterpret_cast<Address>(&main_thread_flags_)));
++  }
++
++  V8_INLINE void SetFlagUnlocked(Flag flag) { writable_flags() |= flag; }
+   V8_INLINE void ClearFlagUnlocked(Flag flag) {
+-    main_thread_flags_ = main_thread_flags_.without(flag);
++    writable_flags() = writable_flags().without(flag);
+   }
+   // Set or clear multiple flags at a time. `mask` indicates which flags are
+   // should be replaced with new `flags`.
+   V8_INLINE void ClearFlagsUnlocked(MainThreadFlags flags) {
+-    main_thread_flags_ &= ~flags;
++    writable_flags() &= ~flags;
+   }
+   V8_INLINE void SetFlagsUnlocked(MainThreadFlags flags,
+                                   MainThreadFlags mask = kAllFlagsMask) {
+-    main_thread_flags_ = (main_thread_flags_ & ~mask) | (flags & mask);
++    writable_flags() = (writable_flags() & ~mask) | (flags & mask);
+   }
+ 
+   V8_INLINE void SetFlagNonExecutable(Flag flag) {

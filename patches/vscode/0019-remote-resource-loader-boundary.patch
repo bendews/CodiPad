@@ -1,0 +1,20 @@
+--- a/src/vs/platform/remote/electron-browser/remoteAuthorityResolverService.ts
++++ b/src/vs/platform/remote/electron-browser/remoteAuthorityResolverService.ts
+@@ -11,7 +11,7 @@
+ import { URI } from '../../../base/common/uri.js';
+ import { IProductService } from '../../product/common/productService.js';
+ import { IRemoteAuthorityResolverService, IRemoteConnectionData, RemoteConnectionType, ResolvedAuthority, ResolvedOptions, ResolverResult } from '../common/remoteAuthorityResolver.js';
+-import { ElectronRemoteResourceLoader } from './electronRemoteResourceLoader.js';
++import type { ElectronRemoteResourceLoader } from './electronRemoteResourceLoader.js';
+ 
+ export class RemoteAuthorityResolverService extends Disposable implements IRemoteAuthorityResolverService {
+ 
+@@ -25,7 +25,7 @@
+ 	private readonly _canonicalURIRequests: Map<string, { input: URI; result: DeferredPromise<URI> }>;
+ 	private _canonicalURIProvider: ((uri: URI) => Promise<URI>) | null;
+ 
+-	constructor(@IProductService productService: IProductService, private readonly remoteResourceLoader: ElectronRemoteResourceLoader) {
++	constructor(@IProductService productService: IProductService, private readonly remoteResourceLoader: Pick<ElectronRemoteResourceLoader, 'getResourceUriProvider'>) {
+ 		super();
+ 		this._resolveAuthorityRequests = new Map<string, DeferredPromise<ResolverResult>>();
+ 		this._connectionTokens = new Map<string, string>();

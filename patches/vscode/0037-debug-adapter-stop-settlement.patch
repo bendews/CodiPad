@@ -1,0 +1,420 @@
+--- a/src/vs/workbench/contrib/debug/node/debugAdapter.ts
++++ b/src/vs/workbench/contrib/debug/node/debugAdapter.ts
+@@ -241,6 +241,10 @@
+ 
+ 	private serverProcess: cp.ChildProcess | undefined;
+ 	private stopped = false;
++	private static readonly STOP_TIMEOUT = 5000;
++	private stopPromise: Promise<void> | undefined;
++	private processClose: Promise<void> | undefined;
++	private processCloseStatus: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+ 
+ 	constructor(private adapterExecutable: IDebugAdapterExecutable, private debugType: string) {
+ 		super();
+@@ -315,6 +319,12 @@
+ 
+ 				this.serverProcess = cp.spawn(spawnCommand, spawnArgs, spawnOptions);
+ 			}
++
++			const child = this.serverProcess;
++			this.processClose = new Promise(resolve => child.once('close', (code, signal) => {
++				this.processCloseStatus = { code, signal };
++				resolve();
++			}));
+ 
+ 			// Node reports asynchronous admission failures via 'error', before 'spawn'.
+ 			await new Promise<void>((resolve, reject) => {
+@@ -342,7 +352,9 @@
+ 			});
+ 
+ 			this.serverProcess.stdout!.on('close', () => {
+-				this._onError.fire(new Error('read error'));
++				if (!this.stopped) {
++					this._onError.fire(new Error('read error'));
++				}
+ 			});
+ 			this.serverProcess.stdout!.on('error', error => {
+ 				this._onError.fire(error);
+@@ -366,25 +378,41 @@
+ 		}
+ 	}
+ 
+-	async stopSession(): Promise<void> {
++	stopSession(): Promise<void> {
+ 		this.stopped = true;
+-
+-		if (!this.serverProcess) {
+-			return Promise.resolve(undefined);
+-		}
+-
+-		// when killing a process in windows its child
+-		// processes are *not* killed but become root
+-		// processes. Therefore we use TASKKILL.EXE
++		if (!this.stopPromise) {
++			this.stopPromise = this.stopProcess().catch(error => {
++				this.stopPromise = undefined;
++				throw error;
++			});
++		}
++		return this.stopPromise;
++	}
++
++	private async stopProcess(): Promise<void> {
++		const child = this.serverProcess;
++		if (!child) {
++			return;
++		}
+ 		await this.cancelPendingRequests();
+-		if (platform.isWindows) {
+-			return killTree(this.serverProcess!.pid!, true).catch(() => {
+-				this.serverProcess?.kill();
+-			});
+-		} else {
+-			this.serverProcess.kill('SIGTERM');
+-			return Promise.resolve(undefined);
+-		}
++		if (!this.processCloseStatus && child.pid) {
++			if (platform.isWindows) {
++				await killTree(child.pid, true);
++			} else {
++				child.kill('SIGTERM');
++			}
++		}
++		// A signal is not completion. Keep ownership until this child's status and pipes close.
++		await new Promise<void>((resolve, reject) => {
++			const timer = setTimeout(() => reject(new Error('Debug adapter cleanup incomplete: child close timed out.')), ExecutableDebugAdapter.STOP_TIMEOUT);
++			this.processClose!.then(() => { clearTimeout(timer); resolve(); });
++		});
++		const status = this.processCloseStatus!;
++		if (status.code !== child.exitCode || status.signal !== child.signalCode ||
++			(child.pid && (!child.stdout?.readableEnded || !child.stderr?.readableEnded))) {
++			throw new Error('Debug adapter cleanup incomplete: child status or stdout/stderr EOF was not confirmed.');
++		}
++		this.serverProcess = undefined;
+ 	}
+ 
+ 	private static extract(platformContribution: IPlatformSpecificAdapterContribution, extensionFolderPath: string): IDebuggerContribution | undefined {
+--- a/src/vs/workbench/api/common/extHostDebugService.ts
++++ b/src/vs/workbench/api/common/extHostDebugService.ts
+@@ -718,21 +718,19 @@
+ 		da?.sendMessage(message);
+ 	}
+ 
+-	public $stopDASession(debugAdapterHandle: number): Promise<void> {
++	public async $stopDASession(debugAdapterHandle: number): Promise<void> {
+ 
+ 		const tracker = this._debugAdaptersTrackers.get(debugAdapterHandle);
+-		this._debugAdaptersTrackers.delete(debugAdapterHandle);
+ 		if (tracker && tracker.onWillStopSession) {
+ 			tracker.onWillStopSession();
+ 		}
+ 
+ 		const da = this._debugAdapters.get(debugAdapterHandle);
++		if (da) {
++			await da.stopSession();
++		}
+ 		this._debugAdapters.delete(debugAdapterHandle);
+-		if (da) {
+-			return da.stopSession();
+-		} else {
+-			return Promise.resolve(void 0);
+-		}
++		this._debugAdaptersTrackers.delete(debugAdapterHandle);
+ 	}
+ 
+ 	public $acceptBreakpointsDelta(delta: IBreakpointsDeltaDto): void {
+--- a/src/vs/workbench/contrib/debug/browser/rawDebugSession.ts
++++ b/src/vs/workbench/contrib/debug/browser/rawDebugSession.ts
+@@ -48,6 +48,8 @@
+ 	// shutdown
+ 	private debugAdapterStopped = false;
+ 	private inShutdown = false;
++	private shutdownPromise: Promise<void> | undefined;
++	private disconnectAttempted = false;
+ 	private terminated = false;
+ 	private firedAdapterExitEvent = false;
+ 
+@@ -94,15 +96,20 @@
+ 		this._capabilities = Object.create(null);
+ 
+ 		this.toDispose.add(this.debugAdapter.onError(err => {
+-			this.shutdown(err);
++			if (!this.inShutdown) {
++				this.shutdown(err).catch(error => this.notificationService.notify({ severity: Severity.Error, message: error.message }));
++			}
+ 		}));
+ 
+ 		this.toDispose.add(this.debugAdapter.onExit(code => {
++			if (this.inShutdown) {
++				return;
++			}
+ 			if (code !== 0) {
+-				this.shutdown(new Error(`exit code: ${code}`));
++				this.shutdown(new Error(`exit code: ${code}`)).catch(error => this.notificationService.notify({ severity: Severity.Error, message: error.message }));
+ 			} else {
+ 				// normal exit
+-				this.shutdown();
++				this.shutdown().catch(error => this.notificationService.notify({ severity: Severity.Error, message: error.message }));
+ 			}
+ 		}));
+ 
+@@ -589,44 +596,44 @@
+ 
+ 	//---- private
+ 
+-	private async shutdown(error?: Error, restart = false, terminateDebuggee: boolean | undefined = undefined, suspendDebuggee: boolean | undefined = undefined): Promise<void> {
+-		if (!this.inShutdown) {
++	private shutdown(error?: Error, restart = false, terminateDebuggee: boolean | undefined = undefined, suspendDebuggee: boolean | undefined = undefined): Promise<void> {
++		if (!this.shutdownPromise) {
+ 			this.inShutdown = true;
+-			if (this.debugAdapter) {
+-				try {
+-					const args: DebugProtocol.DisconnectArguments = { restart };
+-					if (typeof terminateDebuggee === 'boolean') {
+-						args.terminateDebuggee = terminateDebuggee;
+-					}
+-
+-					if (typeof suspendDebuggee === 'boolean') {
+-						args.suspendDebuggee = suspendDebuggee;
+-					}
+-
+-					// if there's an error, the DA is probably already gone, so give it a much shorter timeout.
+-					await this.send('disconnect', args, undefined, error ? 200 : 2000);
+-				} catch (e) {
+-					// Catch the potential 'disconnect' error - no need to show it to the user since the adapter is shutting down
+-				} finally {
+-					await this.stopAdapter(error);
++			this.shutdownPromise = this.shutdownAdapter(error, restart, terminateDebuggee, suspendDebuggee).catch(error => {
++				this.inShutdown = false;
++				this.shutdownPromise = undefined;
++				throw error;
++			});
++		}
++		return this.shutdownPromise;
++	}
++
++	private async shutdownAdapter(error: Error | undefined, restart: boolean, terminateDebuggee: boolean | undefined, suspendDebuggee: boolean | undefined): Promise<void> {
++		if (this.debugAdapter && !this.disconnectAttempted) {
++			this.disconnectAttempted = true;
++			try {
++				const args: DebugProtocol.DisconnectArguments = { restart };
++				if (typeof terminateDebuggee === 'boolean') {
++					args.terminateDebuggee = terminateDebuggee;
+ 				}
+-			} else {
+-				return this.stopAdapter(error);
+-			}
+-		}
++				if (typeof suspendDebuggee === 'boolean') {
++					args.suspendDebuggee = suspendDebuggee;
++				}
++				await this.send('disconnect', args, undefined, error ? 200 : 2000);
++			} catch {
++				// The peer may already be gone; transport cleanup must still be confirmed.
++			}
++		}
++		await this.stopAdapter(error);
+ 	}
+ 
+ 	private async stopAdapter(error?: Error): Promise<void> {
+-		try {
+-			if (this.debugAdapter) {
+-				const da = this.debugAdapter;
+-				this.debugAdapter = null;
+-				await da.stopSession();
+-				this.debugAdapterStopped = true;
+-			}
+-		} finally {
+-			this.fireAdapterExitEvent(error);
+-		}
++		if (this.debugAdapter) {
++			await this.debugAdapter.stopSession();
++			this.debugAdapter = null;
++			this.debugAdapterStopped = true;
++		}
++		this.fireAdapterExitEvent(error);
+ 	}
+ 
+ 	private fireAdapterExitEvent(error?: Error): void {
+--- a/src/vs/workbench/contrib/debug/browser/debugSession.ts
++++ b/src/vs/workbench/contrib/debug/browser/debugSession.ts
+@@ -9,7 +9,7 @@
+ import { distinct } from '../../../../base/common/arrays.js';
+ import { Queue, RunOnceScheduler, raceTimeout } from '../../../../base/common/async.js';
+ import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
+-import { canceled } from '../../../../base/common/errors.js';
++import { canceled, getErrorMessage } from '../../../../base/common/errors.js';
+ import { Emitter, Event } from '../../../../base/common/event.js';
+ import { normalizeDriveLetter } from '../../../../base/common/labels.js';
+ import { Lazy } from '../../../../base/common/lazy.js';
+@@ -58,6 +58,8 @@
+ 	private _subId: string | undefined;
+ 	raw: RawDebugSession | undefined; // used in tests
+ 	private initialized = false;
++	private shutdownPromise: Promise<void> | undefined;
++	private adapterExitPromise: Promise<void> | undefined;
+ 	private _options: IDebugSessionOptions;
+ 
+ 	private sources = new Map<string, Source>();
+@@ -141,9 +143,8 @@
+ 		const replListener = toDispose.add(new MutableDisposable());
+ 		replListener.value = this.repl.onDidChangeElements((e) => this._onDidChangeREPLElements.fire(e));
+ 		if (lifecycleService) {
+-			toDispose.add(lifecycleService.onWillShutdown(() => {
+-				this.shutdown();
+-				dispose(toDispose);
++			toDispose.add(lifecycleService.onWillShutdown(event => {
++				event.join(this.shutdown().then(() => { dispose(toDispose); }), { id: 'debugSession', label: localize('debugSessionShutdown', "Debug session") });
+ 			}));
+ 		}
+ 
+@@ -345,10 +346,12 @@
+ 	 */
+ 	async initialize(dbgr: IDebugger): Promise<void> {
+ 
+-		if (this.raw) {
+-			// if there was already a connection make sure to remove old listeners
++		if (this.raw || this.shutdownPromise) {
+ 			await this.shutdown();
+ 		}
++		await this.adapterExitPromise;
++		this.shutdownPromise = undefined;
++		this.adapterExitPromise = undefined;
+ 
+ 		try {
+ 			const debugAdapter = await dbgr.createDebugAdapter(this);
+@@ -384,7 +387,11 @@
+ 		} catch (err) {
+ 			this.initialized = true;
+ 			this._onDidChangeState.fire();
+-			await this.shutdown();
++			try {
++				await this.shutdown();
++			} catch (cleanupError) {
++				throw new AggregateError([err, cleanupError], `Debug session failed: ${getErrorMessage(err)}; cleanup incomplete: ${getErrorMessage(cleanupError)}`);
++			}
+ 			throw err;
+ 		}
+ 	}
+@@ -405,7 +412,11 @@
+ 		try {
+ 			await this.raw.launchOrAttach(config);
+ 		} catch (err) {
+-			this.shutdown();
++			try {
++				await this.shutdown();
++			} catch (cleanupError) {
++				throw new AggregateError([err, cleanupError], `Debug session failed: ${getErrorMessage(err)}; cleanup incomplete: ${getErrorMessage(cleanupError)}`);
++			}
+ 			throw err;
+ 		}
+ 	}
+@@ -426,7 +437,7 @@
+ 	async terminate(restart = false): Promise<void> {
+ 		if (!this.raw) {
+ 			// Adapter went down but it did not send a 'terminated' event, simulate like the event has been sent
+-			this.onDidExitAdapter();
++			await this.onDidExitAdapter();
+ 		}
+ 
+ 		this.cancelAllRequests();
+@@ -453,7 +464,7 @@
+ 	async disconnect(restart = false, suspend = false): Promise<void> {
+ 		if (!this.raw) {
+ 			// Adapter went down but it did not send a 'terminated' event, simulate like the event has been sent
+-			this.onDidExitAdapter();
++			await this.onDidExitAdapter();
+ 		}
+ 
+ 		this.cancelAllRequests();
+@@ -1122,10 +1133,14 @@
+ 
+ 		this.rawListeners.add(this.raw.onDidTerminateDebugee(async event => {
+ 			aria.status(localize('debuggingStopped', "Debugging stopped."));
+-			if (event.body && event.body.restart) {
+-				await this.debugService.restartSession(this, event.body.restart);
+-			} else if (this.raw) {
+-				await this.raw.disconnect({ terminateDebuggee: false });
++			try {
++				if (event.body && event.body.restart) {
++					await this.debugService.restartSession(this, event.body.restart);
++				} else if (this.raw) {
++					await this.raw.disconnect({ terminateDebuggee: false });
++				}
++			} catch (error) {
++				this.notificationService.error(error);
+ 			}
+ 		}));
+ 
+@@ -1347,7 +1362,7 @@
+ 			}
+ 		}));
+ 
+-		this.rawListeners.add(this.raw.onDidExitAdapter(event => this.onDidExitAdapter(event)));
++		this.rawListeners.add(this.raw.onDidExitAdapter(event => { this.onDidExitAdapter(event).catch(error => this.notificationService.error(error)); }));
+ 	}
+ 
+ 	private async handleStop(event: IRawStoppedDetails) {
+@@ -1479,20 +1494,38 @@
+ 		});
+ 	}
+ 
+-	private onDidExitAdapter(event?: AdapterEndEvent): void {
+-		this.initialized = true;
+-		this.model.setBreakpointSessionData(this.getId(), this.capabilities, undefined);
+-		this.shutdown();
+-		this._onDidEndAdapter.fire(event);
+-	}
+-
+-	// Disconnects and clears state. Session can be initialized again for a new connection.
+-	private shutdown(): void {
++	private onDidExitAdapter(event?: AdapterEndEvent): Promise<void> {
++		if (!this.adapterExitPromise) {
++			this.adapterExitPromise = this.shutdown().then(() => {
++				this.initialized = true;
++				this.model.setBreakpointSessionData(this.getId(), this.capabilities, undefined);
++				this._onDidEndAdapter.fire(event);
++			}).catch(error => {
++				this.adapterExitPromise = undefined;
++				throw error;
++			});
++		}
++		return this.adapterExitPromise;
++	}
++
++	private shutdown(): Promise<void> {
++		if (!this.shutdownPromise) {
++			this.shutdownPromise = this.shutdownRaw().catch(error => {
++				this.shutdownPromise = undefined;
++				throw error;
++			});
++		}
++		return this.shutdownPromise;
++	}
++
++	private async shutdownRaw(): Promise<void> {
++		const raw = this.raw;
++		if (raw) {
++			await raw.disconnect({});
++		}
+ 		this.rawListeners.clear();
+-		if (this.raw) {
+-			// Send out disconnect and immediatly dispose (do not wait for response) #127418
+-			this.raw.disconnect({});
+-			this.raw.dispose();
++		if (raw) {
++			raw.dispose();
+ 			this.raw = undefined;
+ 		}
+ 		this.passFocusScheduler.cancel();
+@@ -1506,6 +1539,10 @@
+ 	}
+ 
+ 	public dispose() {
++		if (this.raw) {
++			this.shutdown().then(() => this.dispose(), error => this.notificationService.error(error));
++			return;
++		}
+ 		this.cancelAllRequests();
+ 		this.rawListeners.dispose();
+ 		this.globalDisposables.dispose();

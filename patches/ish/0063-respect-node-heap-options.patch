@@ -1,0 +1,66 @@
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -45,6 +45,41 @@
+ static inline addr_t copy_string(addr_t sp, const char *string);
+ static inline addr_t args_copy(addr_t sp, struct exec_args args);
+ static size_t args_size(struct exec_args args);
++
++#if defined(GUEST_ARM64)
++// NODE_OPTIONS is parsed before command-line flags, so an injected CLI heap
++// limit would override a limit explicitly chosen in the environment.
++static bool node_options_has_heap_limit(const char *options) {
++    const char *names[] = {"--max-old-space-size", "--max-old-space-size-percentage", "--max-heap-size"};
++    bool matched = false, quoted = false;
++    char token[64];
++    size_t len = 0;
++    for (;;) {
++        char c = *options++;
++        if (c == '\\' && quoted) {
++            if (*options == '\0') return false;
++            c = *options++;
++        } else if (c == '"') {
++            quoted = !quoted;
++            continue;
++        } else if (c == '\0' || (c == ' ' && !quoted)) {
++            size_t n = len < sizeof(token) - 1 ? len : sizeof(token) - 1;
++            token[n] = '\0';
++            for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++                size_t prefix = strlen(names[i]);
++                if (strncmp(token, names[i], prefix) == 0 &&
++                    (token[prefix] == '=' || (token[prefix] == '\0' && len == prefix)))
++                    matched = true;
++            }
++            len = 0;
++            if (c == '\0') return !quoted && matched;
++            continue;
++        }
++        if (len < sizeof(token) - 1) token[len] = c == '_' ? '-' : c;
++        len++;
++    }
++}
++#endif
+ 
+ static int read_header(struct fd *fd, exec_elf_header *header) {
+     int err;
+@@ -1546,7 +1581,12 @@
+             // WebAssembly away, and Node's own undici calls WebAssembly.compile() when it loads,
+             // so they need the jitless set with wasm-polyfill.js.
+             bool jitless = false;
++            bool heap_override = false, heap_options_seen = false;
+             for (const char *e = envp; *e != '\0'; e += strlen(e) + 1) {
++                if (!heap_options_seen && strncmp(e, "NODE_OPTIONS=", 13) == 0) {
++                    heap_override = node_options_has_heap_limit(e + 13);
++                    heap_options_seen = true;
++                }
+                 if (strcmp(e, "ISH_NODE_MODE=jitless") == 0)
+                     jitless = true;
+             }
+@@ -1584,6 +1624,8 @@
+             }
+             for (size_t ai = 0; ai < inject_count; ai++) {
+                 const char *arg = inject_args[ai];
++                if (heap_override && strcmp(arg, "--max-old-space-size=512") == 0)
++                    continue;
+                 size_t arg_len = strlen(arg) + 1; // includes NUL
+ 
+                 // Empty strings are argv entries; only argc marks the end of this vector.

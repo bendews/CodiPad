@@ -1,0 +1,16 @@
+diff --git a/src/vs/base/node/ripgrep.ts b/src/vs/base/node/ripgrep.ts
+--- a/src/vs/base/node/ripgrep.ts
++++ b/src/vs/base/node/ripgrep.ts
+@@ -6,6 +6,12 @@
+ import { Lazy } from '../common/lazy.js';
+ 
+ const _rgDiskPath = new Lazy(async () => {
++	// The platform owner may execute child tools in a different ABI from native Node.
++	// Keep the search engine and arguments unchanged; only its packaged executable differs.
++	const executable = process.env['VSCODE_RIPGREP_PATH'];
++	if (executable) {
++		return executable;
++	}
+ 	const m = await import('@vscode/ripgrep-universal');
+ 	return m.rgPath.replace(/\bnode_modules\.asar\b/, 'node_modules.asar.unpacked');
+ });

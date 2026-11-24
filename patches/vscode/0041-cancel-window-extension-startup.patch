@@ -1,0 +1,110 @@
+--- a/src/vs/workbench/services/extensions/common/abstractExtensionService.ts
++++ b/src/vs/workbench/services/extensions/common/abstractExtensionService.ts
+@@ -456,6 +456,8 @@
+ 	//#endregion
+ 
+ 	private _initializePromise: Promise<void> | null = null;
++	/** Once a window reload is accepted, late resolver completions cannot start hosts. */
++	private _stoppingForWindowReload = false;
+ 	protected _initializeIfNeeded(): Promise<void> | null {
+ 		if (!this._initializePromise) {
+ 			this._initializePromise = this._initialize();
+@@ -464,12 +466,14 @@
+ 	}
+ 
+ 	protected async _initialize(): Promise<void> {
++		if (this._stoppingForWindowReload) { return; }
+ 		perf.mark('code/willLoadExtensions');
+ 		this._startExtensionHostsIfNecessary(true, []);
+ 
+ 		const lock = await this._registry.acquireLock('_initialize');
+ 		try {
+ 			await this._resolveAndProcessExtensions(lock);
++			if (this._stoppingForWindowReload) { return; }
+ 			// Start extension hosts which are not automatically started
+ 			this._startOnDemandExtensionHosts();
+ 		} finally {
+@@ -521,6 +525,7 @@
+ 		let remoteExtensions: IExtensionDescription[] = [];
+ 
+ 		for await (const extensions of this._resolveExtensions()) {
++			if (this._stoppingForWindowReload) { return; }
+ 			if (extensions instanceof ResolverExtensions) {
+ 				resolverExtensions = checkEnabledAndProposedAPI(this._logService, this._extensionEnablementService, this._extensionsProposedApi, extensions.extensions, false);
+ 				this._registry.deltaExtensions(lock, resolverExtensions, []);
+@@ -534,6 +539,7 @@
+ 			}
+ 		}
+ 
++		if (this._stoppingForWindowReload) { return; }
+ 		// `initializeRunningLocation` will look at the complete picture (e.g. an extension installed on both sides),
+ 		// takes care of duplicates and picks a running location for each extension
+ 		this._runningLocations.initializeRunningLocation(localExtensions, remoteExtensions);
+@@ -744,6 +750,11 @@
+ 		return this._doStopExtensionHostsWithVeto(reason, auto);
+ 	}
+ 
++	/** A user-initiated window transition must not wait for a stalled resolver. */
++	public async stopExtensionHostsForWindowReload(reason: string): Promise<boolean> {
++		return this._doStopExtensionHostsWithVeto(reason, false, () => { this._stoppingForWindowReload = true; });
++	}
++
+ 	protected async _doStopExtensionHosts(): Promise<void> {
+ 		const previouslyActivatedExtensionIds: ExtensionIdentifier[] = [];
+ 		for (const extensionStatus of this._extensionStatus.values()) {
+@@ -762,7 +773,7 @@
+ 		}
+ 	}
+ 
+-	private async _doStopExtensionHostsWithVeto(reason: string, auto: boolean = false): Promise<boolean> {
++	private async _doStopExtensionHostsWithVeto(reason: string, auto: boolean = false, accepted?: () => void): Promise<boolean> {
+ 		if (auto && this._environmentService.isExtensionDevelopment) {
+ 			return false;
+ 		}
+@@ -794,6 +805,7 @@
+ 
+ 		const veto = await handleVetos(vetos, error => this._logService.error(error));
+ 		if (!veto) {
++			accepted?.();
+ 			await this._doStopExtensionHosts();
+ 		} else {
+ 			if (!auto) {
+@@ -811,6 +823,10 @@
+ 				});
+ 
+ 				if (confirmed) {
++					if (accepted) {
++						accepted();
++						await this._doStopExtensionHosts();
++					}
+ 					return true;
+ 				}
+ 			}
+@@ -821,6 +837,7 @@
+ 	}
+ 
+ 	private _startExtensionHostsIfNecessary(isInitialStart: boolean, initialActivationEvents: string[]): void {
++		if (this._stoppingForWindowReload) { return; }
+ 		const locations: ExtensionRunningLocation[] = [];
+ 		for (let affinity = 0; affinity <= this._runningLocations.maxLocalProcessAffinity; affinity++) {
+ 			locations.push(new LocalProcessRunningLocation(affinity));
+--- a/src/vs/workbench/services/extensions/common/extensions.ts
++++ b/src/vs/workbench/services/extensions/common/extensions.ts
+@@ -540,6 +540,9 @@
+ 	 * if the operation was vetoed by listeners of the `onWillStop` event.
+ 	 */
+ 	stopExtensionHosts(reason: string, auto?: boolean): Promise<boolean>;
++
++	/** Stop for a window transition even if extension initialization is still pending. */
++	stopExtensionHostsForWindowReload(reason: string): Promise<boolean>;
+ 
+ 	/**
+ 	 * Starts the extension hosts. If updates are provided, the extension hosts are started with the given updates.
+@@ -616,6 +619,7 @@
+ 	getExtensionsStatus(): { [id: string]: IExtensionsStatus } { return Object.create(null); }
+ 	getInspectPorts(_extensionHostKind: ExtensionHostKind, _tryEnableInspector: boolean): Promise<IExtensionInspectInfo[]> { return Promise.resolve([]); }
+ 	async stopExtensionHosts(): Promise<boolean> { return true; }
++	async stopExtensionHostsForWindowReload(): Promise<boolean> { return true; }
+ 	async startExtensionHosts(): Promise<void> { }
+ 	async setRemoteEnvironment(_env: { [key: string]: string | null }): Promise<void> { }
+ 	canAddExtension(): boolean { return false; }

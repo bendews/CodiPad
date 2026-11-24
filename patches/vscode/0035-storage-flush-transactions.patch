@@ -1,0 +1,56 @@
+--- a/src/vs/base/parts/storage/common/storage.ts
++++ b/src/vs/base/parts/storage/common/storage.ts
+@@ -3,7 +3,7 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
+-import { ThrottledDelayer } from '../../../common/async.js';
++import { Promises, ThrottledDelayer } from '../../../common/async.js';
+ import { Event, PauseableEmitter } from '../../../common/event.js';
+ import { Disposable, IDisposable } from '../../../common/lifecycle.js';
+ import { parse, stringify } from '../../../common/marshalling.js';
+@@ -131,6 +131,8 @@
+ 	private pendingClose: Promise<void> | undefined = undefined;
+ 
+ 	private readonly whenFlushedCallbacks: Function[] = [];
++	private readonly inFlightFlushes = new Set<Promise<void>>();
++	private unreportedFlushError: { error: unknown } | undefined;
+ 
+ 	constructor(
+ 		protected readonly database: IStorageDatabase,
+@@ -374,13 +376,19 @@
+ 
+ 		// Update in storage and release any
+ 		// waiters we have once done
+-		return this.database.updateItems(updateRequest).finally(() => {
++		const transaction = this.database.updateItems(updateRequest).catch(error => {
++			this.unreportedFlushError ??= { error };
++			throw error;
++		}).finally(() => {
++			this.inFlightFlushes.delete(transaction);
+ 			if (!this.hasPending) {
+ 				while (this.whenFlushedCallbacks.length) {
+ 					this.whenFlushedCallbacks.pop()?.();
+ 				}
+ 			}
+ 		});
++		this.inFlightFlushes.add(transaction);
++		return transaction;
+ 	}
+ 
+ 	async flush(delay?: number): Promise<void> {
+@@ -391,7 +399,13 @@
+ 			return;
+ 		}
+ 
+-		return this.doFlush(delay);
++		try {
++			await Promises.settled([...this.inFlightFlushes, this.doFlush(delay)]);
++			// The scheduled writer may have rejected before this explicit flush began.
++			if (this.unreportedFlushError) { throw this.unreportedFlushError.error; }
++		} finally {
++			this.unreportedFlushError = undefined;
++		}
+ 	}
+ 
+ 	private async doFlush(delay?: number): Promise<void> {

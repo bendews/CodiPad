@@ -1,0 +1,84 @@
+--- a/src/vs/workbench/contrib/debug/node/debugAdapter.ts
++++ b/src/vs/workbench/contrib/debug/node/debugAdapter.ts
+@@ -4,6 +4,7 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import * as cp from 'child_process';
++import { CancellationError } from '../../../../base/common/errors.js';
+ import * as net from 'net';
+ import * as stream from 'stream';
+ import * as objects from '../../../../base/common/objects.js';
+@@ -239,6 +240,7 @@
+ export class ExecutableDebugAdapter extends StreamDebugAdapter {
+ 
+ 	private serverProcess: cp.ChildProcess | undefined;
++	private stopped = false;
+ 
+ 	constructor(private adapterExecutable: IDebugAdapterExecutable, private debugType: string) {
+ 		super();
+@@ -270,6 +272,10 @@
+ 					"Cannot determine executable for debug adapter '{0}'.", this.debugType));
+ 			}
+ 
++			if (this.stopped) {
++				throw new CancellationError();
++			}
++
+ 			let env = process.env;
+ 			if (options.env && Object.keys(options.env).length > 0) {
+ 				env = objects.mixin(objects.deepClone(process.env), options.env);
+@@ -287,9 +293,6 @@
+ 						forkOptions.cwd = options.cwd;
+ 					}
+ 					const child = cp.fork(args[0], args.slice(1), forkOptions);
+-					if (!child.pid) {
+-						throw new Error(nls.localize('unableToLaunchDebugAdapter', "Unable to launch debug adapter from '{0}'.", args[0]));
+-					}
+ 					this.serverProcess = child;
+ 				} else {
+ 					throw new Error(nls.localize('unableToLaunchDebugAdapterNoArgs', "Unable to launch debug adapter."));
+@@ -313,6 +316,24 @@
+ 				this.serverProcess = cp.spawn(spawnCommand, spawnArgs, spawnOptions);
+ 			}
+ 
++			// Node reports asynchronous admission failures via 'error', before 'spawn'.
++			await new Promise<void>((resolve, reject) => {
++				const child = this.serverProcess!;
++				const onError = (error: Error) => {
++					child.removeListener('spawn', onSpawn);
++					child.stdin?.destroy();
++					child.stdout?.destroy();
++					child.stderr?.destroy();
++					reject(error);
++				};
++				const onSpawn = () => {
++					child.removeListener('error', onError);
++					resolve();
++				};
++				child.once('error', onError);
++				child.once('spawn', onSpawn);
++			});
++
+ 			this.serverProcess.on('error', err => {
+ 				this._onError.fire(err);
+ 			});
+@@ -335,13 +356,18 @@
+ 
+ 			// finally connect to the DA
+ 			this.connect(this.serverProcess.stdout!, this.serverProcess.stdin!);
++			if (this.stopped) {
++				throw new CancellationError();
++			}
+ 
+ 		} catch (err) {
+-			this._onError.fire(err);
++			await this.stopSession();
++			throw err;
+ 		}
+ 	}
+ 
+ 	async stopSession(): Promise<void> {
++		this.stopped = true;
+ 
+ 		if (!this.serverProcess) {
+ 			return Promise.resolve(undefined);

@@ -1,0 +1,77 @@
+--- a/emu/tlb.h
++++ b/emu/tlb.h
+@@ -25,7 +25,11 @@
+ struct tlb {
+     struct mmu *mmu;
+     page_t dirty_page;
++#ifdef GUEST_ARM64
++    uint64_t mem_changes;
++#else
+     unsigned mem_changes;
++#endif
+ #ifdef GUEST_ARM64
+     // TLB_STALE once another thread may have changed the mappings since this
+     // TLB was last checked against mmu->changes, else 0. The inline lookups OR
+--- a/emu/tlb.c
++++ b/emu/tlb.c
+@@ -1,10 +1,16 @@
+ #include "emu/cpu.h"
+ #include "emu/tlb.h"
+ #include <stdatomic.h>
++#include <stddef.h>
+ #include "kernel/task.h"
+ #include "kernel/memory.h"
+ #include "kernel/fs.h"
+ #include "util/sync.h"
++
++#ifdef GUEST_ARM64
++_Static_assert(offsetof(struct tlb, mem_changes) == 16, "ARM64 dispatch TLB generation offset");
++_Static_assert(offsetof(struct mmu, changes) == 16, "ARM64 dispatch MMU generation offset");
++#endif
+ 
+ #ifdef GUEST_ARM64
+ // T11: ISH_TLB_FULL_CLEAR=1 forces the pre-T8 whole-array clear, so T8 itself is A/B-able on device
+@@ -41,7 +47,7 @@
+     // not change.
+     tlb_refresh_flat_view(tlb, mmu);
+ #endif
+-    if (tlb->mmu == mmu && tlb->mem_changes == mmu->changes)
++    if (tlb->mmu == mmu && tlb->mem_changes == __atomic_load_n(&mmu->changes, __ATOMIC_ACQUIRE))
+         return;
+     if (tlb->mmu != mmu) {
+         // Address space changed (execve); block cache and ret_cache are invalid
+@@ -54,7 +60,7 @@
+     }
+     tlb->mmu = mmu;
+     tlb->dirty_page = TLB_PAGE_EMPTY;
+-    tlb->mem_changes = mmu->changes;
++    tlb->mem_changes = __atomic_load_n(&mmu->changes, __ATOMIC_ACQUIRE);
+     tlb_flush(tlb);
+ }
+ 
+@@ -96,7 +102,7 @@
+ #endif
+ 
+ void tlb_flush(struct tlb *tlb) {
+-    tlb->mem_changes = tlb->mmu->changes;
++    tlb->mem_changes = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
+ #ifdef GUEST_ARM64
+     pthread_once(&tlb_forced_once, tlb_forced_init);
+     if (tlb->occupied_valid && !tlb_forced_full_clear) {
+--- a/asbestos/guest-arm64/gadgets-aarch64/entry.S
++++ b/asbestos/guest-arm64/gadgets-aarch64/entry.S
+@@ -90,10 +90,11 @@
+     // On macOS, munmap+mmap reuses host virtual addresses, so stale TLB entries
+     // silently read/write wrong data (no SIGSEGV). Must return to main loop
+     // for TLB flush when the page table has changed.
+-    ldr x8, [_tlb, #(-TLB_entries + 16)]   // tlb->mem_changes (unsigned, at offset 16)
++    ldr x8, [_tlb, #(-TLB_entries + 16)]   // tlb->mem_changes (uint64_t, at offset 16)
+     ldr x9, [_tlb, #-TLB_entries]           // tlb->mmu
+-    ldr x9, [x9, #16]                       // mmu->changes (uint64_t, at offset 16)
+-    cmp w8, w9                              // compare as 32-bit (mem_changes is unsigned)
++    add x9, x9, #16                         // &mmu->changes
++    ldar x9, [x9]                            // acquire concurrent generation changes
++    cmp x8, x9
+     b.ne poke                               // if changed, return to main loop for flush
+     // Record last_block for block chaining in main loop
+     sub x8, _pc, #FIBER_BLOCK_code

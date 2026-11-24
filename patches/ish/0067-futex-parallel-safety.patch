@@ -1,0 +1,362 @@
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -1,3 +1,4 @@
++#include <errno.h>
+ #include <poll.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+@@ -66,10 +67,8 @@
+     }
+ 
+     futex = malloc(sizeof(struct futex));
+-    if (futex == NULL) {
+-        unlock(&futex_lock);
++    if (futex == NULL)
+         return NULL;
+-    }
+     futex->refcount = 1;
+     futex->mem = current->mem;
+     futex->addr = addr;
+@@ -108,7 +107,7 @@
+     read_wrlock(&current->mem->lock);
+     dword_t *ptr = mem_ptr(current->mem, futex->addr, MEM_READ);
+     if (ptr != NULL)
+-        *out = *ptr;
++        *out = __atomic_load_n(ptr, __ATOMIC_SEQ_CST);
+     read_wrunlock(&current->mem->lock);
+     return ptr == NULL;
+ }
+@@ -143,14 +142,23 @@
+ }
+ 
+ static addr_t futex_watch_addr(void) {
+-    static addr_t a = 1;
+-    if (a == 1) { const char *e = getenv("ISH_FUTEX_WATCH"); a = e ? strtoull(e, NULL, 16) : 0; }
+-    return a;
++    static _Atomic(addr_t) a = 1;
++    addr_t value = atomic_load_explicit(&a, memory_order_relaxed);
++    if (value == 1) {
++        const char *e = getenv("ISH_FUTEX_WATCH");
++        value = e ? strtoull(e, NULL, 16) : 0;
++        atomic_store_explicit(&a, value, memory_order_relaxed);
++    }
++    return value;
+ }
+ 
+ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
+     futex_dbg_set(current->pid, uaddr, val);
+     struct futex *futex = futex_get(uaddr);
++    if (futex == NULL) {
++        futex_dbg_set(current->pid, 0, 0);
++        return _ENOMEM;
++    }
+     if (uaddr == futex_watch_addr()) {
+         dword_t rv = 0xdeadbeef; void *hp = NULL;
+         read_wrlock(&current->mem->lock);
+@@ -170,12 +178,22 @@
+     else {
+         // Lazily create per-thread futex pipe (reused across all futex_wait calls)
+         if (current->futex_pipe[0] == -1) {
+-            if (pipe(current->futex_pipe) < 0) {
+-                futex_put(futex);
+-                return _ENOMEM;
++            int fds[2];
++            if (pipe(fds) < 0) {
++                err = errno_map();
++                futex_put(futex);
++                goto futex_wait_done;
+             }
+-            fcntl(current->futex_pipe[0], F_SETFL, O_NONBLOCK);
+-            fcntl(current->futex_pipe[1], F_SETFL, O_NONBLOCK);
++            if (fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0 ||
++                    fcntl(fds[1], F_SETFL, O_NONBLOCK) < 0) {
++                err = errno_map();
++                close(fds[0]);
++                close(fds[1]);
++                futex_put(futex);
++                goto futex_wait_done;
++            }
++            current->futex_pipe[0] = fds[0];
++            current->futex_pipe[1] = fds[1];
+         }
+         // Drain any stale bytes from previous wakeups
+         { char buf[16]; while (read(current->futex_pipe[0], buf, sizeof(buf)) > 0) {} }
+@@ -240,14 +258,22 @@
+             }
+ 
+             int ret = poll(&pfd, 1, poll_ms);
+-            if (ret > 0) {
++            if (ret > 0 && (pfd.revents & POLLIN)) {
+                 // Woken by pipe write — drain it
+                 char buf[16];
+                 while (read(current->futex_pipe[0], buf, sizeof(buf)) > 0) {}
+                 err = 0;
+                 break;
+             }
+-            // ret == 0 (timeout) or ret < 0 (EINTR from signal) — check conditions
++            if (ret > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
++                err = _EIO;
++                break;
++            }
++            if (ret < 0 && errno != EINTR) {
++                err = err_map(errno);
++                break;
++            }
++            // Timeout or EINTR: check for guest signals and group exit.
+ 
+             stall_count++;
+             if (current->group->doing_group_exit) {
+@@ -259,10 +285,6 @@
+                 unlock(&current->sighand->lock);
+                 if (sig_pending) { err = _EINTR; break; }
+             }
+-            // Check value periodically (every ~100ms instead of every 10ms)
+-            dword_t observed;
+-            if (futex_load(futex, &observed)) { err = _EFAULT; break; }
+-            if (observed != val) { err = 0; break; }
+             // Debug: dump all threads' state once when stalled past a short
+             // gated threshold (ISH_FUTEX_DBG=<seconds>). Helps diagnose which
+             // thread holds the lock the stalled thread is waiting on.
+@@ -310,18 +332,11 @@
+             // 2026-09-22), and it reported the kill as a clean exit 0.
+             //
+             // The hangs it papered over had real causes that are fixed:
+-            // lost wakes (condvar -> per-thread pipe, plus the value re-check
+-            // above every 100 ms), exit_group not interrupting blocked
+-            // siblings (doing_group_exit check above), and FUTEX_CMP_REQUEUE /
+-            // FUTEX_WAKE_OP returning ENOSYS (a820b16a, 20 min after the
+-            // valve). With the re-check in place, a wait still stalled here
+-            // means no thread ever changed the word: either the guest is
+-            // idle or deadlocked the way it would be on Linux, or iSH lost a
+-            // wake somewhere else. Neither is the kernel's to kill, and
+-            // killing destroys the evidence of the second. So only say so,
+-            // once per wait, without needing ISH_EXEC_TRACE; a stuck command
+-            // is ended by the caller's own timeout (shell_execute kills the
+-            // process group and reports it as a timeout).
++            // lost wakes (condvar -> per-thread pipe), exit_group not interrupting
++            // blocked siblings (doing_group_exit check above), and missing
++            // FUTEX_CMP_REQUEUE / FUTEX_WAKE_OP support. A stalled wait can
++            // mean an idle guest, a guest deadlock, or a lost wake. Never kill
++            // the process or report success to hide that distinction.
+             if (timeout == NULL && stall_count == 1800) { // 1800 * 100ms = 180s
+                 int live = 0;
+                 lock(&pids_lock);
+@@ -339,6 +354,10 @@
+ 
+         // Remove from queue (pipe stays open for reuse)
+         lock(&futex_lock);
++        // A waker that already removed this waiter owns the result, even if
++        // the poll loop observed a timeout or signal before taking the lock.
++        if (list_null(&wait.queue))
++            err = 0;
+         list_remove_safe(&wait.queue);
+         futex_put_unlocked(wait.futex);
+         unlock(&futex_lock);
+@@ -352,7 +371,8 @@
+ }
+ 
+ // Wake up to `max` waiters on the given futex. Caller must hold futex_lock.
+-static unsigned futex_wake_queue(struct futex *futex, dword_t max) {
++struct futex_wake_result { unsigned woken; int error; };
++static struct futex_wake_result futex_wake_queue(struct futex *futex, dword_t max) {
+     struct futex_wait *wait, *tmp;
+     unsigned woken = 0;
+     list_for_each_entry_safe(&futex->queue, wait, tmp, queue) {
+@@ -361,18 +381,42 @@
+         // Wake via per-thread pipe write — waiter is blocked on poll(futex_pipe[0])
+         if (wait->task->futex_pipe[1] != -1) {
+             char c = 1;
+-            write(wait->task->futex_pipe[1], &c, 1);
++            ssize_t written;
++            do {
++                written = write(wait->task->futex_pipe[1], &c, 1);
++            } while (written < 0 && errno == EINTR);
++            // A full pipe already has a wake pending for this waiter.
++            if (written != 1 && !(written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
++                return (struct futex_wake_result){woken, written < 0 ? err_map(errno) : _EIO};
++        } else {
++            return (struct futex_wake_result){woken, _EIO};
+         }
+         list_remove(&wait->queue);
+         woken++;
+     }
+-    return woken;
++    return (struct futex_wake_result){woken, 0};
+ }
+ 
+ static int futex_wakelike(int op, addr_t uaddr, dword_t wake_max, dword_t requeue_max, addr_t requeue_addr) {
+     struct futex *futex = futex_get(uaddr);
++    if (futex == NULL)
++        return _ENOMEM;
++    struct futex *futex2 = NULL;
++    if (op == FUTEX_REQUEUE_) {
++        futex2 = futex_get_unlocked(requeue_addr);
++        if (futex2 == NULL) {
++            futex_put(futex);
++            return _ENOMEM;
++        }
++    }
+ 
+-    unsigned woken = futex_wake_queue(futex, wake_max);
++    struct futex_wake_result result = futex_wake_queue(futex, wake_max);
++    unsigned woken = result.woken;
++    if (result.error) {
++        if (futex2) futex_put_unlocked(futex2);
++        futex_put(futex);
++        return woken ? (int) woken : result.error;
++    }
+     if (uaddr == futex_watch_addr()) {
+         dword_t mv = 0xdead; void *hp = NULL;
+         read_wrlock(&current->mem->lock);
+@@ -384,19 +428,19 @@
+     }
+ 
+     if (op == FUTEX_REQUEUE_) {
+-        struct futex *futex2 = futex_get_unlocked(requeue_addr);
+         struct futex_wait *wait, *tmp;
+         unsigned requeued = 0;
+         list_for_each_entry_safe(&futex->queue, wait, tmp, queue) {
+             if (requeued >= requeue_max)
+                 break;
+-            // sketchy as hell
+-            list_remove(&wait->queue);
+-            list_add_tail(&futex2->queue, &wait->queue);
+-            assert(futex->refcount > 1); // should be true because this function keeps a reference
+-            futex->refcount--;
+-            futex2->refcount++;
+-            wait->futex = futex2;
++            if (futex != futex2) {
++                list_remove(&wait->queue);
++                list_add_tail(&futex2->queue, &wait->queue);
++                assert(futex->refcount > 1);
++                futex->refcount--;
++                futex2->refcount++;
++                wait->futex = futex2;
++            }
+             requeued++;
+         }
+         futex_put_unlocked(futex2);
+@@ -429,20 +473,32 @@
+         return _EAGAIN;
+     }
+ 
+-    unsigned woken = futex_wake_queue(futex, wake_max);
+-
+     struct futex *futex2 = futex_get_unlocked(requeue_addr);
++    if (futex2 == NULL) {
++        futex_put(futex);
++        return _ENOMEM;
++    }
++    struct futex_wake_result result = futex_wake_queue(futex, wake_max);
++    unsigned woken = result.woken;
++    if (result.error) {
++        futex_put_unlocked(futex2);
++        futex_put(futex);
++        return woken ? (int) woken : result.error;
++    }
++
+     struct futex_wait *wait, *tmp;
+     unsigned requeued = 0;
+     list_for_each_entry_safe(&futex->queue, wait, tmp, queue) {
+         if (requeued >= requeue_max)
+             break;
+-        list_remove(&wait->queue);
+-        list_add_tail(&futex2->queue, &wait->queue);
+-        assert(futex->refcount > 1);
+-        futex->refcount--;
+-        futex2->refcount++;
+-        wait->futex = futex2;
++        if (futex != futex2) {
++            list_remove(&wait->queue);
++            list_add_tail(&futex2->queue, &wait->queue);
++            assert(futex->refcount > 1);
++            futex->refcount--;
++            futex2->refcount++;
++            wait->futex = futex2;
++        }
+         requeued++;
+     }
+     futex_put_unlocked(futex2);
+@@ -467,15 +523,25 @@
+     if (shift) {
+         if (oparg < 0 || oparg > 31)
+             return _EINVAL;
+-        oparg = 1 << oparg;
++        oparg = (int32_t)(UINT32_C(1) << oparg);
+     }
++    if (op_code > FUTEX_OP_XOR || cmp_code > FUTEX_OP_CMP_GE)
++        return _ENOSYS;
+ 
+-    // Atomic RMW on *uaddr2.
+-    // We must hold mem->lock across mem_ptr+atomic op so the mapping can't vanish.
++    // Order the atomic update and wake with WAIT's check and registration.
++    lock(&futex_lock);
++    struct futex *f1 = futex_get_unlocked(uaddr);
++    if (f1 == NULL) { unlock(&futex_lock); return _ENOMEM; }
++    struct futex *f2 = futex_get_unlocked(uaddr2);
++    if (f2 == NULL) { futex_put(f1); return _ENOMEM; }
++
++    // Protect the mapping until the atomic operation has completed.
+     read_wrlock(&current->mem->lock);
+     uint32_t *ptr = mem_ptr(current->mem, uaddr2, MEM_WRITE);
+     if (ptr == NULL) {
+         read_wrunlock(&current->mem->lock);
++        futex_put_unlocked(f2);
++        futex_put(f1);
+         return _EFAULT;
+     }
+     uint32_t oldval;
+@@ -496,8 +562,7 @@
+             oldval = __atomic_fetch_xor(ptr, (uint32_t)oparg, __ATOMIC_SEQ_CST);
+             break;
+         default:
+-            read_wrunlock(&current->mem->lock);
+-            return _ENOSYS;
++            abort(); // validated before taking either lock
+     }
+     read_wrunlock(&current->mem->lock);
+ 
+@@ -510,24 +575,18 @@
+         case FUTEX_OP_CMP_LE: cmp_true = (sold <= cmparg); break;
+         case FUTEX_OP_CMP_GT: cmp_true = (sold >  cmparg); break;
+         case FUTEX_OP_CMP_GE: cmp_true = (sold >= cmparg); break;
+-        default: return _ENOSYS;
++        default: abort(); // validated before the atomic operation
+     }
+ 
+-    // Wake waiters on both queues. Acquire both futexes under futex_lock.
+-    lock(&futex_lock);
+-    struct futex *f1 = futex_get_unlocked(uaddr);
+-    if (f1 == NULL) { unlock(&futex_lock); return _ENOMEM; }
+-    unsigned total = futex_wake_queue(f1, wake_max1);
+-    if (cmp_true) {
+-        struct futex *f2 = futex_get_unlocked(uaddr2);
+-        if (f2 != NULL) {
+-            total += futex_wake_queue(f2, wake_max2);
+-            futex_put_unlocked(f2);
+-        }
++    struct futex_wake_result result = futex_wake_queue(f1, wake_max1);
++    unsigned total = result.woken;
++    if (!result.error && cmp_true) {
++        result = futex_wake_queue(f2, wake_max2);
++        total += result.woken;
+     }
+-    futex_put_unlocked(f1);
+-    unlock(&futex_lock);
+-    return total;
++    futex_put_unlocked(f2);
++    futex_put(f1);
++    return result.error && !total ? result.error : (int) total;
+ }
+ 
+ dword_t sys_futex(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2, addr_t uaddr2, dword_t val3) {
+@@ -535,6 +594,9 @@
+         STRACE("!FUTEX_PRIVATE ");
+     }
+     int cmd = op & FUTEX_CMD_MASK_;
++    if ((uaddr & 3) ||
++        ((cmd == FUTEX_REQUEUE_ || cmd == FUTEX_CMP_REQUEUE_ || cmd == FUTEX_WAKE_OP_) && (uaddr2 & 3)))
++        return _EINVAL;
+     struct timespec timeout = {0};
+     if ((cmd == FUTEX_WAIT_ || cmd == FUTEX_WAIT_BITSET_) && timeout_or_val2) {
+         struct timespec_ timeout_;

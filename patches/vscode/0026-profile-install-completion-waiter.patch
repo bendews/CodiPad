@@ -1,0 +1,19 @@
+--- a/src/vs/platform/extensionManagement/common/abstractExtensionManagementService.ts
++++ b/src/vs/platform/extensionManagement/common/abstractExtensionManagementService.ts
+@@ -305,11 +305,14 @@
+ 						this.logService.info('Waiting for already requested installing extension', identifier.id, root.identifier.id, options.profileLocation.toString());
+ 						existingInstallingExtension.waitingTasks.push(root);
+ 						// add promise that waits until the extension is completely installed, ie., onDidInstallExtensions event is triggered for this extension
++						const expectedTaskKey = getInstallExtensionTaskKey(extension, options.profileLocation);
++						const isExpectedResult = (result: InstallExtensionResult) => !!result.source && !URI.isUri(result.source) && !!result.profileLocation
++							&& getInstallExtensionTaskKey(result.source, result.profileLocation) === expectedTaskKey;
+ 						const waitForInstallation = Event.toPromise(
+-							Event.filter(this.onDidInstallExtensions, results => results.some(result => areSameExtensions(result.identifier, identifier)))
++							Event.filter(this._onDidInstallExtensions.event, results => results.some(isExpectedResult))
+ 						).then(results => {
+ 							this.logService.info('Finished waiting for already requested installing extension', identifier.id, root.identifier.id, options.profileLocation.toString());
+-							const result = results.find(result => areSameExtensions(result.identifier, identifier));
++							const result = results.find(isExpectedResult);
+ 							if (!result?.local) {
+ 								// Extension failed to install
+ 								throw new Error(`Extension ${identifier.id} is not installed`);

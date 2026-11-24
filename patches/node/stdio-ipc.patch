@@ -1,0 +1,25 @@
+--- a/deps/uv/src/unix/stream.c
++++ b/deps/uv/src/unix/stream.c
+@@ -31,6 +31,9 @@
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <sys/uio.h>
++#if defined(__APPLE__)
++# include <TargetConditionals.h>
++#endif
+ #include <sys/un.h>
+ #include <unistd.h>
+ #include <limits.h> /* IOV_MAX */
+@@ -1344,6 +1347,12 @@
+               unsigned int nbufs,
+               uv_stream_t* send_handle,
+               uv_write_cb cb) {
++#if defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
++  /* The shared iOS process authority supports IPC bytes, not native handle transfer.
++   * Refuse before queuing or writing any message bytes. */
++  if (send_handle != NULL)
++    return UV_ENOTSUP;
++#endif
+   int empty_queue;
+   int err;
+ 

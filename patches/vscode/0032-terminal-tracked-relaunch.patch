@@ -1,0 +1,20 @@
+--- a/src/vs/workbench/contrib/terminal/browser/terminalProcessManager.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalProcessManager.ts
+@@ -823,8 +823,15 @@
+ 
+ 		this._swapTimeout = mainWindow.setTimeout(() => this.triggerSwap(), SeamlessRelaunchConstants.SwapWaitMaximumDuration);
+ 
+-		// Pause all outgoing data events
+-		this._dataListener.clear();
++		// Only untracked output may wait for the seamless comparison. Tracked output must
++		// reach the renderer synchronously so the producer receives its writePromise.
++		// Listen before the recorder: swap its earlier bytes, then forward this exact event.
++		this._dataListener.value = process.onProcessData(e => {
++			if (!isString(e) && e.trackCommit) {
++				this.triggerSwap();
++				this._onProcessData.fire(e);
++			}
++		});
+ 
+ 		this._firstDisposable.clear();
+ 		const recorder = this._createRecorder(process);

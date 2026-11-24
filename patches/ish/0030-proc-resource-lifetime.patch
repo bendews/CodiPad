@@ -1,0 +1,161 @@
+--- a/kernel/task.h
++++ b/kernel/task.h
+@@ -109,6 +109,8 @@
+     // reads it to tell a thread that is already exiting (merely waiting its
+     // turn for the lock) from one stuck elsewhere.
+     _Atomic bool exit_started;
++    // Protected by pids_lock; procfs may borrow fs/files only after construction completes.
++    bool proc_resources_ready;
+ 
+     // this structure is allocated on the stack of the parent's clone() call
+     struct vfork_info {
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -75,6 +75,7 @@
+     if (parent != NULL)
+         *task = *parent;
+     task->pid = pid->id;
++    task->proc_resources_ready = false;
+     pid->task = task;
+     // Copied from the parent above; a new task has not begun exiting.
+     atomic_store(&task->exit_started, false);
+--- a/kernel/init.c
++++ b/kernel/init.c
+@@ -93,6 +93,9 @@
+     task->fs->pwd = fd_retain(task->fs->root);
+     current = old_current;
+ 
++    lock(&pids_lock);
++    task->proc_resources_ready = true;
++    unlock(&pids_lock);
+     return task;
+ }
+ 
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -268,6 +268,10 @@
+         task->clear_tid = ctid_addr;
+     task->exit_signal = flags & CSIGNAL_;
+ 
++    // Publish only after every fallible construction step. Failure cleanup stays hidden from procfs.
++    lock(&pids_lock);
++    task->proc_resources_ready = true;
++    unlock(&pids_lock);
+     // remember to do CLONE_SYSVSEM
+     return 0;
+ 
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -110,14 +110,19 @@
+         // cleanup handler must NOT release again.
+         current->mm_release_deferred = false;
+     }
+-    if (current->files != NULL) {
+-        fdtable_release(current->files);
+-        current->files = NULL;
+-    }
+-    if (current->fs != NULL) {
+-        fs_info_release(current->fs);
+-        current->fs = NULL;
+-    }
++    // Detach under the same lock procfs uses to retain these objects. Releases may close FDs
++    // and enter other subsystems, so they must run outside pids_lock.
++    lock(&pids_lock);
++    struct fdtable *files = current->files;
++    struct fs_info *fs = current->fs;
++    current->files = NULL;
++    current->fs = NULL;
++    current->proc_resources_ready = false;
++    unlock(&pids_lock);
++    if (files != NULL)
++        fdtable_release(files);
++    if (fs != NULL)
++        fs_info_release(fs);
+     // Close per-thread futex wakeup pipe
+     if (current->futex_pipe[0] != -1) {
+         close(current->futex_pipe[0]);
+--- a/fs/proc/pid.c
++++ b/fs/proc/pid.c
+@@ -16,8 +16,10 @@
+ static struct task *proc_get_task(struct proc_entry *entry) {
+     lock(&pids_lock);
+     struct task *task = pid_get_task(entry->pid);
+-    // Also reject tasks that are mid-exit: sighand/group may already be freed.
+-    if (task != NULL && (task->exiting || task->sighand == NULL || task->group == NULL))
++    // Construction failure cleanup has not published owned resources; exit detaches them under
++    // this lock. An already admitted reader retains its resource before dropping the lock.
++    if (task != NULL && (!task->proc_resources_ready || atomic_load(&task->exit_started) ||
++                        task->exiting || task->sighand == NULL || task->group == NULL))
+         task = NULL;
+     if (task == NULL)
+         unlock(&pids_lock);
+@@ -318,6 +320,10 @@
+     // proc_entry_stat); holding both here in the opposite order deadlocked
+     // claude-cli startup when 20+ bun workers scan /proc/self/fd at once.
+     struct fdtable *files = task->files;
++    if (files == NULL) {
++        proc_put_task(task);
++        return false;
++    }
+     files->refcount++;
+     proc_put_task(task); // releases pids_lock
+     lock(&files->lock);
+@@ -339,20 +345,20 @@
+     struct task *task = proc_get_task(entry);
+     if (task == NULL)
+         return _ESRCH;
+-    // Retain the fd under files->lock, then drop BOTH files->lock and
+-    // pids_lock (held by proc_get_task) before calling generic_getpath.
+-    // getpath can take other subsystem locks (mounts, real fs), and holding
+-    // pids_lock across it created a lock-ordering hazard against paths that
+-    // take those locks first and then pids_lock — an intermittent deadlock
+-    // during claude-cli startup when 20+ bun worker threads all scan
+-    // /proc/self/fd concurrently. Also: fd may be NULL if another thread
+-    // closed the descriptor (return ENOENT, not a host crash).
+-    lock(&task->files->lock);
+-    struct fd *fd = fdtable_get(task->files, entry->fd);
++    // Retain the table under pids_lock, then take its lock only after releasing pids_lock.
++    struct fdtable *files = task->files;
++    if (files == NULL) {
++        proc_put_task(task);
++        return _ESRCH;
++    }
++    files->refcount++;
++    proc_put_task(task);
++    lock(&files->lock);
++    struct fd *fd = fdtable_get(files, entry->fd);
+     if (fd != NULL)
+         fd = fd_retain(fd);
+-    unlock(&task->files->lock);
+-    proc_put_task(task); // releases pids_lock
++    unlock(&files->lock);
++    fdtable_release(files);
+     if (fd == NULL)
+         return _ENOENT;
+     int err = generic_getpath(fd, buf);
+@@ -396,10 +402,21 @@
+     struct task *task = proc_get_task(entry);
+     if (task == NULL)
+         return _ESRCH;
+-    lock(&task->fs->lock);
+-    int err = generic_getpath(task->fs->pwd, buf);
+-    unlock(&task->fs->lock);
+-    proc_put_task(task);
++    struct fs_info *fs = task->fs;
++    if (fs == NULL) {
++        proc_put_task(task);
++        return _ESRCH;
++    }
++    fs->refcount++;
++    proc_put_task(task);
++    lock(&fs->lock);
++    struct fd *pwd = fs->pwd != NULL ? fd_retain(fs->pwd) : NULL;
++    unlock(&fs->lock);
++    fs_info_release(fs);
++    if (pwd == NULL)
++        return _ENOENT;
++    int err = generic_getpath(pwd, buf);
++    fd_close(pwd);
+     return err;
+ }
+ 

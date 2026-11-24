@@ -1,0 +1,79 @@
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -2059,6 +2059,41 @@
+ }
+ 
+ // Emit one segment starting at unit ui (not installed). Returns the next unit.
++// Group two consecutive unsigned-offset scalar loads. The entire range must
++// be readable in one guest page before the first load takes effect. On a miss
++// resume at the first original gadget, preserving partial-fault semantics.
++static bool emit_two_loads(struct em *e, const struct jit_unit *a, const struct jit_unit *b) {
++    if (a->last || b->last || a->follow || b->follow || a->n != 1 || b->n != 1 ||
++        a->start == a->end || b->start == b->end || a->end != b->start ||
++        b->pc != a->pc + 4) return false;
++    uint32_t x = a->w[0], y = b->w[0];
++    if ((x & 0x3FC00000u) != 0x39400000u ||
++        (y & 0x3FC00000u) != 0x39400000u) return false;
++    unsigned sx = x >> 30, sy = y >> 30;
++    unsigned rn = (x >> 5) & 31, rt = x & 31;
++    if (((y >> 5) & 31) != rn || (rn != 31 && rt == rn)) return false;
++    unsigned ox = ((x >> 10) & 0xfff) << sx;
++    unsigned oy = ((y >> 10) & 0xfff) << sy;
++    if (ox > 4095 || oy < ox || oy - ox > 4095) return false;
++    unsigned span = oy - ox + (1u << sy);
++    if (span < (1u << sx) || span > 4096 || (oy - ox) % (1u << sy)) return false;
++    e->locked = 0;
++    int hn = hreg(e, rn == 31 ? G_SP : rn);
++    put(e, 0x91000000u | (ox << 10) | ((uint32_t) hn << 5) | T_A);
++    tlb_lookup(e, span, false, a->start, false);
++    int ht = rt == 31 ? 31 : hdest(e, rt);
++    put(e, (x & 0xC0C00000u) | 0x39000000u | (T_A << 5) | (uint32_t) ht);
++    if (rt != 31) writeback(e, rt);
++    e->locked = 0;
++    unsigned rt2 = y & 31;
++    int ht2 = rt2 == 31 ? 31 : hdest(e, rt2);
++    unsigned offset = oy - ox;
++    put(e, (y & 0xC0C00000u) | 0x39000000u |
++           ((offset >> sy) << 10) | (T_A << 5) | (uint32_t) ht2);
++    if (rt2 != 31) writeback(e, rt2);
++    return true;
++}
++
+ static unsigned emit_segment(struct em *e, struct fiber_block *b, const struct jit_units *U, unsigned ui,
+                              bool *ended_out, unsigned *covered_out, unsigned *real_out) {
+     memset(e->host, -1, sizeof(e->host));
+@@ -2132,8 +2167,9 @@
+         int8_t host0[33], owner0[32];
+         memcpy(host0, e->host, sizeof(host0));
+         memcpy(owner0, e->owner, sizeof(owner0));
+-        bool ok = true, pure = true;
+-        for (unsigned k = 0; ok && k < u->n && !u->follow; k++) {
++        bool grouped = ui + 1 < U->n && emit_two_loads(e, u, &U->u[ui + 1]);
++        bool ok = !e->fail, pure = true;
++        for (unsigned k = 0; ok && !grouped && k < u->n && !u->follow; k++) {
+             bool has_mem;
+             ok = emit_insn(e, u->w[k], u->pc + 4 * k, u->start, &has_mem) && !e->fail;
+             // A bailout re-runs the whole unit's gadget, so everything the
+@@ -2151,10 +2187,10 @@
+             memcpy(e->owner, owner0, sizeof(owner0));
+             break;
+         }
+-        covered++;
++        covered += grouped ? 2 : 1;
+         if (!u->follow)
+-            real++;
+-        ui++;
++            real += grouped ? 2 : 1;
++        ui += grouped ? 2 : 1;
+     }
+     *ended_out = ended;
+     *covered_out = covered;
+@@ -2547,7 +2583,7 @@
+ 
+ // Bump whenever the code emitted for some guest instruction, stub or exit
+ // changes: images made before would still pass every other check.
+-#define JIT_CODE_VERSION 15
++#define JIT_CODE_VERSION 16
+ 
+ // Everything the emitted code bakes in besides the gadgets it names: the
+ // conventions, the struct layouts it loads from and the TLB / block cache

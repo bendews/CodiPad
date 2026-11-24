@@ -1,0 +1,234 @@
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -43,6 +43,7 @@
+     struct futex *futex; // will be changed by a requeue
+     struct list queue;
+     struct task *task;   // owning task (for per-thread futex_pipe wakeup)
++    dword_t bitset;
+ };
+ 
+ #define FUTEX_HASH_BITS 12
+@@ -152,7 +153,8 @@
+     return value;
+ }
+ 
+-static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
++static int futex_wait(addr_t uaddr, dword_t val, const struct timespec *deadline,
++                      clockid_t deadline_clock, dword_t bitset) {
+     futex_dbg_set(current->pid, uaddr, val);
+     struct futex *futex = futex_get(uaddr);
+     if (futex == NULL) {
+@@ -202,31 +204,23 @@
+         wait.cond = COND_INITIALIZER;
+         wait.futex = futex;
+         wait.task = current;
++        wait.bitset = bitset;
+ 
+         // Stay in queue so futex_wakelike can find us and write to our pipe
+         list_add_tail(&futex->queue, &wait.queue);
+         unlock(&futex_lock);
+ 
+-        // Calculate deadline for timed waits
+-        int64_t deadline_ns = 0; // 0 = infinite
+-        if (timeout) {
+-            struct timespec now;
+-            clock_gettime(CLOCK_MONOTONIC, &now);
+-            deadline_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec
+-                        + (int64_t)timeout->tv_sec * 1000000000LL + timeout->tv_nsec;
+-        }
+-
+         current->blocking = true;
+         int stall_count = 0;
+         struct pollfd pfd = { .fd = current->futex_pipe[0], .events = POLLIN };
+         for (;;) {
+             // Compute poll timeout
+             int poll_ms;
+-            if (deadline_ns) {
++            if (deadline != NULL) {
+                 struct timespec now;
+-                clock_gettime(CLOCK_MONOTONIC, &now);
+-                int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+-                int64_t remain_ns = deadline_ns - now_ns;
++                if (clock_gettime(deadline_clock, &now) < 0) { err = errno_map(); break; }
++                __int128 remain_ns = ((__int128) deadline->tv_sec - now.tv_sec) * 1000000000
++                                   + deadline->tv_nsec - now.tv_nsec;
+                 if (remain_ns <= 0) { err = _ETIMEDOUT; break; }
+                 // [T-ish-futex-subms-timeout] This used to be
+                 // `remain_ms = remain / 1e6; if (remain_ms <= 0) ETIMEDOUT`:
+@@ -250,7 +244,7 @@
+                     nanosleep(&ts, NULL);   // EINTR (signal) just falls through to the checks
+                     poll_ms = 0;
+                 } else {
+-                    int64_t remain_ms = remain_ns / 1000000LL;   // >= 1 here
++                    __int128 remain_ms = remain_ns / 1000000;   // >= 1 here
+                     poll_ms = remain_ms > 100 ? 100 : (int)remain_ms;
+                 }
+             } else {
+@@ -337,7 +331,7 @@
+             // FUTEX_CMP_REQUEUE / FUTEX_WAKE_OP support. A stalled wait can
+             // mean an idle guest, a guest deadlock, or a lost wake. Never kill
+             // the process or report success to hide that distinction.
+-            if (timeout == NULL && stall_count == 1800) { // 1800 * 100ms = 180s
++            if (deadline == NULL && stall_count == 1800) { // 1800 * 100ms = 180s
+                 int live = 0;
+                 lock(&pids_lock);
+                 lock(&current->group->lock);
+@@ -372,12 +366,14 @@
+ 
+ // Wake up to `max` waiters on the given futex. Caller must hold futex_lock.
+ struct futex_wake_result { unsigned woken; int error; };
+-static struct futex_wake_result futex_wake_queue(struct futex *futex, dword_t max) {
++static struct futex_wake_result futex_wake_queue(struct futex *futex, dword_t max, dword_t bitset) {
+     struct futex_wait *wait, *tmp;
+     unsigned woken = 0;
+     list_for_each_entry_safe(&futex->queue, wait, tmp, queue) {
+         if (woken >= max)
+             break;
++        if (!(wait->bitset & bitset))
++            continue;
+         // Wake via per-thread pipe write — waiter is blocked on poll(futex_pipe[0])
+         if (wait->task->futex_pipe[1] != -1) {
+             char c = 1;
+@@ -397,7 +393,7 @@
+     return (struct futex_wake_result){woken, 0};
+ }
+ 
+-static int futex_wakelike(int op, addr_t uaddr, dword_t wake_max, dword_t requeue_max, addr_t requeue_addr) {
++static int futex_wakelike(int op, addr_t uaddr, dword_t wake_max, dword_t requeue_max, addr_t requeue_addr, dword_t bitset) {
+     struct futex *futex = futex_get(uaddr);
+     if (futex == NULL)
+         return _ENOMEM;
+@@ -410,7 +406,7 @@
+         }
+     }
+ 
+-    struct futex_wake_result result = futex_wake_queue(futex, wake_max);
++    struct futex_wake_result result = futex_wake_queue(futex, wake_max, bitset);
+     unsigned woken = result.woken;
+     if (result.error) {
+         if (futex2) futex_put_unlocked(futex2);
+@@ -452,7 +448,7 @@
+ }
+ 
+ int futex_wake(addr_t uaddr, dword_t wake_max) {
+-    return futex_wakelike(FUTEX_WAKE_, uaddr, wake_max, 0, 0);
++    return futex_wakelike(FUTEX_WAKE_, uaddr, wake_max, 0, 0, UINT32_MAX);
+ }
+ 
+ // FUTEX_CMP_REQUEUE: like FUTEX_REQUEUE, but first atomically check *uaddr == expected.
+@@ -478,7 +474,7 @@
+         futex_put(futex);
+         return _ENOMEM;
+     }
+-    struct futex_wake_result result = futex_wake_queue(futex, wake_max);
++    struct futex_wake_result result = futex_wake_queue(futex, wake_max, UINT32_MAX);
+     unsigned woken = result.woken;
+     if (result.error) {
+         futex_put_unlocked(futex2);
+@@ -578,10 +574,10 @@
+         default: abort(); // validated before the atomic operation
+     }
+ 
+-    struct futex_wake_result result = futex_wake_queue(f1, wake_max1);
++    struct futex_wake_result result = futex_wake_queue(f1, wake_max1, UINT32_MAX);
+     unsigned total = result.woken;
+     if (!result.error && cmp_true) {
+-        result = futex_wake_queue(f2, wake_max2);
++        result = futex_wake_queue(f2, wake_max2, UINT32_MAX);
+         total += result.woken;
+     }
+     futex_put_unlocked(f2);
+@@ -594,53 +590,70 @@
+         STRACE("!FUTEX_PRIVATE ");
+     }
+     int cmd = op & FUTEX_CMD_MASK_;
++    if ((cmd == FUTEX_WAIT_BITSET_ || cmd == FUTEX_WAKE_BITSET_) && val3 == 0)
++        return _EINVAL;
++    if ((cmd == FUTEX_REQUEUE_ || cmd == FUTEX_CMP_REQUEUE_) &&
++        ((int32_t) val < 0 || (int32_t) (uint32_t) timeout_or_val2 < 0))
++        return _EINVAL;
++    // The legacy Linux WAKE and WAKE_OP interfaces wake one matching waiter
++    // for a zero or negative signed count; REQUEUE instead rejects negatives.
++    if ((cmd == FUTEX_WAKE_ || cmd == FUTEX_WAKE_BITSET_ || cmd == FUTEX_WAKE_OP_) &&
++        (int32_t) val <= 0)
++        val = 1;
++    if (cmd == FUTEX_WAKE_OP_ && (int32_t) (uint32_t) timeout_or_val2 <= 0)
++        timeout_or_val2 = 1;
+     if ((uaddr & 3) ||
+         ((cmd == FUTEX_REQUEUE_ || cmd == FUTEX_CMP_REQUEUE_ || cmd == FUTEX_WAKE_OP_) && (uaddr2 & 3)))
+         return _EINVAL;
++    if ((op & FUTEX_CLOCK_REALTIME_) && cmd != FUTEX_WAIT_BITSET_)
++        return _ENOSYS;
+     struct timespec timeout = {0};
++    clockid_t timeout_clock = (op & FUTEX_CLOCK_REALTIME_) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+     if ((cmd == FUTEX_WAIT_ || cmd == FUTEX_WAIT_BITSET_) && timeout_or_val2) {
+         struct timespec_ timeout_;
+         if (user_get(timeout_or_val2, timeout_))
+             return _EFAULT;
+-        if (cmd == FUTEX_WAIT_BITSET_) {
+-            // FUTEX_WAIT_BITSET uses absolute CLOCK_REALTIME timeout;
+-            // convert to relative for our futex_wait implementation.
++#ifdef GUEST_ARM64
++        int64_t seconds = timeout_.sec, nanoseconds = timeout_.nsec;
++#else
++        int64_t seconds = (int32_t) timeout_.sec, nanoseconds = (int32_t) timeout_.nsec;
++#endif
++        if (seconds < 0 || nanoseconds < 0 || nanoseconds >= 1000000000)
++            return _EINVAL;
++        if (cmd == FUTEX_WAIT_) {
+             struct timespec now;
+-            clock_gettime(CLOCK_REALTIME, &now);
+-            timeout.tv_sec = timeout_.sec - now.tv_sec;
+-            timeout.tv_nsec = timeout_.nsec - now.tv_nsec;
+-            if (timeout.tv_nsec < 0) {
+-                timeout.tv_sec--;
+-                timeout.tv_nsec += 1000000000;
++            if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
++                return errno_map();
++            __int128 nsec = (__int128) now.tv_nsec + nanoseconds;
++            __int128 sec = (__int128) now.tv_sec + seconds + nsec / 1000000000;
++            if (sec > INT64_MAX) {
++                timeout.tv_sec = INT64_MAX;
++                timeout.tv_nsec = 999999999;
++            } else {
++                timeout.tv_sec = (time_t) sec;
++                timeout.tv_nsec = (long) (nsec % 1000000000);
+             }
+-            if (timeout.tv_sec < 0) {
+-                timeout.tv_sec = 0;
+-                timeout.tv_nsec = 0;
+-            }
+         } else {
+-            timeout.tv_sec = timeout_.sec;
+-            timeout.tv_nsec = timeout_.nsec;
++            timeout.tv_sec = (time_t) seconds;
++            timeout.tv_nsec = (long) nanoseconds;
+         }
+     }
+     switch (cmd) {
+         case FUTEX_WAIT_:
+             STRACE("futex(FUTEX_WAIT, %#x, %d, 0x%x {%ds %dns}) = ...\n", uaddr, val, timeout_or_val2, timeout.tv_sec, timeout.tv_nsec);
+-            return futex_wait(uaddr, val, timeout_or_val2 ? &timeout : NULL);
++            return futex_wait(uaddr, val, timeout_or_val2 ? &timeout : NULL, timeout_clock, UINT32_MAX);
+         case FUTEX_WAIT_BITSET_:
+-            // FUTEX_WAIT_BITSET with MATCH_ANY (0xffffffff) is equivalent to FUTEX_WAIT.
+-            // We ignore the bitset mask (val3) and treat all bits as matching.
+             STRACE("futex(FUTEX_WAIT_BITSET, %#x, %d, mask=%#x) = ...\n", uaddr, val, val3);
+-            return futex_wait(uaddr, val, timeout_or_val2 ? &timeout : NULL);
++            return futex_wait(uaddr, val, timeout_or_val2 ? &timeout : NULL, timeout_clock, val3);
+         case FUTEX_WAKE_:
+             STRACE("futex(FUTEX_WAKE, %#x, %d)", uaddr, val);
+-            return futex_wakelike(FUTEX_WAKE_, uaddr, val, 0, 0);
++            return futex_wakelike(FUTEX_WAKE_, uaddr, val, 0, 0, UINT32_MAX);
+         case FUTEX_WAKE_BITSET_:
+-            // FUTEX_WAKE_BITSET with MATCH_ANY is equivalent to FUTEX_WAKE.
+             STRACE("futex(FUTEX_WAKE_BITSET, %#x, %d, mask=%#x)", uaddr, val, val3);
+-            return futex_wakelike(FUTEX_WAKE_, uaddr, val, 0, 0);
++            return futex_wakelike(FUTEX_WAKE_, uaddr, val, 0, 0, val3);
+         case FUTEX_REQUEUE_:
+             STRACE("futex(FUTEX_REQUEUE, %#x, %d, %#x)", uaddr, val, uaddr2);
+-            return futex_wakelike(FUTEX_REQUEUE_, uaddr, val, timeout_or_val2, uaddr2);
++            return futex_wakelike(FUTEX_REQUEUE_, uaddr, val, timeout_or_val2, uaddr2, UINT32_MAX);
+         case FUTEX_CMP_REQUEUE_:
+             STRACE("futex(FUTEX_CMP_REQUEUE, %#x, %d, %#x, expected=%d)", uaddr, val, uaddr2, val3);
+             return futex_cmp_requeue(uaddr, val, timeout_or_val2, uaddr2, val3);

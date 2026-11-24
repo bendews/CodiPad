@@ -1,0 +1,64 @@
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -54,7 +54,11 @@
+ // ISH_JIT_CACHE_MB: a size in MB, or `def` when unset (see region_size).
+ static size_t env_mb(const char *name, size_t def) {
+     const char *v = getenv(name);
+-    return v != NULL && v[0] != '\0' ? (size_t) atol(v) << 20 : def;
++    if (!v || !v[0] || v[0] < '0' || v[0] > '9') return def;
++    char *end;
++    unsigned long long mb = strtoull(v, &end, 10);
++    if (*end || mb < 16 || mb > 1024) return def;
++    return (size_t) mb << 20;
+ }
+ 
+ // ---------------------------------------------------------------- stats
+@@ -125,6 +129,7 @@
+ // Debugger-prepared device mappings charge the entire reservation to memory.
+ static _Atomic size_t region_size = 256u << 20;
+ static unsigned region_shift = 28;
++static size_t region_maximum = (size_t) 1024 << 20;
+ #define CODE_BANK (128u << 20)
+ static size_t stub_bytes;   // permanent prefix copied at the start of each bank
+ static uint8_t *region;   // executable view
+@@ -3932,13 +3937,15 @@
+     uint64_t ram = 0;
+     size_t len = sizeof(ram), default_size = 128u << 20;
+     if (sysctlbyname("hw.memsize", &ram, &len, NULL, 0) == 0 && ram > (4ull << 30))
+-        default_size = 256u << 20;
++        default_size = 512u << 20;
+     region_size = env_mb("ISH_JIT_CACHE_MB", default_size);
+-    if (region_size < (16u << 20) || region_size > (256u << 20))
+-        region_size = default_size;
+     region_shift = 24;
+     while (((size_t) 1 << region_shift) < region_size) region_shift++;
+     region_size = (size_t) 1 << region_shift;   // exact flag-preserving range test
++    while (region_size > region_maximum) {
++        region_size >>= 1;
++        region_shift--;
++    }
+ }
+ 
+ // ish_jit_try_enable() has normally mapped the region before boot; this covers the rest.
+@@ -4039,6 +4046,21 @@
+ #endif
+ }
+ 
++// Limit the cache after the debugger supplies a smaller shared pool. This is
++// only legal before the translator has borrowed or started using a mapping.
++bool ish_jit_limit_region_capacity(size_t maximum) {
++#ifndef ISH_JIT_NO_EMIT
++    pthread_mutex_lock(&jit_region_lock);
++    bool ok = !jit_startup_started && region == NULL && maximum >= (16u << 20) &&
++              maximum <= ((size_t) 1024 << 20) && !(maximum & (maximum - 1));
++    if (ok) region_maximum = maximum;
++    pthread_mutex_unlock(&jit_region_lock);
++    return ok;
++#else
++    return false;
++#endif
++}
++
+ // Install a cache lease from CodiPad's shared Node/JIT executable pool. The
+ // owner already established RX and RW aliases; this never maps or chmods pages.
+ bool ish_jit_install_region(void *rx, void *rw, size_t capacity) {

@@ -1,0 +1,131 @@
+--- a/asbestos/guest-arm64/jit.c
++++ b/asbestos/guest-arm64/jit.c
+@@ -142,6 +142,14 @@
+ static _Atomic uint64_t cache_recycles, cache_reclaimed, cache_max_ticks;
+ static _Atomic bool region_full;   // an allocation failed: what came after runs as gadgets
+ 
++// Conditional branches have a +/- 1 MiB reach. Allocate hot and cold code
++// from opposite ends of one bounded chunk, keeping every pair in reach.
++#define COLD_CHUNK (1u << 20)
++static pthread_mutex_t cold_lock = PTHREAD_MUTEX_INITIALIZER;
++static uint8_t *cold_chunk;
++static size_t cold_hot, cold_end;
++static bool cm_on;
++
+ #ifndef ISH_JIT_NO_EMIT   // AOT-only builds never map executable memory
+ static bool map_dual(void) {
+     void *rw = mmap(NULL, region_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+@@ -201,6 +209,26 @@
+     return region + off;
+ }
+ 
++static bool region_alloc_split(size_t hot_bytes, size_t cold_bytes,
++                               uint8_t **hot, uint8_t **cold) {
++    size_t h = (hot_bytes + 15) & ~(size_t) 15;
++    size_t c = (cold_bytes + 15) & ~(size_t) 15;
++    if (h + c > COLD_CHUNK) return false;
++    pthread_mutex_lock(&cold_lock);
++    if (!cold_chunk || h + c > cold_end - cold_hot) {
++        cold_chunk = region_alloc(COLD_CHUNK);
++        cold_hot = 0;
++        cold_end = COLD_CHUNK;
++    }
++    if (!cold_chunk) { pthread_mutex_unlock(&cold_lock); return false; }
++    *hot = cold_chunk + cold_hot;
++    cold_hot += h;
++    cold_end -= c;
++    *cold = cold_chunk + cold_end;
++    pthread_mutex_unlock(&cold_lock);
++    return true;
++}
++
+ // MAP_JIT W^X is per thread and only this thread's fiber runs its native
+ // code, so a thread stays writable across the compiles and links of one
+ // run-loop pass and turns executable again in jit_exec_ready(), right before
+@@ -1326,6 +1354,7 @@
+             stub_pos[ns++] = e->fix[i].spos;
+         }
+     }
++    unsigned hot_words = e->n;
+     for (unsigned s = 0; s < ns; s++) {
+         stub_at[s] = e->n;
+         if (e->loop) emit_canon(e);
+@@ -1341,13 +1370,24 @@
+             emit_exit(e, stub_pos[s] == first_pos ? orig_first : b->code[stub_pos[s]]);
+         }
+     }
+-    uint8_t *dst = e->fail ? NULL : region_alloc(e->n * 4);
+-    if (!dst)
+-        return NULL;
++    // Recording and code maps expect contiguous segments and raw internal
++    // offsets. Keep that representation for those modes.
++    bool split = ns && !e->record && !cm_on;
++    uint8_t *dst = NULL, *cold = NULL;
++    if (!e->fail) {
++        if (split) {
++            if (!region_alloc_split(hot_words * 4, (e->n - hot_words) * 4, &dst, &cold))
++                return NULL;
++        } else dst = region_alloc(e->n * 4);
++    }
++    if (!dst) return NULL;
+     for (unsigned i = 0; i < e->nfix; i++) {
++        uintptr_t site = split && e->fix[i].at >= hot_words
++            ? (uintptr_t) cold + 4 * (e->fix[i].at - hot_words)
++            : (uintptr_t) dst + 4 * e->fix[i].at;
+         if (e->fix[i].kind == 4) {   // absolute target (a shared stub)
+             uintptr_t stub = e->fix[i].abs + ((size_t) (dst - region) / CODE_BANK) * CODE_BANK;
+-            int64_t d = (int64_t) stub - (int64_t) ((uintptr_t) dst + 4 * e->fix[i].at);
++            int64_t d = (int64_t) stub - (int64_t) site;
+             if (!fits(d >> 2, 26)) return NULL;
+             e->buf[e->fix[i].at] = ENC_B(d);
+             if (e->record) {
+@@ -1361,7 +1401,9 @@
+         }
+         unsigned s;
+         for (s = 0; stub_pos[s] != e->fix[i].spos; s++) {}
+-        int64_t d = 4 * ((int64_t) stub_at[s] - (int64_t) e->fix[i].at);
++        uintptr_t target = split ? (uintptr_t) cold + 4 * (stub_at[s] - hot_words)
++                                 : (uintptr_t) dst + 4 * stub_at[s];
++        int64_t d = (int64_t) target - (int64_t) site;
+         uint32_t enc;
+         if (e->fix[i].kind == 0) enc = ENC_B(d);
+         else {
+@@ -1370,7 +1412,10 @@
+         }
+         e->buf[e->fix[i].at] = enc;
+     }
+-    install_code(dst, e->buf, e->n);
++    if (split) {
++        install_code(cold, e->buf + hot_words, e->n - hot_words);
++        install_code(dst, e->buf, hot_words);
++    } else install_code(dst, e->buf, e->n);
+     if (e->loop) {
+         b->native_loop = (uint32_t *) (dst + 4 * e->loop_head);
+         loopmap_add((uintptr_t) b->native_loop, (uintptr_t) dst + 4 * e->body_end, e);
+@@ -2583,7 +2628,7 @@
+ 
+ // Bump whenever the code emitted for some guest instruction, stub or exit
+ // changes: images made before would still pass every other check.
+-#define JIT_CODE_VERSION 16
++#define JIT_CODE_VERSION 17
+ 
+ // Everything the emitted code bakes in besides the gadgets it names: the
+ // conventions, the struct layouts it loads from and the TLB / block cache
+@@ -3290,7 +3335,7 @@
+     uint64_t blocks, units, segments, bytes;
+ };
+ struct cm_segment { uint64_t code, off, pc; uint32_t words, units, insn; int mod; };
+-static bool cm_on;
++
+ static pthread_mutex_t cm_lock = PTHREAD_MUTEX_INITIALIZER;
+ static struct cm_module *cm_mods;
+ static unsigned cm_nmods, cm_capmods;
+@@ -4136,6 +4181,8 @@
+     pthread_mutex_unlock(&loopmap_lock);
+     cache_reclaimed += region_used - stub_bytes;
+     region_used = stub_bytes;
++    cold_chunk = NULL;
++    cold_hot = cold_end = 0;
+     region_full = false;
+     jit_cache_pending = false;
+     cache_generation++;
