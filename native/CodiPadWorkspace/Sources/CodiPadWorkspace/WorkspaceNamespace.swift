@@ -168,9 +168,9 @@ public final class WorkspaceNamespace {
             }
             throw WorkspaceFileSystemError.noPermissions("virtual namespace ancestors are not file authority")
         }
-        let suffix = alias ? String(path.dropFirst("/workspace".count)) : self.suffix(path, mount: mount)!
+        let relativePath = alias ? String(path.dropFirst("/workspace".count)) : self.suffix(path, mount: mount)!
         return WorkspaceFileSystem.Target(grant: binding.grant,
-            components: suffix.split(separator: "/").map(String.init) + (path.hasSuffix("/") ? ["."] : []))
+            components: relativePath.split(separator: "/").map(String.init) + (path.hasSuffix("/") ? ["."] : []))
     }
 
     internal func authorize<T>(_ grant: WorkspaceFileSystem.Grant, writing: Bool,
