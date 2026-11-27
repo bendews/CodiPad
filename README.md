@@ -6,6 +6,10 @@ CodiPad is built on Code - OSS, the open-source project behind Visual Studio Cod
 
 ## See CodiPad in action
 
+![Two overlapping CodiPad windows show fizzbuzz.py, with Python output in the right window’s terminal.](media/demos/ipad-13-multiwindow.webp)
+
+*Two editor windows on a 13-inch iPad.*
+
 These recordings follow a TypeScript project called *Field notes* in the iPad simulator. Select a preview to watch the full-size MP4.
 
 | Edit a TypeScript file | Run it with Node.js | Format it with Prettier |
