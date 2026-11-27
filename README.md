@@ -10,6 +10,14 @@ CodiPad is built on Code - OSS, the open-source project behind Visual Studio Cod
 
 *Two editor windows on a 13-inch iPad.*
 
+### Write Python tests with GitHub Copilot
+
+Copilot adds tests for `fizzbuzz.py` and asks to run them. All eight pass in CodiPad’s terminal. This recording uses the [optional VS Code components](docs/build.md#optional-vs-code-components).
+
+[![Typing a request in Copilot Chat, approving the test command, and reviewing the Python tests and terminal output](media/demos/copilot-python-tests.gif)](media/demos/copilot-python-tests.mp4)
+
+### Edit, run, and format TypeScript
+
 These recordings follow a TypeScript project called *Field notes* in the iPad simulator. Select a preview to watch the full-size MP4.
 
 | Edit a TypeScript file | Run it with Node.js | Format it with Prettier |
